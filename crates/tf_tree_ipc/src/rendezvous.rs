@@ -7,12 +7,8 @@
 //! name:   $TF_TREE_NAME,   else "default"
 //! ```
 //!
-//! Falling back to `$ROS_DOMAIN_ID` is the part worth understanding. A ROS 2
-//! system has already configured its isolation; inheriting it means `tf_tree`
-//! partitions exactly the way the rest of the stack does with no additional
-//! setup, so two robots on one bench — or a simulator alongside hardware — stay
-//! separated because they were already separated. Nobody has to know this
-//! library has a notion of domain at all.
+//! Falling back to `$ROS_DOMAIN_ID` inherits a ROS 2 system's existing
+//! isolation, so `tf_tree` partitions the way the rest of the stack does.
 
 use std::path::{Path, PathBuf};
 
@@ -21,8 +17,7 @@ use crate::runtime_dir::{current_uid, EnvLookup, RuntimeDir, SystemEnv};
 
 /// Longest arena name, in bytes.
 ///
-/// It has to fit a filename with room for `.lock`/`.sock` suffixes, and short
-/// names are the ones people actually type into a launch file.
+/// Fits a filename with room for `.lock`/`.sock` suffixes.
 pub const MAX_NAME_LEN: usize = 64;
 
 /// The default arena name when `$TF_TREE_NAME` is unset.
@@ -31,8 +26,7 @@ pub const DEFAULT_NAME: &str = "default";
 /// A validated arena name: one path component, UTF-8, non-empty, at most
 /// [`MAX_NAME_LEN`] bytes.
 ///
-/// Stored inline rather than as a `String` so it stays `Copy` and can sit inside
-/// error values, matching the workspace rule that errors never allocate.
+/// Stored inline so it stays `Copy` and can sit inside error values.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ArenaName {
     bytes: [u8; MAX_NAME_LEN],
@@ -57,10 +51,8 @@ impl ArenaName {
             || name.contains('\0')
             || name.contains('\\')
         {
-            // A name is a single path component. `$TF_TREE_NAME=../other` would
-            // otherwise let two processes that "agree" on the name resolve to
-            // different directories, which is the exact failure §3.1 is built to
-            // prevent.
+            // One path component: `../other` would resolve two "agreeing"
+            // processes to different directories (§3.1).
             Some(NameProblem::NotOneComponent)
         } else {
             None
@@ -97,11 +89,8 @@ impl core::fmt::Display for ArenaName {
     }
 }
 
-/// Where a group of processes meets: a runtime directory, a domain, and a name.
-///
-/// Holding these three together as one value is deliberate — they are jointly
-/// the sharing boundary (§3.1), and code that passes them around separately
-/// eventually passes two of the three.
+/// Where a group of processes meets: a runtime directory, a domain, and a name —
+/// jointly the sharing boundary (§3.1), so kept as one value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rendezvous {
     runtime_dir: RuntimeDir,
@@ -165,9 +154,8 @@ impl Rendezvous {
 
     /// `<runtime_dir>/<domain>/<name>.sock`.
     ///
-    /// [`crate::OwnerServer::bind_at`] binds it and [`crate::attach`] connects
-    /// to it, but the path is part of the rendezvous identity, so it is derived
-    /// here rather than in the code that binds it.
+    /// Bound by [`crate::OwnerServer::bind_at`], connected by [`crate::attach`];
+    /// derived here because the path is part of the rendezvous identity.
     #[must_use]
     pub fn sock_path(&self) -> &Path {
         &self.sock_path
@@ -218,10 +206,8 @@ impl Rendezvous {
 ///
 /// # Errors
 ///
-/// [`IpcError::DomainNotAnInteger`] if either variable is set to something that
-/// is not a `u32`. Deliberately fatal: a typo that fell back to domain 0 would
-/// silently place the process on the wrong arena, and a process on the wrong
-/// arena reports nothing at all — it just never sees the transforms it expects.
+/// [`IpcError::DomainNotAnInteger`] if either variable is not a `u32`. Fatal on
+/// purpose: falling back to domain 0 would silently join the wrong arena.
 pub fn domain_from_env(env: &dyn EnvLookup) -> Result<u32, IpcError> {
     for var in [EnvVar::Domain, EnvVar::RosDomainId] {
         let Some(raw) = env.var(var.as_str()) else {
@@ -304,8 +290,7 @@ mod tests {
 
     #[test]
     fn an_unparsable_domain_is_fatal_not_zero() {
-        // Silently using domain 0 here would be the worst possible behaviour:
-        // the process starts, joins the wrong arena, and reports nothing.
+        // Falling back to domain 0 would silently join the wrong arena.
         for (var, key) in [
             (EnvVar::Domain, "TF_TREE_DOMAIN"),
             (EnvVar::RosDomainId, "ROS_DOMAIN_ID"),

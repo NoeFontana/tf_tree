@@ -7,34 +7,13 @@
 //! just bench-report --out dir/ --consumers 8
 //! ```
 //!
-//! There is no `cargo xtask bench-report`: `xtask` dispatches
-//! `loom | bench-gate | headers` only.
+//! `tf_tree bench compare --bag` (§9.1) is not wired: `tf_tree_bench` is
+//! `publish = false` and the shipped binary must not depend on it, which is a
+//! crate-boundary question for a decision record. `xtask` has no bench-report.
 //!
-//! §9.1 spells the entry point `tf_tree bench compare --bag run.mcap ...`. That
-//! spelling is **not wired up.** The reason is no longer the one an earlier
-//! revision of this comment gave — it said §3 (bag ingestion) was unimplemented,
-//! and §3 has since landed for MCAP. Two reasons remain, and both are about this
-//! crate rather than about the roadmap:
-//!
-//! * `tf_tree_bench` is `publish = false` and carries `criterion`, `proptest`
-//!   and an optional ROS-adjacent dependency. Making the shipped `tf_tree`
-//!   binary depend on it to gain a subcommand would drag a benchmark harness
-//!   into every install.
-//! * Every row `--bag` would feed is UNAVAILABLE here for a reason the report
-//!   states, so the subcommand would accept a recording and use none of it.
-//!
-//! Wiring it is therefore a crate-boundary question, which `CLAUDE.md` routes to
-//! a decision record rather than to a PR.
-//!
-//! The interesting behaviour is in `tf_tree_bench::report`, in particular
-//! `Report::validate`: this binary **exits non-zero without writing anything**
-//! if the assembled report breaks one of §9.3's rules. A tool that cannot emit
-//! an over-claiming report is a stronger guarantee than a reviewer who promises
-//! not to write one.
-//!
-//! Run it inside `./docker/tf2/run.sh` (or on any host with ROS 2) with
-//! `--features tf2` and the tf2 correctness column fills in; the comparison rows
-//! additionally need a host with more physical cores than consumers.
+//! `Report::validate` makes this binary exit non-zero without writing anything
+//! if the report breaks one of §9.3's rules. `--features tf2` (under
+//! `./docker/tf2/run.sh`) fills the tf2 correctness column.
 // This binary's output *is* its result.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -50,9 +29,7 @@ fn main() -> Result<()> {
     let mut check: Option<PathBuf> = None;
     let mut opts = Options::default();
 
-    // Hand-rolled argument parsing: this is a benchmark binary in a
-    // `publish = false` crate, and `clap` is not one of its dependencies. The
-    // CLI (`tf_tree bench compare`) is where the parsed surface lives.
+    // Hand-rolled parsing: `clap` is not a dependency of this crate.
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |name: &str| -> Result<String> {
@@ -70,13 +47,7 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            // Rejected rather than accepted-and-ignored. §9.1 spells `--duration`
-            // as the steady-state window per point, and every point it would
-            // govern is an N-way comparison row that is UNAVAILABLE here (§0.0:
-            // no ROS 2, and the core budget). The one row this tool measures
-            // itself is bounded by lookup samples, not by wall clock. Taking the
-            // flag and producing a byte-identical report is exactly the quiet
-            // dishonesty §9.3 is written against.
+            // Rejected, not ignored: every row `--duration` would govern is UNAVAILABLE here.
             "--duration" => bail!(
                 "--duration is `docs/PHASE5.md` §9.1's steady-state window for the N-way \
                  comparison rows, every one of which this host reports as UNAVAILABLE, so \
@@ -85,16 +56,9 @@ fn main() -> Result<()> {
                  recorded as warmup_discarded_s) to change the discarded window."
             ),
             "--warmup" => opts.warmup = parse_duration(&value("--warmup")?)?,
-            // §9.2's embedding row arrives from outside, and this is the one
-            // row where that is a property of the measurement rather than a
-            // shortcut: it compares two builds of one program, and this tool is
-            // a single build. `just embed-cost` writes the pair; without the
-            // flag the row says so and names that recipe.
+            // §9.2's embedding row compares two builds, so it arrives from `just embed-cost`.
             "--embed-cost" => opts.embed_cost = Some(PathBuf::from(value("--embed-cost")?)),
-            // Still rejected. `tf_tree ingest --bag` / `tf_tree freeze --from-bag` are how a
-            // recording is read today. What is missing is the wiring *here*:
-            // this harness never opens a `.tft`, so a recording handed to it
-            // would be parsed and then have nothing to feed.
+            // Rejected: this harness never opens a `.tft`, so a recording would go unused.
             "--bag" => bail!(
                 "--bag is `docs/PHASE5.md` §9.1's spelling for feeding this harness a \
                  recording, and it is not wired up: the two bag-dependent rows \
@@ -103,10 +67,7 @@ fn main() -> Result<()> {
                  §3 itself *is* implemented for MCAP — use `tf_tree ingest --bag` to read \
                  a recording, or `tf_tree freeze --from-bag` to keep the result."
             ),
-            // `docs/PHASE5.md` §10's "benchmark artifact as a regression gate".
-            // The comparison runs *after* the report is written, so a failing
-            // gate still leaves the artifact on disk to look at — a gate that
-            // deletes the evidence it failed on is unusable.
+            // The comparison runs after the report is written so a failing gate leaves the artifact.
             "--check-baseline" => check = Some(PathBuf::from(value("--check-baseline")?)),
             "-h" | "--help" => {
                 println!(
@@ -150,9 +111,7 @@ fn main() -> Result<()> {
         "warmup_discarded_s", report.warmup_discarded_s
     );
     println!();
-    // The two verdicts are printed apart, because they refuse different rows:
-    // the clock verdict governs any timing number, the core budget governs only
-    // the rows that run `--consumers` processes at once.
+    // The clock verdict governs any timing number; the core budget only the N-consumer rows.
     if report.fitness.fair_for_timing {
         println!("clock fitness: PASS — timing rows on this host are claims.");
     } else {
@@ -198,11 +157,7 @@ fn main() -> Result<()> {
         for n in &cmp.notes {
             println!("  note: {n}");
         }
-        // Checked before the verdict is printed, so "zero comparisons" never
-        // appears on screen as a PASS. "0 failures" is also what a gate that
-        // compared nothing prints, and a regression gate that has quietly
-        // stopped comparing is the exact failure this whole file is written
-        // against.
+        // Checked first so a gate that compared nothing never prints as a PASS.
         if cmp.compared_nothing() {
             eprintln!(
                 "regression gate compared NOTHING against {}: the baseline carries no \
@@ -224,12 +179,7 @@ fn main() -> Result<()> {
             for f in &cmp.failures {
                 eprintln!("  - {f}");
             }
-            // Name the recipe that regenerates *this* baseline. There are two,
-            // one per build, and they are not interchangeable: a baseline cut
-            // with `--features tf2` checked against a build without it fails
-            // every row it measured, on the difference between two recipes
-            // rather than on the code. Telling a reader to run the wrong one is
-            // how that happens.
+            // Two recipes, one per build; a baseline from the other fails every row.
             let recipe = if path.to_string_lossy().contains("results-tf2") {
                 "just tf2-bench-baseline-update"
             } else {

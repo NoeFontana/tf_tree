@@ -1,19 +1,11 @@
 //! Does autovectorisation reach the batch interpolation loop for free?
 //!
-//! `docs/decisions/0016` open question 2, and its implementation-plan step 3:
-//! *"Try autovectorisation first: shape the batch interpolation loop over
-//! `[f64; 4]` and read the asm. If it vectorises, stop."* This harness is the
-//! measurement half of that; the asm half is recorded in `0016`'s *Amendment*.
+//! `docs/decisions/0016` open question 2, step 3: shape the batch loop over `[f64; 4]` and read
+//! the asm. This is the measurement half; the asm half is in `0016`'s *Amendment*. The unit is the
+//! loop over stamps, not the call (`interp_cost`).
 //!
-//! # What it isolates, and why it is not `interp_cost`
-//!
-//! `interp_cost` times **one** `Interp::eval` at a time. The question here is
-//! about a *loop over stamps* — whether LLVM can run several stamps' worth of
-//! interpolation in one set of SIMD registers — so the unit of measurement has
-//! to be the loop, not the call.
-//!
-//! Each variant computes the same interpolation over the same 1024 pose pairs
-//! and differs only in the **shape** it hands the vectoriser:
+//! Each variant computes the same interpolation over the same 1024 pose pairs and differs only in
+//! shape:
 //!
 //! | | shape |
 //! |---|---|
@@ -22,9 +14,7 @@
 //! | **C** | structure-of-arrays: seven planar `f64` lanes in, four out |
 //! | **D** | `0016` step 3 literally — `[f64; 4]` blocks over a `chunks`-style walk |
 //!
-//! A is the ceiling any *engine* change could reach without restructuring the
-//! fold, because the engine's real loop body is strictly A plus a seqlock, a
-//! galloping search and a `?`. B/C/D are what a restructured fold could reach.
+//! A is the ceiling for any engine change short of restructuring the fold.
 //!
 //! # Run it twice
 //!
@@ -34,10 +24,8 @@
 //!   taskset -c 2 cargo run --release -p tf_tree_bench --example autovec_probe
 //! ```
 //!
-//! The difference between the two runs is what the compiler's vectoriser is
-//! worth on each shape. A shape whose two runs agree was never vectorised.
-//!
-//! Unpinned runs migrate cores and swing by >30%.
+//! The difference is what the vectoriser is worth; a shape whose runs agree was never vectorised.
+//! Unpinned runs swing by >30%.
 #![allow(clippy::unwrap_used, clippy::print_stdout)]
 
 use std::hint::black_box;
@@ -49,14 +37,11 @@ use tf_tree::{Interp, Iso3, LerpSlerp, Quat, ScLerp, Vec3};
 const N: usize = 1024;
 /// Timed rounds per repeat.
 const ROUNDS: usize = 20_000;
-/// Repeats; the **best** is reported, not the median. A cold round is noise in
-/// one direction only.
+/// Repeats; the **best** is reported (a cold round is noise in one direction only).
 const REPEATS: usize = 7;
 
-/// Pose pairs one 200 Hz tick apart on a body rotating at a brisk 180 °/s, plus
-/// an interior `s`. Both endpoints are arbitrary rigid transforms, and the arc
-/// sits inside `THETA_SLERP_SMALL`, so every variant takes the series path —
-/// which is the branch `interp.rs`'s own rate table says dominates.
+/// Pose pairs one 200 Hz tick apart on a body rotating at 180 °/s, plus an interior `s`; the arc
+/// sits inside `THETA_SLERP_SMALL`, so every variant takes the series path.
 fn data() -> (Vec<Iso3>, Vec<Iso3>, Vec<f64>) {
     let mut a = Vec::with_capacity(N);
     let mut b = Vec::with_capacity(N);
@@ -75,8 +60,7 @@ fn data() -> (Vec<Iso3>, Vec<Iso3>, Vec<f64>) {
         );
         a.push(base);
         b.push(base * rel);
-        // Interior, and never 0 or 1: the endpoint shortcuts would otherwise
-        // skip the work being measured.
+        // Interior, never 0 or 1: the endpoint shortcuts would skip the work.
         s.push(0.05 + 0.9 * ((i % 97) as f64 / 97.0));
     }
     (a, b, s)
@@ -111,8 +95,7 @@ fn variant_b(a: &[Iso3], b: &[Iso3], s: &[f64], out: &mut [Iso3]) {
     }
 }
 
-/// **C** — structure-of-arrays. Every slice is re-sliced to the common length
-/// first, so the loop has one exit rather than one per index.
+/// **C** — structure-of-arrays, re-sliced to a common length so the loop has one exit.
 #[inline(never)]
 fn variant_c(qa: &[[f64; 4]], qb: &[[f64; 4]], s: &[f64], ow: &mut [[f64; 4]]) {
     let n = s.len();
@@ -175,9 +158,8 @@ fn variant_d(qa: &[[f64; 4]], qb: &[[f64; 4]], s: &[f64], ow: &mut [[f64; 4]]) {
     }
 }
 
-/// `θ²` from `h = 1 − |cos θ|` — a local copy of `interp.rs`'s
-/// `theta_sq_from_chord`, which is `pub(crate)`. `variants_agree_with_eval`
-/// below is what keeps this copy honest.
+/// `θ²` from `h = 1 − |cos θ|` — a local copy of `interp.rs`'s `theta_sq_from_chord` (`pub(crate)`);
+/// `variants_agree_with_eval` keeps it honest.
 #[inline]
 fn theta_sq(h: f64) -> f64 {
     const C: [f64; 8] = [
@@ -197,8 +179,7 @@ fn theta_sq(h: f64) -> f64 {
     2.0 * h * acc
 }
 
-/// `sin(a·θ)/sin(θ)` as a series in `u = θ²` — a local copy of `interp.rs`'s
-/// `slerp_weight`, for the same reason.
+/// `sin(a·θ)/sin(θ)` as a series in `u = θ²` — a local copy of `interp.rs`'s `slerp_weight`.
 #[inline]
 fn weight(a: f64, u: f64) -> f64 {
     let x = a * a;
@@ -229,10 +210,8 @@ fn best<F: FnMut()>(label: &str, mut f: F) -> f64 {
     b
 }
 
-/// The comparison is only worth anything if every variant computes the same
-/// number. B, C and D drop branches that are unreachable *for this data*; if a
-/// future edit makes one of them reachable this is what says so, before the
-/// timings are read as a speedup.
+/// Every variant must compute the same number: B, C and D drop branches unreachable *for this
+/// data*, and this says so if an edit makes one reachable.
 fn variants_agree_with_eval(a: &[Iso3], b: &[Iso3], s: &[f64]) -> f64 {
     let (qa, qb) = (quats(a), quats(b));
     let mut ob = vec![Iso3::IDENTITY; N];

@@ -2,29 +2,19 @@
 //!
 //! # Who serves
 //!
-//! A thread in the **owning process**, not a daemon (`docs/decisions/0005` §3).
-//! §3.5 makes ownership a role a surviving participant *inherits*, which is only
-//! possible if any participant can bind. A daemon-only design would make
-//! `tf_treed` a hard prerequisite and owner death fatal instead of recoverable.
+//! A thread in the **owning process**, not a daemon (`docs/decisions/0005` §3):
+//! §3.5 makes ownership a role a survivor inherits, so any participant must be
+//! able to bind.
 //!
 //! # Why this loop exists after the handshake is done
 //!
-//! §3.7 step 9 says keep the client sockets open; it never says who watches
-//! them. D17 answers it: *"Participants hold their Unix socket open for the
-//! lifetime of the attachment. Process death of any kind closes it, and the
-//! owner sees `EPOLLHUP` in microseconds — exact, immediate, with no timeout to
-//! tune."* *Exact* and *no timeout* stand; *in microseconds* does not, and D17
-//! now carries an amendment saying so
-//! ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)):
-//! the hangup arrives when the kernel closes the dying participant's files, at
-//! the end of its exit, so a participant that dumps core keeps its connection
-//! for the length of its dump and a large one for its address-space teardown,
-//! and this loop's reap of it waits that long — inferred from the hangup being
-//! symmetric, since `0057` timed the survivor's end and not this `epoll` path.
-//! That delay is reaping latency, not a correctness gap. The hangup is the reap trigger, so the server keeps
-//! every accepted fd in its `epoll` set and reports a hangup with the slot it
-//! granted. Holding the fds without watching them would keep the cost and throw
-//! away the signal.
+//! D17: participants hold their socket open for the attachment, so the owner
+//! sees `EPOLLHUP` when the kernel closes a dead participant's files — at the end
+//! of its exit, not in microseconds
+//! ([`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)),
+//! so a core dump delays the reap. The hangup is the reap trigger: every
+//! accepted fd stays in the `epoll` set and a hangup is reported with the slot
+//! granted.
 //!
 //! # Policy is the caller's
 //!
@@ -45,16 +35,11 @@ use rustix::net::{
 use crate::error::IpcError;
 use crate::wire::{HelloRequest, HelloResponse, HelloStatus, SegmentDescriptor, HELLO_REQUEST_LEN};
 
-/// Connection backlog. Generous: a thundering herd of participants at boot is
-/// the expected case (§11.2 scenario 7), not an anomaly to shed.
+/// Connection backlog: a thundering herd at boot is expected (§11.2 scenario 7).
 const BACKLOG: i32 = 64;
 
-/// How long the owner will wait on one client's half of the handshake.
-///
-/// Two messages over a connected local socket; a client that cannot manage that
-/// in two seconds is not going to. Deliberately much shorter than the §3.4
-/// open deadline, because this budget is per-client and that one is per-attempt
-/// — a stalled peer must not consume the deadline of everybody queued behind it.
+/// How long the owner waits on one client's half of the handshake. Per-client,
+/// so a stalled peer cannot consume the deadline of those queued behind it.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `epoll` token for the listening socket.
@@ -78,10 +63,7 @@ pub struct OwnerServer {
     bound: (u64, u64),
 }
 
-/// Ask a running [`OwnerServer`] to stop.
-///
-/// Cloneable and `Send`, so the thread that owns the server does not have to be
-/// the thread that stops it.
+/// Ask a running [`OwnerServer`] to stop; `Send`, so another thread can stop it.
 #[derive(Debug)]
 pub struct ShutdownHandle {
     eventfd: OwnedFd,
@@ -106,15 +88,13 @@ impl ShutdownHandle {
 impl OwnerServer {
     /// Bind `sock_path` and start listening.
     ///
-    /// # The bind sequence, and why it is not just `bind`
+    /// # The bind sequence
     ///
-    /// §3.4 step 5 says "bind sock.tmp", naming no per-process suffix. Two
-    /// processes taking ownership in sequence — or one stale file from a binder
-    /// that died — then collide on `EADDRINUSE`, and a Unix socket path is not
-    /// removed when its process exits. So: unlink any stale path, bind a
-    /// **pid-suffixed** temporary, restrict it to the owner, and `rename` it
-    /// into place. `rename` is atomic, so a client sees the old socket or a
-    /// fully-listening new one, never a bound-but-not-listening one.
+    /// §3.4 step 5's "bind sock.tmp" names no per-process suffix, and a stale
+    /// socket path outlives its process. So: unlink any stale path, bind a
+    /// **pid-suffixed** temporary, restrict it to the owner, and `rename` it into
+    /// place; `rename` is atomic, so a client never sees a bound-but-not-listening
+    /// socket.
     ///
     /// # Errors
     ///
@@ -127,8 +107,7 @@ impl OwnerServer {
     ) -> Result<OwnerServer, IpcError> {
         let tmp = sock_path.with_extension(format!("sock.{owner_pid}"));
         let addr = crate::client::socket_addr(&tmp)?;
-        // Validate the final path too, so an over-long name fails here rather
-        // than after a successful bind to the temporary.
+        // Validate the final path too, so an over-long name fails before binding.
         let _ = crate::client::socket_addr(sock_path)?;
 
         let listener = socket_with(
@@ -142,34 +121,14 @@ impl OwnerServer {
         // A leftover from a previous owner is expected (§3.9), not exceptional.
         let _ = std::fs::remove_file(&tmp);
         bind(&listener, &addr).map_err(io)?;
-        // The trust model is same-user cooperating processes (§0), and the
-        // runtime directory is already 0700 — but the socket inherits the
-        // umask, so an operator running with `umask 000` would otherwise widen
-        // it. Set it explicitly rather than depend on ambient state.
+        // The socket inherits the umask; set the mode explicitly.
         rustix::fs::chmod(&tmp, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).map_err(io)?;
         listen(&listener, BACKLOG).map_err(io)?;
 
-        // Identify the file about to be published, so teardown can tell it apart
-        // from a successor's.
-        //
-        // **`stat` the temporary, before the rename — not the path, after it.**
-        // Two reasons, and the first is a correctness bug rather than a
-        // preference. `rename` preserves the inode, so both forms name the same
-        // file in the quiet case; but between our `rename` and a `stat` of the
-        // published path, a concurrent takeover may rename *its* socket over
-        // that path. `bound` would then hold the successor's identity, and this
-        // server's teardown would unlink a live successor's socket — precisely
-        // the failure `unlink_if_still_ours` exists to prevent, and one that only
-        // became reachable now that its comparison does something. `tmp` is
-        // pid-suffixed and this process just bound it, so nobody can substitute
-        // it. Second: a `stat` of the path also fails with `ENOENT` if somebody
-        // removes it in that window, failing a bind whose listener is up,
-        // listening, and correctly published.
-        //
-        // It cannot be `fstat` on the listener either: that returns the socket's
-        // `sockfs` inode, which shares no device with any filesystem and so never
-        // compares equal to the path (measured: `dev=8` against `dev=2049` on
-        // tmpfs). That form is what made this a no-op for the whole of its life.
+        // Identify the file about to be published, so teardown can tell it from a
+        // successor's. `stat` the temporary before the rename: stat of the path
+        // afterwards could capture a concurrent successor's identity, and `fstat`
+        // on the listener returns a `sockfs` inode that never equals the path's.
         #[allow(clippy::unnecessary_cast)]
         let bound = rustix::fs::stat(&tmp)
             .map(|s| (s.st_dev as u64, s.st_ino as u64))
@@ -193,8 +152,7 @@ impl OwnerServer {
             desc,
             owner_pid,
             fork_gen: {
-                // Bound the socket, so from here on a `fork` matters. Arming is
-                // idempotent and the server is created once per arena.
+                // From here on a `fork` matters; arming is idempotent.
                 crate::fork::arm();
                 crate::fork::generation()
             },
@@ -220,13 +178,9 @@ impl OwnerServer {
     /// Serve until [`ShutdownHandle::stop`].
     ///
     /// `assign` validates a request against arena policy and returns the slot to
-    /// grant, or the [`HelloStatus`] to reject with. `on_hangup` is called with
-    /// a granted slot when that client's socket closes — the D17 reap trigger.
-    ///
-    /// A failed handshake never takes the server down: the client is dropped and
-    /// the loop continues. An owner that died because one peer sent a short
-    /// datagram would be a denial of service from any process that can reach the
-    /// socket.
+    /// grant, or the [`HelloStatus`] to reject with. `on_hangup` is called with a
+    /// granted slot when that client's socket closes — the D17 reap trigger. A
+    /// failed handshake drops the client and never the server.
     ///
     /// # Errors
     ///
@@ -257,62 +211,23 @@ impl OwnerServer {
         )
         .map_err(io)?;
 
-        // Token -> (client socket, granted slot). The fd must be kept alive
-        // here: dropping it would close the connection and tell the client the
-        // *owner* died, which is the opposite of the truth.
+        // Token -> (client socket, granted slot). Dropping the fd would tell the
+        // client the *owner* died.
         let mut clients: Vec<Option<(OwnedFd, u32)>> = Vec::new();
 
-        // A fixed buffer, reused across iterations: this loop wakes on every
-        // attach and every participant death, and an allocation per wakeup
-        // would be pure waste.
-        //
-        // It must NOT be a `Vec`. rustix's `Buffer` impl for `&mut Vec<T>`
-        // reports `len()` as the capacity, not the spare capacity, so a
-        // `Vec::with_capacity(16)` passes `maxevents = 0` and `epoll_wait`
-        // fails with `EINVAL` — it compiles cleanly and only fails at runtime.
+        // Fixed buffer, not a `Vec`: rustix's `Buffer` for `&mut Vec<T>` reports
+        // `len()` as capacity, so `maxevents = 0` and `epoll_wait` fails `EINVAL`
+        // at runtime.
         let mut events = [core::mem::MaybeUninit::<epoll::Event>::uninit(); 16];
 
         loop {
-            // **`EINTR` is not a failure here, and propagating it strands the
-            // arena.** `epoll_wait` is one of the interfaces `signal(7)` lists
-            // as failing with `EINTR` after a stop signal followed by `SIGCONT`
-            // — *even with no handler installed anywhere in the process*, which
-            // is why "this crate installs no signal handlers" is not an argument
-            // that it cannot happen. **Two triggers are measured and a third is
-            // not, so they are not listed as one.** Ctrl-Z then `fg` (`SIGTSTP`
-            // + `SIGCONT`) wedges the pre-fix build and not this one. A debugger
-            // does too, but by a different mechanism and only one way round:
-            // `PTRACE_ATTACH` + `PTRACE_DETACH` over every tid in
-            // `/proc/<pid>/task`, as `gdb -p` does, wedges it, while attaching
-            // to the main thread alone does not — the tracee sits in
-            // ptrace-stop and the syscall restarts. A container freeze/thaw is
-            // the plausible third and **nobody has run it**; `signal(7)`'s list
-            // is scoped to stop signals resumed by `SIGCONT`, and a cgroup
-            // freezer is a different mechanism, so it stays a suspicion.
-            //
-            // What propagating cost: `serve` returns `Err`, this server's `Drop`
-            // runs `unlink_if_still_ours` and removes the published socket, and
-            // the process **lives on** still holding participant byte 0 and the
-            // ownership byte with nothing serving. §3.4 then has no exit for
-            // anybody — a joiner cannot reach a server, and step 4's split-brain
-            // check refuses to create a second arena because a participant byte
-            // is held by a process that is genuinely alive. Measured on this
-            // branch before the fix: `SIGSTOP` + `SIGCONT` to an owner takes it
-            // from two threads to one, `default.sock` disappears, and a join
-            // reports `an arena is alive but unreachable: participant slots 0x1
-            // still hold their lock bytes (slot 0, pid <alive>)` — the wording
-            // of that error at the time; `0055` step 6 reduced it to facts plus
-            // `(ArenaHeldButUnreachable)`, so do not grep for this text. The only
-            // remedy was killing a healthy process. Three controls — no signal,
-            // three `SIGWINCH`es, and a bare `SIGCONT` to a never-stopped owner
-            // — all left the socket up and the join succeeding, so it is the
-            // stop/continue pair and not the act of signalling.
-            //
-            // Retry, do not swallow: every other errno still returns, so a real
-            // `epoll` failure (`EBADF` after a descriptor accident) is still
-            // loud rather than an infinite spin. `e == Errno::INTR` and not a
-            // pattern match, matching `ofd::try_lock`'s `EAGAIN`/`EACCES` arm —
-            // the crate's one existing errno discrimination.
+            // **`EINTR` is not a failure here.** `epoll_wait` fails with `EINTR`
+            // after a stop signal followed by `SIGCONT` even with no handler
+            // installed (Ctrl-Z then `fg`; a debugger attaching every tid).
+            // Propagating it makes `serve` return, `Drop` unlink the socket, and
+            // the process live on holding byte 0 and the ownership byte with
+            // nothing serving: §3.4 then has no exit for anybody. Retry on
+            // `Errno::INTR` only, so a real `epoll` failure stays loud.
             let (ready, _) = match epoll::wait(&ep, &mut events, None) {
                 Ok(ready) => ready,
                 Err(e) if e == Errno::INTR => continue,
@@ -329,20 +244,14 @@ impl OwnerServer {
                         if let Ok((sock, slot)) =
                             self.accept_one(segment, &mut assign, &mut on_hangup)
                         {
-                            // Reuse a departed client's index rather than always
-                            // appending. An owner runs for the life of the robot
-                            // and §11.2 cycles attach/detach 10^4 times; an
-                            // append-only table would grow without bound and
-                            // hand out ever-larger tokens for a fleet whose size
-                            // never changes.
+                            // Reuse a departed client's index so the table and
+                            // tokens do not grow over 10^4 attach/detach cycles.
                             let idx = clients
                                 .iter()
                                 .position(Option::is_none)
                                 .unwrap_or(clients.len());
                             let token = TOKEN_CLIENT_BASE + idx as u64;
-                            // Watch for the peer going away. RDHUP catches a
-                            // clean shutdown, HUP an abrupt death; both mean the
-                            // participant is gone.
+                            // RDHUP catches a clean shutdown, HUP an abrupt death.
                             if epoll::add(
                                 &ep,
                                 &sock,
@@ -357,28 +266,13 @@ impl OwnerServer {
                                     clients[idx] = Some((sock, slot));
                                 }
                             }
-                            // **No `on_hangup` on the `epoll::add` failure path,
-                            // deliberately — the asymmetry with `accept_one`'s
-                            // `sendmsg` arm is the point.** There the response
-                            // never reached the client, so it never learned its
-                            // slot and cannot be holding it; releasing is free.
-                            // Here the handshake already *succeeded*: the client
-                            // holds `HelloStatus::Ok`, the slot number and the
-                            // segment fd. Releasing the grant would let the next
-                            // joiner be handed the same slot, and `register_at`
-                            // writes its identity record *before* taking the lock
-                            // byte — an ordering its own doc justifies by "nobody
-                            // else is racing us for *this* byte, because the owner
-                            // hands each client a different one". Breaking that
-                            // overwrites a live participant's record, leaving a
-                            // held slot naming the wrong pid, which is what makes
-                            // `ArenaHeldButUnreachable` point an operator at the
-                            // wrong process.
-                            //
-                            // So this leaks the slot, bounded at 64 and only under
-                            // ENOSPC/ENOMEM. That is strictly the better failure:
-                            // a slot nobody can use, rather than two participants
-                            // who disagree about who owns one.
+                            // No `on_hangup` on an `epoll::add` failure, unlike
+                            // `accept_one`'s `sendmsg` arm: the handshake already
+                            // succeeded, so the client holds the slot, and
+                            // releasing it would let `register_at` overwrite a
+                            // live participant's identity record. This leaks a
+                            // slot (bounded at 64, only under ENOSPC/ENOMEM)
+                            // rather than have two participants share one.
                         }
                     }
                     token => {
@@ -396,13 +290,9 @@ impl OwnerServer {
         }
     }
 
-    /// Accept one connection and run the handshake on it.
-    ///
-    /// Returns the connection and the slot granted, or an error if the client
-    /// was rejected or misbehaved — in which case its socket is dropped here.
-    ///
-    /// `on_hangup` is the caller's slot-release callback, the same one
-    /// [`Self::serve`] runs when a watched participant dies.
+    /// Accept one connection and run the handshake on it; returns the connection
+    /// and slot granted, or an error (the socket is dropped here).
+    /// `on_hangup` is [`Self::serve`]'s slot-release callback.
     fn accept_one<A, H>(
         &self,
         segment: BorrowedFd<'_>,
@@ -415,14 +305,10 @@ impl OwnerServer {
     {
         let sock = accept_with(&self.listener, SocketFlags::CLOEXEC).map_err(io)?;
 
-        // **Bound the handshake, or one peer wedges the owner.** `recvmsg`
-        // below is blocking and this loop is single-threaded, so a client that
-        // connects and then never sends — hung, stopped, or hostile — would
-        // otherwise stall every other participant's attach *and* the shutdown
-        // path, indefinitely. §3.7 specifies no timeout on either side; the
-        // client half sets one for the mirror-image reason.
-        //
-        // A slow client costs one timeout. An unbounded wait costs the arena.
+        // **Bound the handshake, or one peer wedges the owner.** `recvmsg` is
+        // blocking and this loop single-threaded, so a client that connects and
+        // never sends would stall every attach and the shutdown path. §3.7 sets
+        // no timeout; the client half sets one for the mirror-image reason.
         for dir in [
             rustix::net::sockopt::Timeout::Recv,
             rustix::net::sockopt::Timeout::Send,
@@ -440,10 +326,8 @@ impl OwnerServer {
         )
         .map_err(io)?;
 
-        // Length, then magic, then everything else — and a decode failure is a
-        // `Malformed` rejection rather than a dropped connection, so a client
-        // built against a different protocol learns why instead of seeing its
-        // connection vanish.
+        // Length, then magic, then the rest; a decode failure is a `Malformed`
+        // rejection so a mismatched client learns why.
         let (status, slot) = match HelloRequest::from_bytes(&buf[..recv.bytes]) {
             Err(_) => (HelloStatus::Malformed, u32::MAX),
             Ok(req) => match self.check(&req) {
@@ -464,8 +348,7 @@ impl OwnerServer {
 
         let mut space = [core::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
         let mut cmsg = SendAncillaryBuffer::new(&mut space);
-        // A rejection carries **no fd** (§3.7): handing a segment to a peer we
-        // just refused would make the refusal advisory.
+        // A rejection carries **no fd** (§3.7), or refusal would be advisory.
         let granted = [segment];
         if status == HelloStatus::Ok {
             cmsg.push(SendAncillaryMessage::ScmRights(&granted));
@@ -477,14 +360,10 @@ impl OwnerServer {
             &mut cmsg,
             SendFlags::empty(),
         ) {
-            // `assign` has already reserved the slot, and this send is where a
-            // client that died mid-handshake shows up: `SIGKILL`ed between its
-            // own `sendmsg` and `recvmsg`, the owner's send returns `EPIPE`.
-            // Nothing will ever hang up on a connection the peer never received,
-            // so the slot must go back here or it stays granted for the lifetime
-            // of the owner. Sixty-four such deaths — one supervised node in a
-            // crash loop — would otherwise wedge an empty arena at
-            // `NoParticipantSlots` until the owner itself is restarted.
+            // `assign` has reserved the slot and a client killed mid-handshake
+            // surfaces here as `EPIPE`; nothing will ever hang up on a connection
+            // the peer never received, so return the slot now or 64 crash-loop
+            // deaths wedge an empty arena at `NoParticipantSlots`.
             if status == HelloStatus::Ok {
                 on_hangup(slot);
             }
@@ -503,10 +382,7 @@ impl OwnerServer {
     }
 
     /// The checks that do not need the arena: version, then layout, then boot id.
-    ///
-    /// Order matters. A version mismatch makes every later field's meaning
-    /// uncertain, so it is reported first rather than surfacing as a confusing
-    /// layout complaint about a struct the peer lays out differently anyway.
+    /// Version first: a mismatch makes every later field uncertain.
     fn check(&self, req: &HelloRequest) -> Option<HelloStatus> {
         if req.format_version != self.desc.format_version {
             return Some(HelloStatus::VersionMismatch);
@@ -523,25 +399,11 @@ impl OwnerServer {
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
-        // Never from a `fork` child. `bound` — the `(st_dev, st_ino)` this
-        // server published — is copied verbatim into the child, so the child's
-        // `unlink_if_still_ours` matches and removes the **parent's** live
-        // listening path, after which no client can find an owner that is still
-        // perfectly happy to serve one. The child's own fd closing is harmless:
-        // the description stays open in the parent.
-        //
-        // This rationale used to cite the inherited listener fd `stat`ing equal
-        // to the path. That was never true — a listening socket's inode is in
-        // `sockfs` — and it was the same mistake that made
-        // `unlink_if_still_ours` itself a no-op. The guard is still required;
-        // only its reason changed.
-        //
-        // **Coverage, stated plainly: no test fails when this check is
-        // removed.** In this workspace an `OwnerServer` only ever lives on the
-        // serving thread's stack, and `fork` does not copy threads, so the
-        // child has no such value to drop. It is reachable only through the
-        // public API — bind on the main thread, then fork — which is exactly
-        // the case a library owes a guard for, and nothing else provides one.
+        // Never from a `fork` child: `bound` is copied verbatim, so the child's
+        // `unlink_if_still_ours` would remove the **parent's** live socket path.
+        // **No test fails when this check is removed**: an `OwnerServer` lives on
+        // the serving thread, which `fork` does not copy, so only the public API
+        // (bind on the main thread, then fork) reaches it.
         if self.fork_gen != crate::fork::generation() {
             return;
         }
@@ -552,31 +414,13 @@ impl Drop for OwnerServer {
 impl OwnerServer {
     /// Remove the socket path **only if it is still this server's socket**.
     ///
-    /// A plain `remove_file` here is a real hazard rather than a tidy-up. §3.5
-    /// lets a successor take over, and a successor publishes by `rename`ing its
-    /// own socket over this path — so by the time this server winds down, the
-    /// path may name *somebody else's* live listener, and unlinking it would
-    /// silently make the new owner unreachable while it happily keeps serving a
-    /// socket no client can find.
-    ///
-    /// Comparing the identity this server *published* (`bound`, captured at
-    /// bind time) against what the path names today closes it: after a
-    /// successor's `rename` the inodes differ, so this leaves the path alone.
-    /// Not perfectly atomic — the successor could rename between the
-    /// `stat` and the `unlink` — but that window is a single syscall wide,
-    /// against a window that is otherwise the entire lifetime of the process,
-    /// and §3.9 already makes a stale socket path a state every client
-    /// tolerates.
-    ///
-    /// **This compares against `bound`, not against `fstat(listener)`.** It used
-    /// to do the latter, which made the whole function a no-op: a listening
-    /// socket's fd resolves to an inode in `sockfs`, which shares no device with
-    /// the filesystem holding the path, so the equality could never hold on any
-    /// kernel. The socket was therefore *never* unlinked, not even on a clean
-    /// stop, and the successor protection this comment argues for had never run.
-    /// Nothing failed either way, which is how it survived — hence the two tests
-    /// below, which fail for an unconditional `remove_file` and for the old
-    /// `fstat` form respectively.
+    /// A successor publishes by `rename`ing over this path (§3.5), so a plain
+    /// `remove_file` would make a live new owner unreachable. Compares `bound`
+    /// (captured at bind) with what the path names now; the residual
+    /// `stat`-to-`unlink` window is one syscall, and §3.9 makes a stale path
+    /// tolerable. Compares `bound`, not `fstat(listener)` (a `sockfs` inode that
+    /// never matches); `winding_down_leaves_a_successors_socket_alone` covers both
+    /// mutants.
     fn unlink_if_still_ours(&self) {
         let Ok(theirs) = rustix::fs::stat(&self.sock_path) else {
             return;
@@ -589,7 +433,7 @@ impl OwnerServer {
     }
 }
 
-/// Every rustix error in this module becomes the same shape.
+/// Every rustix error in this module becomes `HandshakeIo`.
 fn io(e: rustix::io::Errno) -> IpcError {
     IpcError::HandshakeIo {
         raw_os_error: e.raw_os_error(),
@@ -620,13 +464,9 @@ mod tests {
         dir
     }
 
-    /// **An outgoing owner must not unlink its successor's socket.**
-    ///
-    /// Mutants this kills: replacing `unlink_if_still_ours` with an
-    /// unconditional `remove_file` fails the second assertion; comparing
-    /// `fstat(listener)` against the path — the form this code shipped with —
-    /// fails the third, because a listening socket's inode lives in `sockfs` and
-    /// never matches the filesystem the path is on.
+    /// **An outgoing owner must not unlink its successor's socket.** Kills an
+    /// unconditional `remove_file` (second assertion) and an `fstat(listener)`
+    /// comparison (third).
     #[test]
     fn winding_down_leaves_a_successors_socket_alone() {
         let dir = scratch("succession");
@@ -647,8 +487,7 @@ mod tests {
             "the outgoing owner unlinked its successor's socket"
         );
 
-        // And the last owner *does* clean up after itself, so §3.9's stale path
-        // is a crash artefact rather than the normal outcome of a clean stop.
+        // The last owner cleans up, so §3.9's stale path is a crash artefact.
         drop(second);
         assert!(
             rustix::fs::stat(&sock).is_err(),
@@ -657,9 +496,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The pid-suffixed temporary `bind_at` renames from is an implementation
-    /// detail that must not survive the bind, or a runtime directory accumulates
-    /// one dead socket per owner that ever ran.
+    /// The pid-suffixed temporary must not survive the bind.
     #[test]
     fn binding_leaves_only_the_published_path() {
         let dir = scratch("tmp-path");

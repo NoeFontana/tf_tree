@@ -1,34 +1,6 @@
-# **Every job in this file is a thin wrapper around a `just` recipe, and that
-# shape is the point of the file.** The recipe run locally, on a stated
-# architecture, is the first gate; this workflow is the second opinion. A job
-# that re-spells a recipe's lines instead of invoking it is a defect here, not a
-# style preference — `just lint`'s `-p tf_tree_c --features test-hooks` clippy
-# row once lived in no workflow at all because a job had transcribed five of six
-# lines, and the `msrv` job below carries a longer version of the same story.
-#
-# **CI is real again, and what it found on its return is why it is worth
-# running.** Actions produced no run for this repository between 2026-07-23 and
-# 2026-08-16 — an account-level state on private repositories, confirmed rather
-# than inferred when making the repository public restored runs immediately, and
-# visible throughout in that GitHub-managed Dependabot runs never stopped while
-# *user* workflows did. Not one job in this file had ever executed. The first
-# runs after it returned found three latent bugs that no local gate had ever
-# been in a position to see: `c_char` signedness on aarch64 (`i8` vs `u8`, six
-# casts and two hard type errors), an exported symbol in no header tier, and a
-# container with no writable `ROS_HOME`. The first-ever run of `nightly.yml`, on
-# 2026-08-17, found two more.
-#
-# So a green check is evidence again — **but only of what the jobs cover.** The
-# outage is over; the reason the recipes came first is not. `just` is still what
-# gates a change before it is pushed, and everything that a shared runner cannot
-# measure honestly (`bench-check`'s pinned probe below, every timing recipe in
-# the justfile) is still gated on a host, by hand.
-#
-# **On aarch64, specifically.** The `ubuntu-24.04-arm` rows in the `test` and
-# `shm` matrices had never executed in the life of the project; they now run and
-# pass. That is *execution*, not a weak-memory proof. aarch64 reorders more than
-# x86-64, so it can surface a missing barrier — a green run is not evidence one
-# is absent. `just loom` remains the argument; these rows are corroboration.
+# Every job wraps a `just` recipe; a job that re-spells a recipe's lines drifts from it.
+# A green check covers only what the jobs cover: timing recipes are gated by hand on
+# a host. The aarch64 rows are execution, not a weak-memory proof (`just loom` is the argument).
 name: CI
 
 on:
@@ -44,83 +16,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # **`just lint`, not a transcription of two of its lines.**
-  #
-  # This job used to run `cargo fmt --all -- --check` and `cargo clippy
-  # --workspace --all-targets` directly. `just lint` is those two plus one
-  # clippy pass per feature configuration the `--workspace` pass compiles out.
-  #
-  # **No count of them is written here any more, and the deletion is the fix.**
-  # This paragraph said "five and six", was corrected to "seven more / eight"
-  # under the label *counted, not remembered*, and had drifted again before
-  # anyone re-read it. Twice is a stale number; three times is a class. The
-  # recipe is the list, and this prints its size:
-  #
-  #     awk '/^lint[: ]/{f=1;next} f&&/^[a-zA-Z0-9_-]+[: ]/{exit} f' justfile \
-  #       | grep -v '^[[:space:]]*#' | grep -c 'cargo clippy'
-  #
-  # The `grep -v` is load-bearing: the recipe body quotes the `--workspace`
-  # command inside a comment, so a bare `grep -c` over-counts by one. CLAUDE.md's
-  # `just lint` row already refuses to keep a count for the same reason; this
-  # comment is the site that had not caught up.
-  #
-  # They exist because a default-off (or default-*on*) feature makes a file
-  # invisible to `--workspace`. **The enumeration that used to sit here is
-  # deleted for the same reason the count was**: a hedged list is the same
-  # instrument as a hedged number, and it went stale the same way. The command
-  # above prints the rows; the recipe is the list. One of them —
-  # `-p tf_tree_c --features test-hooks` — ran in **no workflow at all** under
-  # the old spelling, and the justfile records that a real warning had been
-  # sitting in `publish.rs` unseen. Running the recipe is what makes CLAUDE.md's
-  # "CI mirrors these recipes 1:1" true rather than aspirational.
-  #
-  # `just lint` also depends on `no-build-output`, which rejects any tracked file
-  # carrying a cargo build-output signature. It runs first because it is the
-  # cheapest thing in the recipe and because 358 MiB of `target-*` directories
-  # reached `main` through three green runs of this very job.
-  #
-  # And on `no-conflict-markers`, for the same reason one job later: an
-  # unresolved `<<<<<<< Updated upstream` reached `main` inside
-  # `docs/decisions/README.md`'s status table, and **this job was green on it**,
-  # along with the other seventeen. A rebase on a dirty worktree autostashed,
-  # popped into a conflict after reporting success, and the markers were staged
-  # in the same command. `artifact-versions` reads that exact table and counts
-  # cells per row; a conflict marker is not a row.
-  #
-  # `just lint` depends on `py-compile`, which compiles the workspace-excluded
-  # `tf_tree_py` against `.venv`'s interpreter or, failing that, the one on
-  # `PATH` — so on this runner, which has no `.venv`, the dependency is a real
-  # gate rather than the loud skip it used to be. The `bindings` job below runs
-  # the same recipe against a pinned interpreter; see its comment for why both.
-  # `lint` also depends on `evidence-audit` and `artifact-versions`, which is
-  # why neither has a job of its own: both are pure text checks over the
-  # checkout and cost a fraction of a second, which `time` answers and this
-  # comment does not — the figures that used to be written here had gone stale
-  # by a factor of three. It depends on `sbom` too, for the
-  # opposite reason — that one checks nothing, it only runs. `scripts/sbom.py`
-  # was reached by exactly one caller, `release.yml`'s tag-gated
-  # `github-release` job, and the commit adding it landed after the last tag, so
-  # it had never executed on any path and no release carries an SBOM. This is
-  # where it becomes exercised before a release rather than during one; it costs
-  # one `cargo metadata` and no compile.
-  #
-  # **`just audit`, not `EmbarkStudios/cargo-deny-action`.** The old note here
-  # said the action stays because it supplies the binary and the recipe is one
-  # line either way. The first half stopped being a reason once this job grew a
-  # `taiki-e/install-action` step, which lists `cargo-deny` among its tools
-  # (checked against that repository's `TOOLS.md`, the same way the `c-surface`
-  # job below establishes that `cbindgen` is *not* in it). The second half was
-  # never a reason at all: one line is exactly how long `cargo fmt --all --
-  # --check` is, and that line drifting out of a job is the defect this file
-  # keeps finding. `deny.toml` is the configuration either way; what changes is
-  # that a contributor's `just audit` and this step are now the same command.
+  # `just lint` is the recipe list (no count is kept here). It depends on
+  # `no-build-output`, `no-conflict-markers`, `py-compile`, `evidence-audit`,
+  # `artifact-versions` (pure text checks, no job of their own) and `sbom`
+  # (checks nothing; exercises `scripts/sbom.py` before a release does).
+  # `just audit` runs `cargo deny` with `deny.toml`.
   lint:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      # Tags and full history: `artifact-versions`' changelog-freshness rule
-      # needs `git describe`, and the default shallow checkout has no tags, so it
-      # would report NOT CHECKED and pass here forever.
+      # Full history and tags: `artifact-versions`' changelog-freshness rule uses `git describe`.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -136,52 +41,9 @@ jobs:
       - name: just audit
         run: just audit
 
-  # **The MSRV floor, enforced rather than intended** (`SUPPORT.md`, and
-  # `docs/PHASE5.md` §10's "MSRV policy and a CI matrix pinning it").
-  #
-  # `rust-version` in the workspace manifest is a promise to every downstream
-  # that this builds on that floor. Nothing in the other jobs checks it: they all
-  # run `stable`, where a newer-than-floor method compiles perfectly and the
-  # breakage is discovered by a user on an older toolchain.
-  #
-  # **This job used to transcribe `just msrv` instead of running it, and the
-  # transcription was both short and wrong.**
-  #
-  # Short: the recipe has three arms and this job had two. The missing one greps
-  # the prose a user actually reads — `README.md`, `SUPPORT.md`,
-  # `crates/tf_tree/src/lib.rs` — for the floor, and it exists *because* README
-  # said 1.85 while the manifest said 1.87 and both of the arms that were here
-  # passed anyway. That arm therefore ran in no workflow at all.
-  #
-  # Wrong: the recipe builds with `cargo "+$want"`; the transcription dropped the
-  # `+` and ran a bare `cargo build`. `rust-toolchain.toml` in this repository
-  # pins `channel = "stable"`, and a directory's `rust-toolchain.toml` beats
-  # `rustup default`, which is all `dtolnay/rust-toolchain` sets (its `action.yml`
-  # runs `rustup default <toolchain>` and exports no `RUSTUP_TOOLCHAIN`). Measured
-  # in the repository root:
-  #
-  #     $ rustup show active-toolchain -v
-  #     stable-x86_64-unknown-linux-gnu
-  #     active because: overridden by '/home/dev/src/tf_tree/rust-toolchain.toml'
-  #
-  # So the one step that was supposed to compile on the floor would have compiled
-  # on `stable` — a green msrv job proving nothing about the MSRV. `cargo +1.87`
-  # is unambiguous under every rustup precedence rule, and it is what the recipe
-  # already spelled.
-  #
-  # What survives here is the one thing the recipe cannot do for itself: the
-  # floor's toolchain has to exist before `cargo +$want` can use it, and the
-  # recipe deliberately *fails* rather than falling back to `stable` when it does
-  # not. So the version is still read from the manifest — never hardcoded, which
-  # would drift from `rust-version` and pass while the promise was broken — and
-  # handed to `dtolnay/rust-toolchain`, whose `rustup toolchain install` leaves it
-  # named `<floor>-<triple>` for the recipe's `rustup toolchain list` check to
-  # find. Everything after that is `just msrv`.
-  #
-  # The rest of the argument lives with the recipe, where a developer running it
-  # will read it: `--lib --bins` and not `test`, the committed `Cargo.lock` used
-  # as-is, and why the two workspace-excluded crates are compared rather than
-  # compiled.
+  # The MSRV floor (`SUPPORT.md`, `docs/PHASE5.md` §10). The version is read from
+  # the manifest and installed so `just msrv` (`cargo +<floor>`, which beats
+  # `rust-toolchain.toml`) can find it; the recipe fails rather than fall back to stable.
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -203,36 +65,10 @@ jobs:
       - name: just msrv
         run: just msrv
 
-  # `crates/tf_tree_py` is excluded from the workspace, so `cargo clippy
-  # --workspace` above never compiles it. That gap shipped a real bug: a
-  # `transmute::<EdgeWriter, Publisher>` that compiled only while the two types
-  # happened to be the same size, and which silently dropped the claim lease and
-  # the fork guard. It survived six PRs because nothing built the crate.
-  #
-  # Demonstrated against the historical bug itself. Restoring the cross-type
-  # `transmute::<EdgeWriter, Publisher>` gives **4 errors from a clippy that
-  # names the crate's own manifest and 0 from `cargo clippy --workspace`**,
-  # because the workspace does not compile this crate at all — an error confined
-  # to it is invisible, however loud.
-  #
-  # **The same crate, on the platforms the wheel matrix ships to.**
-  #
-  # `tf_tree_py` always enables `shm`, but the facade gates its whole
-  # shared-arena surface on `#[cfg(all(feature = "shm", target_os = "linux"))]`
-  # — so it is the *target*, not the feature, that decides whether `Open`,
-  # `AttachMode`, `CreatePolicy` and `OpenError` exist. An unconditional import
-  # of any of them compiles here and fails everywhere else.
-  #
-  # That is not hypothetical: it shipped. Both macOS and both Windows rows of
-  # `wheels.yml` failed on the `v0.0.1` tag with `E0432`/`E0433`, which was the
-  # first time that workflow had ever run — it triggers only on `v*`, so the
-  # binding had never once been compiled off Linux. 0.0.1 has no wheel and
-  # cannot have one.
-  #
-  # `cargo check` on native runners rather than a cross-compile from Linux:
-  # blake3's build script needs a C toolchain for the target, so a cross-check
-  # dies in a dependency before reaching this crate. Native runners have one.
-  # It is a check, not a build — no Python, no linking, no wheel.
+  # `tf_tree_py` is outside the workspace, so `cargo clippy --workspace` never
+  # compiles it. The facade gates its shared-arena surface on `shm` and Linux, so
+  # only a native macOS/Windows build catches an unconditional import. A check,
+  # not a build; native because blake3's build script needs a target C toolchain.
   bindings-non-linux:
     name: python bindings compile (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -250,32 +86,10 @@ jobs:
       - name: cargo check (tf_tree_py)
         run: cargo check --manifest-path crates/tf_tree_py/Cargo.toml --features pyo3/extension-module,pyo3/abi3-py39
 
-  # **`just py-compile`, not a re-spelling of that recipe's two lines** — the
-  # transcription this file keeps paying for. One other outlives it: the
-  # `cargo check` in `bindings-non-linux` above, which no recipe spells either
-  # and which is a separate change, not an exception to the rule. The job
-  # could not invoke the recipe before, because the recipe skipped when there was
-  # no `.venv`, which is this runner: it would have gated nothing. `py-compile`
-  # now falls back to the interpreter on `PATH` — the one `actions/setup-python`
-  # puts there — and carries the `cargo fmt` line as well, which nothing else in
-  # CI covers for this crate: `just lint`'s `cargo fmt --all -- --check` reaches
-  # workspace *members* only, and this one is excluded.
-  #
-  # Measured with a cheaper probe than the transmute above, on a checkout with no
-  # `.venv`: a `v.len() == 0` appended to `crates/tf_tree_py/src/lib.rs` left
-  # `cargo clippy --workspace --all-targets -- -D warnings` exiting 0, and took
-  # `just py-compile` to exit 101.
-  #
-  # **The recipe now also runs in the `lint` job, as a dependency, and this job
-  # stays anyway.** One spelling invoked twice is not two spellings, and the two
-  # invocations are not the same compile: `pyo3-build-config` executes the
-  # interpreter and emits a `Py_3_x` cfg for every version at or below it
-  # (measured against 3.12 — `Py_3_8` through `Py_3_12`), so which Python is
-  # found decides what is compiled. This job pins 3.13, the `python` job's
-  # `just py-lint` gets uv's 3.14, and `lint` takes whatever the runner image
-  # ships. It is also the only place the binding gate is named: were `lint`'s
-  # dependency list ever trimmed, a job that ran in no workflow is precisely the
-  # failure this file was rebuilt around.
+  # `just py-compile` (fmt + clippy for `tf_tree_py`, which `just lint`'s fmt does
+  # not reach). Also a `lint` dependency, but `pyo3-build-config` emits `Py_3_x`
+  # cfgs for the interpreter it finds, so this job pins 3.13 and is the only place
+  # the binding gate is named.
   bindings:
     name: python bindings compile
     runs-on: ubuntu-latest
@@ -293,16 +107,8 @@ jobs:
           tool: just
       - name: just py-compile
         run: just py-compile
-      # **The cross-compile half, and it runs here because it can only run on
-      # Linux.** `bindings-non-linux` checks macOS and Windows on *native*
-      # runners, so it never needs `tf_tree_py`'s `pure-hash` feature and never
-      # compiles it. This step is the only thing that does.
-      #
-      # What it guards is #180: `macos-15-intel` is the last x86_64 macOS image
-      # Actions offers and it disappears in August 2027, at which point the
-      # fallback is cross-building x86_64 from the arm64 runner. Measured, that
-      # fallback needs seven things and six are now true; this keeps the one that
-      # was a one-line diff from silently reverting.
+      # Cross-compile half, Linux only: the only thing that compiles `tf_tree_py`'s
+      # `pure-hash` feature. Guards #180 (`macos-15-intel` disappears August 2027).
       - name: just py-cross-check
         run: just py-cross-check
 
@@ -311,8 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 is a first-class target for the atomic-ordering guarantees;
-        # run the suite there as well as on x86_64.
+        # aarch64 is a first-class target for the atomic-ordering guarantees.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
@@ -322,53 +127,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # **`just test`, not its parts.** This job used to run `cargo nextest run
-      # --workspace`, `cargo test --doc --workspace` and `just ingest-check` as
-      # three separate steps. That is `just test` minus exactly one line —
-      # `test-rust`'s `cargo nextest run -p tf_tree_c --features bridge`, which
-      # covers the ten `extern "C"` entry points of the §5 ingest seam, the only
-      # ones that both decide and write. Measured rather than asserted: that
-      # command runs **60** tests where the default-feature build runs **31**,
-      # so 29 tests existed and executed in no job here at all. `just
-      # c-abi-check` runs the same target under Miri, and that recipe was in no
-      # workflow either — see the `c-abi` job below.
+      # `just test` also runs `tf_tree_c --features bridge` (the §5 ingest seam's
+      # `extern "C"` entry points), which the default-feature build compiles out.
       - name: just test
         run: just test
 
-  # **`tf_tree` with `unstable` OFF — the tier every published consumer gets.**
-  #
-  # No `--workspace` job compiles the facade's own default feature set with the
-  # feature off. `lint` and `test` both run `--workspace`, and cargo's resolver
-  # unifies features across a workspace build, so `tf_tree_cli`, `tf_tree_c`,
-  # `tf_tree_bench` and `tf_tree_py` — **four**, not three — each asking for
-  # `tf_tree/unstable` turns the feature on for the facade everywhere: in
-  # `cargo clippy --workspace`, in `cargo nextest run --workspace`, and in
-  # `cargo build --workspace --all-targets`. A `-p tf_tree` selection is what
-  # does not, which is what `just stable-tier-check` is made of.
-  #
-  # Note "no `--workspace` job" and not "no other job": `just miri` and
-  # `just test-doc-error-codes` are `-p tf_tree` selections too and do reach
-  # `FEATURES=counters,default`. What is unique here is the *set* of stable-tier
-  # checks — three clippy configurations, the tier's own rustdoc, the consumer
-  # scan and the test-count floor. `docs/API.md` §2.6 carries the measurement.
-  #
-  # This list is prose and nothing reads it: the recipe's scan compares
-  # `docs/API.md` §6 row 4 and `crates/tf_tree/Cargo.toml`'s `unstable` comment
-  # against the manifests, and never this file. That is exactly how it came to
-  # say three.
-  #
-  # **The recipe was made to fail before this job was written.** Reintroducing
-  # the branch's own defect — `self.arena_view()` where `frozen.rs` now calls
-  # `self.view()` — leaves `cargo check --workspace --all-targets` and
-  # `cargo check -p tf_tree --all-targets --features shm` both at exit 0, and
-  # makes this recipe's second line report
-  # `error[E0599]: no method named 'arena_view'`.
-  #
-  # Its own job rather than a step bolted onto `test` or `lint`, because it needs
-  # `clippy` (which `test`'s toolchain does not install) *and* `cargo-nextest`
-  # (which `lint`'s does not). Adding one binary to the other job is the
-  # cheaper-looking change and is exactly how a gate comes to fail on a missing
-  # tool instead of on the code.
+  # `tf_tree` with `unstable` OFF, the tier a published consumer gets. `--workspace`
+  # unifies the four consumers' `tf_tree/unstable` into the facade, so only a
+  # `-p tf_tree` selection compiles it off (`just stable-tier-check`;
+  # `docs/API.md` §2.6). Its own job: it needs both `clippy` and `cargo-nextest`.
   stable-tier:
     name: default features (no unstable)
     runs-on: ubuntu-latest
@@ -384,21 +151,8 @@ jobs:
       - name: just stable-tier-check
         run: just stable-tier-check
 
-  # `just doc` — rustdoc with warnings denied, at the configuration docs.rs
-  # builds. All five publishable crates now carry `all-features = true` and
-  # `rustdoc-args = ["--cfg", "docsrs"]` in `[package.metadata.docs.rs]`;
-  # `tf_tree_ipc` did not until this commit, so the recipe's own justification
-  # for that flag was false for one of the crates it names. The four
-  # `publish = false` crates on the recipe's first line are there because they
-  # are public API to somebody — a C caller, an operator, the ROS node.
-  #
-  # This job previously spelled its own `cargo doc` line, covering six of the
-  # workspace's eleven members and omitting `tf_tree_c`, `tf_tree_ingest`,
-  # `tf_tree_bridge`, `tf_tree_bench` and `xtask`. It had never executed, so
-  # none of it was enforced anywhere, and `cargo doc --no-deps --workspace` had
-  # accumulated **80** warnings — 44 unresolved intra-doc links, 35 public items
-  # linking to private ones, one redundant explicit target. All 80 are fixed and
-  # the recipe is now the gate; it covers the five members this job missed.
+  # `just doc`: rustdoc with warnings denied, at the docs.rs configuration, over the
+  # five publishable crates and the four public-API `publish = false` ones.
   docs:
     name: docs
     runs-on: ubuntu-latest
@@ -412,21 +166,8 @@ jobs:
       - name: just doc
         run: just doc
 
-  # **`just c-abi-check` — `docs/PHASE4.md` §6.1 and §7 gate 4, which ran in no
-  # workflow until this job existed.**
-  #
-  # The C ABI is the one place in the workspace where `unsafe` faces a caller
-  # the compiler cannot see, and `tf_tree_c` is deliberately excluded from the
-  # `miri` job below. So the four Miri targets this recipe runs — `abi`, `live`,
-  # `publish` and the `bridge` seam, the last of which hands C a fistful of
-  # `const char *` borrowed from the handle — plus the ASan pass had exactly one
-  # gate: whoever remembered to type it. The justfile records that Miri caught a
-  # real alignment UB here, in a *test* that claimed foreign pointers were
-  # safely rejected.
-  #
-  # Its own job rather than a step on `miri`: `-Zbuild-std` for the ASan row is
-  # a from-scratch standard library and pushes this past the wall-clock of
-  # everything else in the file.
+  # `just c-abi-check` (`docs/PHASE4.md` §6.1, §7 gate 4): Miri on the C ABI's four
+  # targets plus ASan. Its own job: `-Zbuild-std` for ASan is slow.
   c-abi:
     name: C ABI (Miri + ASan)
     runs-on: ubuntu-latest
@@ -435,9 +176,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          # `miri` for the four Miri rows; `rust-src` for the ASan row's
-          # `-Zbuild-std`, without which a use-after-free inside `Box::from_raw`
-          # is invisible.
+          # `miri`; `rust-src` for the ASan row's `-Zbuild-std`.
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -446,45 +185,12 @@ jobs:
       - name: just c-abi-check
         run: just c-abi-check
 
-  # **The two recipes that check the *header* and the *package* rather than the
-  # crate — `docs/PHASE4.md` §6.2 and §4.4. Neither was in any workflow.**
-  #
-  # `c-header-check` is the only thing in this repository that compiles the
-  # committed `crates/tf_tree_c/include/*.h`, and it is the only thing that
-  # notices when they have drifted from `src/`. The justfile records the failure
-  # mode concretely: a header with an unbalanced `#endif` shipped once and every
-  # Rust test still passed.
-  #
-  # `cmake-check` builds a downstream project that reaches tf_tree only through
-  # `find_package(tf_tree CONFIG)`. Three real packaging defects were invisible
-  # until that consumer existed.
-  #
-  # **`cbindgen` is what this job was missing, and without it the job could not
-  # have passed on any runner.** `just c-header-check`'s first line is
-  # `cargo xtask headers --check`, which *generates* both headers with the
-  # `cbindgen` binary before diffing them against the committed files — so a
-  # missing binary is not a skipped regeneration, it is `exit 1` before the
-  # compile matrix runs at all. Reproduced locally by removing `cbindgen` from
-  # `$PATH`:
-  #
-  #     xtask headers: could not run `cbindgen`: No such file or directory (os error 2)
-  #     error: Recipe `c-header-check` failed with exit code 1
-  #
-  # It cannot come from `taiki-e/install-action` — `cbindgen` is not in that
-  # action's tool list (checked against its `TOOLS.md`) — and it deliberately is
-  # not a workspace dependency (`docs/decisions/0007`: MPL-2.0 against
-  # `deny.toml`'s allowlist), so `cargo install` is the route. Pinned: the check
-  # compares generated text against a committed file, so an unpinned install
-  # makes cbindgen's release cadence a PR-blocking input. The pin is not papering
-  # over a known incompatibility — 0.28.0 and 0.29.4 were both measured to
-  # reproduce the committed headers byte-for-byte.
-  #
-  # `clang` is installed explicitly even though `ubuntu-24.04` preinstalls it
-  # (the image's `install-clang.sh` runs `update-alternatives` for unversioned
-  # `clang`/`clang++`, so §6.2's second compiler is there today). The step stays
-  # because `just c-header-check` does not skip a missing compiler, it fails on
-  # it, and an image change should not be able to turn a two-compiler matrix into
-  # a one-compiler one.
+  # `docs/PHASE4.md` §6.2 and §4.4. `c-header-check` compiles the committed headers
+  # and fails on drift from `src/`; `cmake-check` builds a `find_package(tf_tree CONFIG)`
+  # consumer. `cbindgen` is not in `taiki-e/install-action` and not a workspace
+  # dependency (0007, MPL-2.0), so it is installed pinned: the check diffs generated
+  # text (0.28.0 and 0.29.4 both reproduce the headers). `clang` is named because the
+  # recipe fails, not skips, on a missing compiler.
   c-surface:
     name: C header + CMake package
     runs-on: ubuntu-latest
@@ -505,16 +211,8 @@ jobs:
       - name: just cmake-check
         run: just cmake-check
 
-  # **The Python suite, which ran in no workflow.**
-  #
-  # The `bindings` job below compiles `tf_tree_py` and lints it; nothing
-  # anywhere executed a single `pytest`. `docs/PHASE3.md` §7.3 requires the
-  # suite to pass on **both** interpreters — 3.14 and the free-threaded 3.14t —
-  # and that is exactly the claim `tf_tree_py`'s `gil_used = false` rests on.
-  # The `wheels` workflow builds wheels and never runs a test against one.
-  #
-  # `just py-setup` provisions both interpreters through uv, so the floors in
-  # §10.1 are what actually gets used rather than whatever the runner ships.
+  # The Python suite on both interpreters, 3.14 and 3.14t (`docs/PHASE3.md` §7.3);
+  # `just py-setup` provisions them through uv.
   python:
     name: python bindings (pytest, 3.14 + 3.14t)
     runs-on: ubuntu-latest
@@ -531,30 +229,9 @@ jobs:
           tool: just
       - name: just py-setup
         run: just py-setup
-      # **`just quickstart` — the README's documented first five minutes, which
-      # ran in no workflow.** CLAUDE.md's command table lists it as a gate; it
-      # was one only for whoever typed it. It executes the `## Start with no
-      # data at all` snippet *out of `README.md`* and compares stdout against the
-      # `# ->` marker in the snippet itself, so it fails when an API change makes
-      # the documentation a reader follows stop working — which is a per-PR
-      # concern, not a nightly one, because the documentation drifts on the same
-      # commits the API does.
-      #
-      # It is here, in this job, rather than in one of its own, because that is
-      # what makes it nearly free. Cold it needs uv, two CPython interpreters and
-      # a from-scratch `maturin develop` — all of which this job has already paid
-      # for by the step above. Measured on x86-64 with those already in place:
-      #
-      #     $ /usr/bin/time -f "%e s" just quickstart
-      #     0.72 s          (warm; the smoke script alone is 0.10 s)
-      #
-      # and 7.11 s from no `.venv`/`.venv-t` at all with uv's download cache
-      # warm, which is the closest local approximation of a cold runner and still
-      # an underestimate of one.
-      #
-      # Before `just py-lint` and `just py-test` deliberately: it is the step a
-      # newcomer's experience depends on, and putting it after the suite would
-      # mean a broken quickstart is only ever reported behind a test failure.
+      # `just quickstart` runs the README snippet and compares stdout to its `# ->`
+      # marker. Here because the interpreters are already provisioned, and before
+      # the suite so a broken quickstart is not reported behind a test failure.
       - name: just quickstart
         run: just quickstart
       - name: just py-lint
@@ -564,30 +241,9 @@ jobs:
       - name: just py-test-freethreaded
         run: just py-test-freethreaded
 
-  # **CI is the stricter of the two runs, and it now gets there by adding a flag
-  # to the recipe rather than by retyping the recipe.**
-  #
-  # This job used to spell both `cargo miri test` lines out again so it could put
-  # `-Zmiri-strict-provenance` in front of them, and the reason it had to was one
-  # word in the justfile: the second line assigned `MIRIFLAGS=` outright, so
-  # anything the environment set was discarded and there was no way to ask for
-  # provenance checking without losing `-Zmiri-disable-isolation`. The recipe now
-  # appends to `${MIRIFLAGS:-}` instead, so the flag can be set here, at the job
-  # level, and the recipe stays the single spelling of *which* targets are
-  # interpreted under Miri. Which matters: `docs/decisions/0017` says a second
-  # `unsafe` in `tf_tree` adds its target to that `--test` list, and under the old
-  # arrangement it would have been added in one place and silently not run in the
-  # other.
-  #
-  # A green `just miri` on a developer's machine still does not imply a green job
-  # here — `MIRIFLAGS` is unset locally and provenance checking is off. That
-  # asymmetry is deliberate and unchanged; what changed is that it is now the only
-  # difference between the two, instead of one difference among however many a
-  # transcription had accumulated.
-  # **Both architectures since 2026-09-09.** This job was `ubuntu-latest` alone
-  # for the life of the project, while `test` and `shm` have carried
-  # `ubuntu-24.04-arm` since aarch64 CI became real. `PHASE1.md` §13's box asks
-  # for §10's tests "in CI" and the aarch64 half is the half it was written for.
+  # CI is the stricter run: it sets `-Zmiri-strict-provenance` in `MIRIFLAGS`, which
+  # the recipe appends to, so the recipe stays the one list of Miri targets
+  # (`docs/decisions/0017`). Both architectures (`PHASE1.md` §13).
   miri:
     name: miri (${{ matrix.os }})
     strategy:
@@ -595,8 +251,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # Both of the recipe's lines, and only this job sets it. The recipe appends
-    # its own `-Zmiri-disable-isolation` to whatever is here.
+    # The recipe appends `-Zmiri-disable-isolation`.
     env:
       MIRIFLAGS: "-Zmiri-strict-provenance"
     steps:
@@ -610,36 +265,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: just miri
         run: just miri
-      # The two `compile_fail,E0277` pins. Stable rustdoc parses the error code
-      # and ignores it, so `just test-doc` cannot enforce them; this job already
-      # has the nightly toolchain that can. Seconds, and it is here rather than
-      # in `test` because that is the only place the toolchain exists.
-      # One row only: these are rustdoc diagnostics, identical on both
-      # architectures, and running them twice would say nothing new.
+      # The `compile_fail,E0277` pins need nightly rustdoc; one row, the diagnostics are identical.
       - name: just test-doc-error-codes
         if: matrix.os == 'ubuntu-latest'
         run: just test-doc-error-codes
 
-  # The only job that needs a container, because it is the only job that needs
-  # ROS 2. `tf_tree_tf2_sys` is excluded from the workspace (it links `-ltf2`, so
-  # it does not build on a plain runner), which also excludes it from the `lint`
-  # and `test` jobs above: their `--workspace` never sees its `unsafe`, its
-  # clippy lints or its unit tests. Nor do they see anything behind
-  # `tf_tree_bench`'s `tf2` feature. This job is where all of that is checked.
-  #
-  # It builds `docker/tf2/` on every run (a ROS 2 base image plus a rustup
-  # toolchain, several minutes) and it is deliberately the same `just` recipe a
-  # developer runs locally — CI mirrors the recipes 1:1 rather than restating
-  # the commands.
-  #
-  # The heavier tf2 recipes stay off *this* workflow, and they split two ways.
-  # `tf2-differential` and `tf2-replay` are tests, not measurements, so they run
-  # on a schedule instead of on every pull request — `nightly.yml`'s
-  # `tf2-differential` job is where, and it is the only place they run. They are
-  # here in comment form so that "excluded from PRs" cannot quietly become
-  # "excluded from everything", which is what it was until that job existed.
-  # `tf2-bench` and `tf2-scaling` are in no workflow at all and should not be:
-  # they are timings, which a shared runner cannot produce meaningfully.
+  # The only job that needs a container (ROS 2). `tf_tree_tf2_sys` and `ros/*` are
+  # outside the workspace, so `lint` and `test` never see them. `tf2-differential`
+  # and `tf2-replay` run in `nightly.yml`; `tf2-bench` and `tf2-scaling` are timings
+  # and run in no workflow.
   tf2:
     name: tf2 bridge (container)
     runs-on: ubuntu-latest
@@ -652,50 +286,28 @@ jobs:
       - name: just tf2-check
         run: just tf2-check
 
-      # `ros/tf_tree_ros` is an `ament_cmake` package outside the cargo
-      # workspace, so `lint` and `test` above compile none of it: not the
-      # subscriptions, not the QoS §5.2 is NORMATIVE about, not the four ctest
-      # binaries. CLAUDE.md says "`just ros-build` and `just ros-test` are its
-      # entire gate" — this is where that gate runs. It reuses the image the
-      # step above already built, so the marginal cost is the colcon build and
-      # the ctests.
+      # `ros/tf_tree_ros` (ament_cmake, outside cargo): `just ros-build` and
+      # `just ros-test` are its entire gate; reuses the image built above.
       - name: just ros-test
         run: just ros-test
 
-  # The `shm` feature is off by default, so `lint` and `test` above compile none
-  # of it: not `MappedArena`'s ~390 lines of syscall-facing `unsafe`, not the
-  # multi-process gate, not the shm benchmarks. Without this job that code is
-  # neither clippy'd nor executed anywhere in CI. Linux-only by construction
-  # (`memfd_create` + `F_ADD_SEALS`), which is why it is not in the `test`
-  # matrix.
+  # `shm` is off by default, so `lint` and `test` compile none of it. Linux-only
+  # (`memfd_create` + `F_ADD_SEALS`).
   shm:
     name: shared memory (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        # aarch64 is not optional here. A1 and A5 are *ordering* fixes, and the
-        # whole atomics discipline exists for weak memory models — x86-64's
-        # near-TSO would hide exactly the bugs they prevent.
+        # aarch64 is required: x86-64's near-TSO hides the ordering bugs A1 and A5 fix.
         os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # 20 until `just no-network` joined it: that recipe builds `tf_tree_cli`'s
-    # test targets for its positive control, which no other step in this job
-    # needs, and then traces the library's test binaries single-threaded under
-    # `strace -f`. (A binary count stood here; the recipe prints its own.)
+    # `just no-network` builds extra targets and traces single-threaded under `strace -f`.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # Declared, not inherited. `dtolnay/rust-toolchain` installs with
-          # `--profile minimal`, and this job runs `cargo fmt` below and the
-          # `cargo clippy` lines inside `just shm-check` — no count of them
-          # here, for the reason the `lint` job's header sets out; this comment
-          # said "five", the recipe had six the day it was written, and it has
-          # been wrong ever since. They work today only
-          # because the runner image happens to `rustup component add rustfmt
-          # clippy` after its own minimal install; an image that stopped would
-          # turn this job into `error: no such command: clippy`.
+          # Declared: the minimal profile has neither, and `cargo fmt` and `just shm-check` need them.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -708,79 +320,26 @@ jobs:
           just shm-check
           just shm-rendezvous
 
-      # **`docs/PHASE5.md` §5.1's NORMATIVE assertion, and §13's box 4.** It
-      # lives on this job rather than on a job of its own because it needs
-      # exactly what this one already has: a Linux runner and the `shm` feature
-      # compiled in. Without `shm` the Phase 2 rendezvous — the one socket the
-      # library is *supposed* to open — is not built, and the recipe refuses a
-      # run in which it was never traced rather than reporting a green scan over
-      # a suite that opened nothing.
-      #
-      # `strace` is installed explicitly rather than assumed. It is present on
-      # today's `ubuntu-latest` image, which is precisely the reason to name it:
-      # an image that dropped it would turn this assertion into a refusal on
-      # every run, and the refusal is correct but the diagnosis would be a
-      # runner change rather than a code one. `apt-get` here is environment
-      # setup, the same shape as the `c-surface` job's `clang`, and the check
-      # itself is the recipe.
-      #
-      # Both matrix rows run it. aarch64 is not corroboration here the way it is
-      # for the ordering claims: `socket(2)`'s family argument is not an
-      # architecture question. What the second row buys is that the *assertion*
-      # keeps working under the runner this project actually ships on, and it
-      # costs ~25 s.
+      # `docs/PHASE5.md` §5.1 (NORMATIVE) and §13 box 4. Needs `shm` compiled in (the
+      # rendezvous socket must be traced); `strace` is named rather than assumed from
+      # the image. Both rows run it.
       - name: install strace
         run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
       - name: just no-network
         run: just no-network
 
-      # PHASE2 §12.3 criterion 4 — SIGKILL a writer, measure the re-claim.
-      #
-      # **The one Phase 2 gate criterion this host class can actually hold**,
-      # and it ran in no workflow until now. It is licensed onto a runner that
-      # fails `Fitness::probe` by PHASE5 §9.3's one-sided-budget amendment: every
-      # check the probe fails makes a reclaim *longer*, so a PASS with margin is
-      # conservative and a FAIL is not attributable to the runner. The margin is
-      # ~60x (p99 0.16 ms against a 10 ms budget) and the run costs ~0.2 s, so
-      # scheduler noise cannot flip it, while a reap that had fallen back to a
-      # timeout would land in milliseconds-to-seconds.
-      #
-      # **`may-refuse`, not `must-pass`, and the reason is the whole point of
-      # `gate.rs`.** `reclaim_latency` exits 2 for its own non-vacuity refusal —
-      # *"N of 200 claims succeeded immediately; this run measured process
-      # teardown, not reclaim latency. INVALID, not FAIL."* — which is a
-      # statement about the runner, not the code. On a loaded 2-vCPU hosted
-      # runner the parent can be descheduled between `kill(2)` returning and the
-      # first `reap_dead()`/`claim()`, and `must-pass` would map that exit 2 to
-      # exit 1: a red job indistinguishable from a genuine p99 regression. That
-      # collapse is exactly what this module was written to prevent, so wiring
-      # it here would have been the bug in its own first customer.
-      #
-      # The refusal stays visible: `may-refuse` emits a `::warning::` on exit 2
-      # rather than passing silently. `scripts/gate-run.sh` is what reads the
-      # code, so this job cannot re-spell the contract and drift from it.
+      # PHASE2 §12.3 criterion 4: SIGKILL a writer, measure the re-claim. ~60x margin
+      # (p99 0.16 ms against 10 ms). `may-refuse`: exit 2 (non-vacuity refusal) is a
+      # runner statement, so it warns instead of failing; `scripts/gate-run.sh` reads the code.
       - name: just gate reclaim-latency may-refuse
         run: just gate reclaim-latency may-refuse
 
-      # The reader itself, all nine (policy x exit code) cells against a stub.
-      # A policy runner that mis-reads one cell is invisible: every gate still
-      # prints its own verdict and only the job colour is wrong.
+      # The reader's nine (policy x exit code) cells against a stub.
       - name: gate-run self-test
         run: ./scripts/gate-run.sh --self-test
 
-  # Spelled as the recipe rather than as its body. It is one line either way,
-  # and it is the *argument* half of the weak-memory defence — the aarch64 rows
-  # above now execute and pass, but a green run on hardware corroborates an
-  # ordering claim and does not prove one. This is the model checker, so it
-  # should be impossible for it to drift from what a developer runs.
-  # **Both architectures since 2026-09-09**, and this is the job where that
-  # matters most. `PROJECT.md` §6's design smell is "weakening an atomic
-  # ordering because a test passes on x86-64", and until now the model checker
-  # that exists to catch it ran on x86-64 only. Loom is still the *argument* —
-  # it explores schedules under a memory model rather than measuring a CPU — so
-  # the aarch64 row is corroboration, not a weak-memory proof. What it does buy
-  # is that the argument is no longer produced solely on the architecture the
-  # smell names.
+  # The model checker, the argument half of the weak-memory defence (`PROJECT.md`
+  # §6); both architectures, the aarch64 row is corroboration.
   loom:
     name: loom (${{ matrix.os }})
     strategy:
@@ -798,34 +357,11 @@ jobs:
       - name: just loom
         run: just loom
 
-  # `docs/PHASE5.md` §10: "the benchmark artifact as a regression gate".
-  #
-  # Runs `just bench-check`, which regenerates the §9 artifact and compares it
-  # against `crates/tf_tree_bench/baseline/results.json`. Deliberately
-  # single-runner and `ubuntu-latest` only.
-  #
-  # **The reason for that used to be "the comparison ignores host facts by
-  # construction, so an extra architecture would re-run the same one
-  # host-independent claim", and half of it expired on 2026-09-10.** It ignores
-  # every host fact in the *provenance header* — CPU model, cores, kernel,
-  # governor, load, and all `reason` prose — and that part is unchanged. But
-  # `docs/decisions/0021` step 4 gated `arena_memory_floor`'s
-  # `idle_arena_resident_bytes`, a whole-process, page-quantised Pss delta, and
-  # this job compares it against a baseline cut on the maintainer's machine. That
-  # is the first host-*dependent* number this gate has ever held, and it is
-  # deliberately banded wide enough (`RESIDENCY_SLACK`, 300%) to clear a 64 KiB
-  # base page. So the surviving reason for one runner is narrower: a second
-  # architecture would add one more draw of that same figure and nothing else.
-  # If this job ever fails on it, the finding is that the residency figure is not
-  # portable — read the two numbers it prints before assuming a regression.
-  #
-  # **A green tick here is not evidence of a performance claim**, and that is
-  # true now that runs happen rather than in spite of it. A shared runner's
-  # neighbours are not observable from inside it, so a timing measured here
-  # answers a different question from the one the baseline was cut against; the
-  # gate is `just bench-check`, run locally on the arch stated in the PR. See the
-  # `bench-check` step below for why this job cannot pass on a hosted runner at
-  # all today.
+  # `docs/PHASE5.md` §10: `just bench-check` regenerates the §9 artifact and compares
+  # it to `crates/tf_tree_bench/baseline/results.json`. One runner: the comparison
+  # ignores provenance host facts, and `idle_arena_resident_bytes` (0021 step 4,
+  # `RESIDENCY_SLACK` 300%) is the one host-dependent figure. A green tick is not a
+  # performance claim; the gate is `just bench-check` run locally.
   bench-gate:
     name: benchmark regression gate
     runs-on: ubuntu-latest
@@ -833,69 +369,28 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # `just embed-cost-check` below opens with `cargo fmt --check` and
-          # `cargo clippy` lines; see the `shm` job for why these are named
-          # rather than inherited from the runner image, and the `lint` job for
-          # why no count of them is kept beside it.
+          # Named, not inherited from the runner image.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: just,cargo-nextest
-      # `--workspace` builds default features, so `tf_tree_core/bench-probe` and
-      # the half of `tf_tree_bench::embed` that drives it are compiled out of
-      # `just test` — the same hole `shm` has, and this is its `shm-check`. It is
-      # a debug clippy/test pass over one crate and builds no extra profile tree.
+      # `--workspace` compiles out `tf_tree_core/bench-probe` and `tf_tree_bench::embed`'s
+      # driver; this is their debug clippy/test pass.
       - name: just embed-cost-check
         run: just embed-cost-check
-      # `bench-check` depends on `just embed-cost`, so this step also builds the
-      # `[profile.embedder]` tree (166 MiB, ~10 s measured locally) and runs the
-      # probe under `taskset -c 2` — which needs a runner with at least three
-      # logical CPUs.
-      #
-      # **This comment used to say the job could not pass on a hosted runner, and
-      # execution refuted it.** The argument was that GitHub's standard Linux
-      # runner is 4 vCPU for a public repository and 2 for a private one, and
-      # `tf_tree` was private, so CPU 2 would not exist. `tf_tree` is public now —
-      # that is how the Actions outage was confirmed — and the prediction was
-      # tested rather than re-reasoned about:
-      #
-      #     gh run view --job 95381266134   # ci.yml run 32027957136, 2026-08-17
-      #     just embed-cost-check  success
-      #     just bench-check       success   (embedder 323.5 ns, release 250.0 ns)
-      #
-      # `taskset -c 2` ran and the pin held. The refuted expectation is left in
-      # place rather than deleted because it is the reason the probe is pinned at
-      # all: if this repository ever goes private again the row stops being
-      # producible, and the fix is *not* to unpin (an unpinned run cannot resolve
-      # §9.2's 5 %) nor to pick the CPU dynamically (that changes the conditions
-      # `crates/tf_tree_bench/baseline/results.json` was cut under, which is a
-      # benchmarking decision and not a CI one).
-      #
-      # The dependency itself is not optional: `bench-baseline-update` records the
-      # row, and a baseline row the check cannot produce is a permanent failure.
+      # `bench-check` depends on `just embed-cost`, which builds `[profile.embedder]`
+      # and pins the probe with `taskset -c 2` (needs three CPUs; a public runner has
+      # four). Do not unpin or pick the CPU dynamically: that changes the baseline's conditions.
       - name: just bench-check
         run: just bench-check
-        # **`EMBED_COST_KNOWN_COLLAPSED` is a disclosed escape, and deleting it is
-        # the point.** `just embed-cost` — which `bench-check` depends on — carries
-        # a structural self-check that the `embedding_cross_crate` row's two
-        # columns still compile to different bodies. It has been red since it was
-        # written, on a defect in the code under test that predates it: since
-        # 2026-08-29 `Plan::at_tagged` sits between `Plan::at` and the fold with no
-        # `#[inline]`, so both columns are the same call stub and the row's
-        # quotient is 1.0 by construction. Repairing that is a trade
-        # (`docs/API.md` §2.3's 2026-09-06 amendment prices it) and not a CI
-        # decision, so this job sets the escape rather than the alternatives —
-        # deleting the check, or leaving a permanently red required job that
-        # people learn to ignore. **The escape does not quiet anything**: the full
-        # diagnosis prints on every run, followed by a line saying the quotient
-        # below is not a measurement. Delete this `env:` block and the recipe's
-        # escape branch in the commit that restores the row's variable.
+        # Disclosed escape: `just embed-cost`'s self-check that `embedding_cross_crate`'s
+        # columns compile to different bodies is red, because `Plan::at_tagged` has no
+        # `#[inline]` (`docs/API.md` §2.3). The diagnosis still prints. Delete this `env:`
+        # block and the recipe's escape branch when the row's variable is restored.
         env:
           EMBED_COST_KNOWN_COLLAPSED: "1"
-      # The artifact itself, so a failing gate can be inspected rather than
-      # re-derived. `bench_report` writes it before comparing, precisely so it
-      # survives the failure.
+      # Written before comparing, so a failing gate can be inspected.
       - uses: actions/upload-artifact@v7
         if: always()
         with:

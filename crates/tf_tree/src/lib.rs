@@ -1,32 +1,11 @@
 #![deny(unsafe_code)]
 // `unsafe` boundary: **one lifetime extension, in [`OwnedWriter`], and nothing
-// else.** `EdgeWriter<'a>` borrows the `Tree`; `OwnedWriter` stores an
-// `Arc<Tree>` beside it and extends that borrow to `'static`, with the strong
-// reference — not a comment — as the thing that keeps the arena alive.
-// See `docs/decisions/0017`, which records why the facade takes the block
-// rather than each binding hand-rolling it (two did; one of them leaked a claim
-// lease and bypassed the fork guard for the life of every Python publisher).
-// **Those two hand-rolled helpers are gone**: that record's steps 6–7 deleted
-// them, and both bindings now claim through `Tree::claim_owned`. So this is the
-// only lifetime extension in the workspace — not merely in this crate — and a
-// second one anywhere is a new decision record rather than a patch.
-//
-// This is `deny` rather than `forbid` so that the one site can `#[allow]`
-// itself and be *visible* — `rg 'allow\(unsafe_code\)' crates/tf_tree/src`
-// returns it and should return nothing else. A second site is a new kind of
-// boundary and needs its own record (`docs/decisions/0007`).
+// else** (`docs/decisions/0017`). It is the only one in the workspace; `deny`
+// rather than `forbid` so `rg 'allow\(unsafe_code\)' crates/tf_tree/src` finds
+// it. A second site needs its own record (`docs/decisions/0007`).
 #![deny(unsafe_op_in_unsafe_fn)]
-// `PHASE1.md` §13 asks for this at the root. The workspace sets
-// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
-// gate was already effective — but only inside that recipe. This makes a plain
-// `cargo build` of this repository say so too.
-//
-// **It does not bind a downstream consumer.** Cargo builds registry
-// dependencies with `--cap-lints allow`, which caps an attribute-level `deny`
-// too, so for somebody building `tf_tree` from crates.io this attribute does
-// nothing. What it binds
-// is builds of this repository and its path dependents — which is where a
-// missing doc would be introduced, so the box is still worth closing this way.
+// `PHASE1.md` §13. Binds this repository's builds only: cargo caps lints on
+// registry dependencies.
 #![deny(missing_docs)]
 //! `std` facade for the `tf_tree` transform engine.
 //!
@@ -59,48 +38,21 @@
 //!
 //! # Minimum supported Rust version
 //!
-//! **1.87**. It is declared in `[workspace.package] rust-version` and repeated
-//! here because a manifest is not somewhere a user reads: the person deciding
-//! whether they can adopt this crate opens the docs, and `cargo` refusing to
-//! build is a worse way to find out. `just msrv` builds `--locked` on exactly
-//! that toolchain and fails if this line, `README.md`, `SUPPORT.md` or any
-//! hand-written `rust-version` disagrees with the manifest.
-//!
-//! An MSRV bump is a minor-version bump pre-1.0 and a breaking change after —
-//! `SUPPORT.md` is the policy, including why each of the two steps so far was
-//! forced by a dependency rather than chosen.
+//! **1.87**, from `[workspace.package] rust-version`. `just msrv` fails if this
+//! line, `README.md`, `SUPPORT.md` or any `rust-version` disagrees. `SUPPORT.md`
+//! is the bump policy.
 //!
 //! # Two stability tiers
 //!
-//! Everything at this crate's root is the **stable** surface: at a published tag
-//! each `pub` item is a semver promise. The `tf_tree::unstable` module — behind
-//! the default-off `unstable` feature, so it is absent from these docs unless
-//! that feature is on — is not, and enabling the feature is the waiver
-//! (`docs/API.md` §2.6). It mirrors the C ABI's `tf_tree.h` /
-//! `tf_tree_unstable.h` split, which is the same promise spelled as two headers.
+//! Everything at this crate's root is **stable**. `tf_tree::unstable`, behind the
+//! default-off `unstable` feature, is not; enabling the feature is the waiver
+//! (`docs/API.md` §2.6). It holds what the *arena layout* shapes
+//! (`docs/PHASE5.md` §1). To ask *what is in this tree?* on the stable tier use
+//! [`Tree::frames`] and [`Tree::edges`] (`docs/API.md` §3.2).
 //!
-//! What lives there is what the *arena layout* shapes, because that layout is
-//! scheduled to change (`docs/PHASE5.md` §1). If you are reading transforms, you
-//! will never need it.
-//!
-//! **Gating a door is not the same as removing a room.** The question the gated
-//! `Tree::arena_view` used to be the only Rust answer to — *what is in this
-//! tree?* — is answered on the stable tier by [`Tree::frames`] and
-//! [`Tree::edges`], which mirror Python's `tree.frames()` / `tree.edges()`
-//! (`docs/API.md` §3.2). Names only: the statistics half is `docs/PHASE5.md`
-//! §4.2's and is held back on every surface until §3's counting pass. Enabling
-//! `unstable` buys the arena-shaped *spelling* of that answer — record fields,
-//! capacities, counters — not the answer itself.
-//!
-//! The three items that moved do not answer at the crate root any more, and this
-//! is what pins that — **but only when the feature is on**, and where that holds
-//! moved in 0.0.1. It used to be every `cargo test` here, because the crate
-//! dev-depended on itself to enable `unstable`; that line did not survive
-//! `cargo package` and is gone. Today the assertion means "moved to
-//! `tf_tree::unstable`" under `cargo test --doc --workspace`, which unifies the
-//! feature in from the four consumers that declare it, and degrades to the
-//! weaker "absent from the crate root" under a bare `-p tf_tree`. Both readings
-//! are true; `just test` runs the strong one:
+//! These pin that `ArenaView`, `EdgeKind` and `EdgeMeta` moved (fully only with
+//! the feature on; `just test-doc-error-codes` is the real gate for `E0432`).
+//! Three blocks, because one block passes when any one of the three is absent:
 //!
 //! ```compile_fail,E0432
 //! use tf_tree::ArenaView;
@@ -112,30 +64,8 @@
 //! use tf_tree::EdgeMeta;
 //! ```
 //!
-//! Three blocks and not one `use tf_tree::{ArenaView, EdgeKind, EdgeMeta};`,
-//! because a single block passes as soon as *any* one of the three is absent —
-//! it would go on passing after a refactor put two of them back.
-//!
-//! `E0432` and not a bare `compile_fail`: an unpinned one passes when the
-//! snippet fails for *any* reason, and stable rustdoc ignores the code, so
-//! `just test-doc-error-codes` is this line's real gate (`justfile`).
-//!
-//! ## What the pre-tag audit left alone, and why
-//!
-//! The sweep behind the split asked `docs/API.md` §7 of every `pub` item here.
-//! Three moved; the rest stay, and two answers are worth recording because they
-//! look like omissions:
-//!
-//! * **[`EdgeWriter`] still carries a lifetime**, which §2.1 calls a violation.
-//!   It is a *known* one and it is not the bug: [`OwnedWriter`] is the storable
-//!   shape, and a scoped claim whose scope the borrow checker enforces is better
-//!   when it fits. §2.1 says so in terms.
-//! * **[`Described`]'s two fields became private.** They promised that the
-//!   `Display` wrapper is exactly `(error, tree)` forever, for no caller — the
-//!   only construction site in the workspace is [`Tree::describe`].
-//!
-//! `tf_tree_core`'s crate docs carry the rule the audit applied to
-//! `#[non_exhaustive]`, and the per-type arguments sit on the types.
+//! [`EdgeWriter`] still carries a lifetime (`docs/API.md` §2.1 names this);
+//! [`OwnedWriter`] is the storable shape.
 //!
 //! # `no_std` / `std` split
 //!
@@ -145,17 +75,10 @@
 //! [`Tree::lookup`]'s per-thread plan cache (`thread_local!`), and
 //! [`Described`]'s `Display`.
 //!
-//! # [`Tree`] is not `Clone`, and `Arc<Tree>` is the embedding idiom
-//!
-//! [`Tree`] is `Send + Sync`, so a shared reference is all a reader needs — but
-//! it is deliberately not `Clone`, and the reason is that a `Tree` is not just a
-//! handle. It owns its arena backing *and* holds a registered slot in the
-//! arena's participant table — a fixed-size table (`DEFAULT_MAX_PARTICIPANTS`,
-//! 64) sized when the arena is created, not an unbounded pool. A derived
-//! `Clone` would have to pick one of two wrong answers: register a second slot,
-//! and burn a scarce resource every time somebody passed a tree by value; or
-//! share the first one, and report two participants as one to the reaper that
-//! decides whether a slot's owner is still alive.
+//! [`Tree`] is `Send + Sync` but deliberately not `Clone`: it owns its arena
+//! backing *and* a slot in the fixed-size participant table
+//! (`DEFAULT_MAX_PARTICIPANTS`, 64). A clone would either burn a slot or report
+//! two participants as one to the reaper.
 //!
 //! So share it with an `Arc`:
 //!
@@ -179,12 +102,7 @@
 //! assert_eq!(joined.unwrap(), Iso3::IDENTITY);
 //! ```
 //!
-//! This is not new advice: `tests/tsan.rs` shares a tree between threads this
-//! way, `tf_tree_c` hands out `Arc<TreeShare>` (a one-field wrapper around a
-//! `Tree`, so the refcount is on the wrapper rather than on the `Tree` itself),
-//! and PyO3's `Py<PyTree>` is the same refcount spelled in CPython's allocator.
-//! Three surfaces arrived here independently and none of them said so where an
-//! embedder would look (`docs/API.md` §2.2).
+//! `tf_tree_c` and PyO3 do the same (`docs/API.md` §2.2).
 //!
 //! # Set `lto = "thin"` and `codegen-units = 1` in your release profile
 //!
@@ -194,41 +112,14 @@
 //! codegen-units = 1
 //! ```
 //!
-//! **This is worth about 25% of a depth-3 lookup, and it is not cargo-cult
-//! advice — it is a property of where this engine's code lives.** [`Plan::at`]
-//! sits across a crate boundary from every consumer, and it and the fold beneath
-//! it live one crate further down still, in `tf_tree_core`. Five functions on
-//! the evaluate path carry `#[inline]` for exactly that reason (`Plan::at`, the
-//! scalar fold, and the three [`Guard`] sampling entry points) — **a true count
-//! and, since 2026-08-29, an incomplete explanation: `Plan::at_tagged` sits
-//! between the first and the second carrying no attribute, so your build still
-//! emits one real cross-crate call. Its doc comment says why that is deliberate
-//! and what measuring it costs.** What an attribute buys depends in any case on
-//! **your** profile, not on ours: this workspace's release profile is not
-//! cargo's default, so every latency number this project publishes is taken
-//! under whole-program optimisation and your node's is not.
-//!
-//! The measurements behind this, and what `just embed-cost` re-measures:
-//! `docs/API.md` §2.3.
-//!
-//! The cost of taking this advice is build time: thin LTO adds a link-time
-//! optimisation pass, and `codegen-units = 1` gives up intra-crate build
-//! parallelism. Neither changes what the shipped binary computes. How the 25%
-//! splits between the two settings has **not** been measured here, so if your
-//! release builds are slow enough that you want to take only one of them,
-//! measure your own case rather than trusting a guess from this paragraph.
+//! Worth about 25% of a depth-3 lookup: [`Plan::at`] and the fold beneath it sit
+//! across crate boundaries from the consumer, and every published latency is
+//! taken under whole-program optimisation. Measurements and `just embed-cost`:
+//! `docs/API.md` §2.3. The cost is build time; how the 25% splits between the
+//! two settings is not measured.
 
-// **The crates.io front page, compiled.** `README.md`'s `rust` fence is the
-// example a stranger reads first, and no recipe parses a README — the next
-// signature change to `claim`, `plan`, `Capacity::history` or the `Described`
-// wording would break the published page with every gate green. `cfg(doctest)`
-// keeps it out of `cargo doc`, which already renders the module docs above, and
-// off the crate root, whose `//!` block carries intra-doc links a README cannot.
-//
-// It gates the *API*, not the *output*: the fence's `// -> x = 0.5` and its
-// two-line extrapolation message are comments, and a doctest does not read
-// stdout. Turning them into asserts would gate those too, at some cost to how
-// the front page reads; that trade has not been made.
+// The crates.io front page, compiled: `README.md`'s `rust` fence is gated for
+// API, not output.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}
@@ -263,12 +154,6 @@ pub use tree::CLAIM_WINDOW_HOOK;
 pub use tf_tree_arena::{AttachMode, ShmError};
 
 /// This build's arena format version (`docs/PHASE5.md` §1).
-///
-/// Re-exported as a function rather than the constant so the facade keeps its
-/// promise of exposing no arena internals: a caller gets the number it needs
-/// for a diagnostic without a path into `tf_tree_arena`. That promise is
-/// unchanged by the crate's one `unsafe` exception (`docs/decisions/0017`): a
-/// lifetime extension is not a widening of what this surface hands out.
 #[must_use]
 pub fn arena_format_version() -> u32 {
     tf_tree_arena::FORMAT_VERSION
@@ -283,12 +168,8 @@ pub fn arena_layout_hash() -> u32 {
 
 /// Whether this build compiled `docs/PHASE5.md` §5's diagnostic counters in.
 ///
-/// A diagnostic that reads `EdgeCounters` cannot otherwise tell "nothing
-/// failed" from "nothing was counted", and those two answers call for opposite
-/// actions. It has to be evaluated *here*, inside the crate that owns the
-/// feature: cargo unifies features across a workspace, so a `cfg!` in a
-/// downstream crate reports what that crate asked for rather than what the
-/// engine was built with.
+/// Evaluated here because cargo unifies features across a workspace, so a
+/// downstream `cfg!` would report the wrong crate's features.
 #[must_use]
 pub fn counters_compiled_in() -> bool {
     cfg!(feature = "counters")
@@ -303,28 +184,18 @@ pub use open::Inheritance;
 pub use open::CRASH_SITES;
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use open::{open, CreatePolicy, Open, OpenError};
-// The payload of `OpenError::Rendezvous`, and every type one of its variants
-// carries, so a caller can dispatch on the rendezvous refusal — `IpcError` is
-// deliberately not `#[non_exhaustive]` for that reason — without adding
-// `tf_tree_ipc` as a second direct dependency. `CreatePolicy` above is the
-// precedent, on the same argument. The one type deliberately left out is
-// `rustix::io::Errno` inside `IpcError::LockFailed`, as `ShmError` and
-// `FrozenError` already leave theirs out. A `//` comment, not `///`: rustdoc
-// inlines a cross-crate re-export and prepends a `///` here to every one of the
-// nine items' own docs, so each would have opened with this paragraph.
+// The payload of `OpenError::Rendezvous` and every type its variants carry, so a
+// caller can dispatch without depending on `tf_tree_ipc`. Left out: `rustix`'s
+// `Errno`. A `//` comment, because rustdoc would prepend a `///` to each item.
 #[cfg(all(feature = "shm", target_os = "linux"))]
 pub use tf_tree_ipc::{
     EnvVar, HelloStatus, IpcError, LockRole, NameProblem, ProcError, ProcParseError,
     RuntimeDirSource, WireError,
 };
 
-/// Test scaffolding for `docs/decisions/0028` plan step 2's reclamation
-/// predicate, which is private. Its two production callers are the owner's slot
-/// assigner (that record's step 3) and [`Tree::reap_participants`] (step 5);
-/// both act on the verdict without reporting one — the assigner stops at the
-/// first grantable slot, the sweep reports a count — and neither a grant nor a
-/// count can separate the two verdicts that collect nothing. Absent unless
-/// `--features test-hooks`; see [`open::reclamation_verdict_for_test`].
+/// Test scaffolding for `docs/decisions/0028` plan step 2's private reclamation
+/// predicate. Absent unless `--features test-hooks`; see
+/// [`open::reclamation_verdict_for_test`].
 #[cfg(all(feature = "test-hooks", feature = "shm", target_os = "linux"))]
 #[doc(hidden)]
 pub use open::reclamation_verdict_for_test;
@@ -335,8 +206,7 @@ pub use open::reclamation_verdict_for_test;
 pub mod unstable;
 
 // Re-export the core engine surface so downstream code depends only on
-// `tf_tree`. What moved to the `unstable` module moved on the test "does its
-// shape follow the arena layout", not "is it low-level" — see that module.
+// `tf_tree`.
 
 pub use tf_tree_core::edge::Publisher;
 pub use tf_tree_core::layout::{write_affine32, write_mat4, write_quat, write_quat_twist, Layout};
@@ -345,43 +215,21 @@ pub use tf_tree_core::plan::{
     SensorDomain, SimDomain, Stamp, SteadyDomain, Step, SystemDomain, MAX_ADAPTIVE_DEPTH,
     MAX_KNOTS,
 };
-// **`ExtrapPolicy` was unnameable from this crate until `0039`.** All three of
-// its variants were implemented and tested in the sampler and every fold site
-// passed the `Error` literal, so `Hold` and `ConstantTwist` were dead from every
-// shipped surface. `Plan::at_extrapolating` is what reaches them, and
-// `Extrapolated` above is what stops a held pose passing for a fresh one.
+// `ExtrapPolicy`: reached by `Plan::at_extrapolating` (`0039`).
 pub use tf_tree_core::sample::ExtrapPolicy;
 pub use tf_tree_core::{
     ClaimError, EdgeId, FrameError, FrameId, LookupError, ParticipantError, PushError,
     TopologyError, MAX_DEPTH, MAX_PATH_EDGES,
 };
-// **The payload of every public error variant is nameable from here.**
-// `BuildError::Topology`, `BuildError::Layout`, `BuildError::Participant` and
-// `ReparentError::Topology` are stable-tier variants, and until these three
-// names were added a caller who depended only on `tf_tree` could match the
-// variant but not the value inside it — while `FrameError` and `ShmError`, the
-// siblings in the same `BuildError`, were exported. On the stable tier and not
-// behind `unstable` (`docs/API.md` §2.6): a stable variant already hands the
-// type out, so the door is open whether or not it is named; both are
-// `#[non_exhaustive]`, so naming them promises no variant set; and `ShmError` /
-// `FrozenError` are the precedent for an arena-crate error at this root.
+// The payload of every public error variant is nameable from here; it is on the
+// stable tier because a stable variant already hands the type out
+// (`docs/API.md` §2.6).
 pub use tf_tree_arena::LayoutError;
 
-// **The math surface, including both interpolation kernels.** `slerp` is here
-// for the reason the rest of this block exists: a consumer who reaches
-// `LerpSlerp` through this facade and its kernel through `tf_tree_math` has two
-// direct dependencies to keep in lockstep on a `0.0.x` line where every release
-// breaks every other — worse than the `Iso3` round trip `docs/API.md` §2.7 told
-// them to abandon. **`ScLerp`'s kernel is here on the same argument**, and it
-// took a review pass to see that leaving it out reproduced the asymmetry one
-// layer up: exporting `LerpSlerp` + `slerp` but `ScLerp` with no route to
-// `screw_pow` leaves an `ScLerp` consumer in the same two-dependency position.
-// What is *not* done is a bare `screw_pow` at this root: that would be a second
-// spelling (`PROJECT.md` §6) of `tf_tree_math::dualquat::screw_pow`, whereas
-// re-exporting the module is the *same* spelling — `tf_tree::dualquat::screw_pow`
-// and `tf_tree_math::dualquat::screw_pow` are one path with one prefix swapped.
-// `tests/math_reexports.rs` says this list and `tf_tree_math`'s are one set of
-// items rather than two.
+// The math surface, including both interpolation kernels, so a consumer does not
+// keep two direct dependencies in lockstep on a `0.0.x` line. The module is
+// re-exported rather than a bare `screw_pow`, which would be a second spelling.
+// `tests/math_reexports.rs` pins the list.
 pub use tf_tree_math::dualquat;
 pub use tf_tree_math::{
     exp_se3, exp_so3, log_se3, log_so3, quat_from_rot3, slerp, Interp, Iso3, LerpSlerp, Quat,

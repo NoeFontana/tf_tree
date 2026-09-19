@@ -1,73 +1,40 @@
 //! Memory footprint and computation-per-lookup, tf_tree vs `tf2::BufferCore`.
 //!
-//! `docs/PHASE1.md` §11 pins down *latency*. This binary covers the other two
-//! axes a migration decision actually turns on: how much memory each engine
-//! costs to hold the same history, and how much work each performs per lookup.
+//! `docs/PHASE1.md` §11 pins latency; this covers memory and work per lookup.
 //!
-//! # One engine per process, on purpose
+//! One engine per process: building both would let the first's freed chunks
+//! satisfy the second's requests. `just footprint` runs the modes separately
+//! (the tf2 modes need the container).
 //!
-//! Every mode measures exactly one engine and then exits. Building both in one
-//! process would let the first engine's freed chunks satisfy the second's
-//! requests, so whichever ran second would look cheaper by an amount nobody can
-//! bound. `just footprint` runs the modes separately and assembles the table.
+//! Memory is `mallinfo2` (`uordblks + hblkhd`), not RSS: C++ `operator new` and
+//! Rust both bottom out in `malloc`, and tf_tree's arena is a single mmapped
+//! allocation invisible to `uordblks` alone.
 //!
-//! # Memory: `mallinfo2`, not RSS
-//!
-//! RSS is page-granular, includes text and stacks, and moves with the kernel's
-//! reclaim mood. `mallinfo2` reports glibc's own accounting, and because C++
-//! `operator new` bottoms out in `malloc` it sees tf2's allocations and Rust's
-//! on the same footing — which is the whole point, since the two engines are
-//! written in different languages.
-//!
-//! In-use bytes are `uordblks + hblkhd`: allocations above glibc's mmap
-//! threshold (128 KiB by default) do not appear in `uordblks`, and tf_tree's
-//! arena is a single allocation far above it, so reporting `uordblks` alone
-//! would show tf_tree using almost nothing. That would be flattering and wrong.
-//!
-//! # Computation: cachegrind, not perf counters
-//!
-//! Instruction counts here are meant to be *reproducible*, including on
-//! machines where `perf_event_paranoid` forbids hardware counters (this one).
-//! `cachegrind` simulates, so its `Ir` is exact and machine-independent.
-//! `--mode lookup-* 0` performs setup and no lookups, so subtracting it from a
-//! run of `N` lookups removes construction, teardown and process startup
-//! exactly, leaving instructions attributable to the lookups alone.
-//!
-//! Run: `just footprint` (needs the container for the tf2 modes).
-// `print_stdout`/`print_stderr`: this binary's entire output *is* its result —
-// `just footprint` pipes it into the table in `docs/benchmarks/tf2.md`.
+//! Computation is cachegrind's exact `Ir`: `--mode lookup-* 0` performs setup
+//! only, so subtracting it from an `N`-lookup run leaves the lookups alone.
+// Output is the result: `just footprint` pipes it into `docs/benchmarks/tf2.md`'s table.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::print_stdout,
     clippy::print_stderr
 )]
-// **`docs/decisions/0007` rule 1, kind 2 — the OS** (`docs/decisions/0048`: a
-// kind is a property, not a crate name). Declared here rather than inherited:
-// `crates/tf_tree_bench/src/lib.rs` is `#![forbid(unsafe_code)]` and a bin is a
-// **separate crate root**, so that attribute governs none of this file — which
-// is why this binary's `mallinfo2` call compiled under a plain `just build` for
-// the whole life of the project.
+// `docs/decisions/0007` rule 1, kind 2 (the OS), per `0048`. A bin is a separate
+// crate root, so the library's `forbid(unsafe_code)` does not govern it.
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// SAFETY (module invariant): the single `unsafe` block below calls glibc's
-// `mallinfo2`, declared in this file's own `extern "C"` block because libc does
-// not expose it. It takes no arguments, reads only the allocator's own
-// bookkeeping, and returns a POD struct by value whose `MallInfo2` mirror is the
-// documented ten-`size_t` layout. The alternatives measure something else: a
-// `GlobalAlloc` counter is itself an `unsafe impl`, and /proc RSS is resident
-// pages rather than allocator bookkeeping.
+// SAFETY (module invariant): the single `unsafe` block calls glibc's `mallinfo2`,
+// declared in this file's `extern "C"` block. It takes no arguments, reads only
+// allocator bookkeeping, and returns a POD struct mirroring the documented
+// ten-`size_t` layout.
 
 use std::hint::black_box;
 
 use tf_tree::{InterpPolicy, Stamp};
 use tf_tree_bench::fixture;
 
-/// glibc's `struct mallinfo2` — ten `size_t` fields.
-///
-/// Declared here rather than pulled from the `libc` crate because this is the
-/// only foreign item the benchmark crate needs, and the layout is stable ABI.
+/// glibc's `struct mallinfo2` — ten `size_t` fields, declared here (stable ABI).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct MallInfo2 {
@@ -75,8 +42,7 @@ struct MallInfo2 {
     ordblks: usize,
     smblks: usize,
     hblks: usize,
-    /// Bytes in `mmap`ed regions — where any allocation over glibc's 128 KiB
-    /// mmap threshold lands, including tf_tree's whole arena.
+    /// Bytes in `mmap`ed regions, including tf_tree's whole arena.
     hblkhd: usize,
     usmblks: usize,
     fsmblks: usize,
@@ -92,10 +58,8 @@ extern "C" {
 
 /// Bytes currently in use across both the sbrk heap and mmapped regions.
 fn heap_in_use() -> usize {
-    // SAFETY: `mallinfo2` takes no arguments, reads only glibc's allocator
-    // bookkeeping, and returns a POD struct by value. `MallInfo2` mirrors the
-    // documented ten-`size_t` layout. (Bench binary; the engine crates are
-    // `#![forbid(unsafe_code)]`.)
+    // SAFETY: `mallinfo2` takes no arguments, reads only allocator bookkeeping and
+    // returns a POD struct by value mirroring the documented layout.
     let mi = unsafe { mallinfo2() };
     mi.uordblks + mi.hblkhd
 }
@@ -115,8 +79,7 @@ fn main() {
 
     match mode {
         "mem-tf_tree" => mem_tf_tree(),
-        // The tf2-comparable policy. tf2 has no screw-geodesic interpolation, so
-        // this is the row that goes head-to-head.
+        // The tf2-comparable policy (tf2 has no screw-geodesic interpolation).
         "lookup-tf_tree" => lookup_tf_tree(n, InterpPolicy::LerpSlerp),
         "lookup-tf_tree-sclerp" => lookup_tf_tree(n, InterpPolicy::ScLerp),
         "push-tf_tree" => push_tf_tree(n),
@@ -139,31 +102,16 @@ fn main() {
     }
 }
 
-/// Heap held by a fully populated tf_tree, plus the arena's own view of itself.
-///
-/// Two per-sample numbers are reported, and reporting only the flattering one
-/// would misrepresent the design:
-///
-/// * **per declared slot** — the marginal cost of ring capacity.
-/// * **per stored sample** — what this fixture's history actually costs. It is
-///   larger, because `Capacity::history` rounds each ring up to a power of two
-///   (a 1 kHz edge over 10 s needs 10 000 slots and gets 16 384). That rounding
-///   is a real cost of fixed-capacity, never-reallocating rings, and it belongs
-///   in the comparison rather than averaged out of it.
+/// Heap held by a fully populated tf_tree. Reports per declared slot (marginal ring
+/// capacity) and per stored sample (larger: `Capacity::history` rounds rings up to a
+/// power of two).
 fn mem_tf_tree() {
-    // Two instruments, matching `docker/tf2/native_footprint.cpp` field for
-    // field. `mallinfo2` is what the engines can be compared on identically
-    // (C++ `operator new` bottoms out in `malloc`); **Pss is what an operator
-    // sees in `top`**, and `mallinfo2` cannot see it, because an allocator can
-    // hold address space it has not faulted. That difference is the entire
-    // subject of decision `0021`, so a table with only the first would hide it.
+    // `mallinfo2` compares the engines; Pss is what an operator sees (0021).
     let before = heap_in_use();
     let pss_before = tf_tree_bench::mp::self_pss_kib();
     let tree = {
         let (tree, samples) = fixture::populated_tree().expect("build fixture");
-        // The harness's own recorded push stream is ~300 KiB of `PushSample` and
-        // is not engine memory. Drop it before the snapshot or tf_tree is
-        // charged 29% more than it uses.
+        // The harness's recorded push stream is not engine memory.
         drop(samples);
         tree
     };
@@ -182,16 +130,10 @@ fn mem_tf_tree() {
     println!("samples_stored\t{samples}");
     println!("bytes_per_slot\t{:.1}", arena as f64 / slots as f64);
     println!("bytes_per_sample\t{:.1}", arena as f64 / samples as f64);
-    // Keep the tree alive across the measurement.
     black_box(&tree);
 }
 
-/// `N` publishes onto one dynamic edge — the *write*-path allocation measure.
-///
-/// This is where the two designs actually diverge on memory. Both engines turn
-/// out to be allocation-free per *lookup*, so the read path is not where the
-/// difference lives; the write path is, because tf2 allocates a node per stored
-/// transform and tf_tree overwrites a preallocated ring slot.
+/// `N` publishes onto one dynamic edge: the write-path allocation measure.
 fn push_tf_tree(n: usize) {
     let tree = fixture::build_tree_with(InterpPolicy::LerpSlerp).expect("build fixture");
     let (parent, child, rate_hz) = fixture::DYNAMIC_EDGES[2]; // the 1 kHz edge
@@ -209,27 +151,14 @@ fn push_tf_tree(n: usize) {
     println!("pushes\t{n}");
 }
 
-/// Stamp for lookup `i`: walks a 100 ms window ending at `NOW`, matching
-/// `docs/PHASE1.md` §11.2's query mix.
-///
-/// Shared by both engines so they answer the identical question. The step is
-/// 1 µs, not 1 ns: a 1 ns step over 100 000 lookups spans only 100 µs, which
-/// keeps every query inside a handful of ring slots and measures a cache- and
-/// branch-predictor best case rather than the intended window.
+/// Stamp for lookup `i`: a 100 ms window ending at `NOW` (`docs/PHASE1.md` §11.2), in
+/// 1 µs steps so queries do not stay inside a few ring slots. Shared by both engines.
 fn window_stamp(i: usize) -> i64 {
     fixture::NOW_NS - (i as i64 % 100_000) * 1_000
 }
 
-/// `N` plan evaluations at the fixture's deepest dynamic chain
-/// (`imu_link <- map`: three dynamic steps after folding).
-///
-/// `interp` is a parameter because the comparison against tf2 is only fair on
-/// `LerpSlerp` — tf2 has no screw-geodesic policy, so charging tf_tree for
-/// `ScLerp`'s extra work in a head-to-head row would understate it. Both are
-/// reported; the tf2-comparable row is the `LerpSlerp` one.
-///
-/// Deliberately *not* timed: this mode exists to be run under cachegrind, and a
-/// timing loop would add clock reads to the instruction count.
+/// `N` plan evaluations at the deepest dynamic chain (`imu_link <- map`). Only
+/// `LerpSlerp` is tf2-comparable. Untimed: it runs under cachegrind.
 fn lookup_tf_tree(n: usize, interp: InterpPolicy) {
     let tree = fixture::build_tree_with(interp).expect("build fixture");
     {
@@ -278,11 +207,8 @@ mod tf2_modes {
         black_box(&fixture);
     }
 
-    /// `N` `setTransform` calls onto one edge, mirroring `push_tf_tree`.
-    ///
-    /// Uses `set_transform_by_name` with prebuilt `std::string` handles for the
-    /// same reason `lookup` does: charging tf2 for string allocations a C++
-    /// caller never makes would inflate the very number being reported.
+    /// `N` `setTransform` calls onto one edge, mirroring `push_tf_tree`, via prebuilt
+    /// `std::string` handles so tf2 is not charged for allocations a C++ caller avoids.
     pub(super) fn push(n: usize) {
         use tf_tree_bench::fixture;
         let buffer = Tf2Buffer::new(fixture::HISTORY_SECS * 3.0).expect("tf2 buffer");
@@ -302,12 +228,8 @@ mod tf2_modes {
         black_box(&buffer);
     }
 
-    /// `N` `lookupTransform` calls over the same chain and window.
-    ///
-    /// Uses `lookup_by_name`, which takes pre-built `std::string` handles: the
-    /// `&str` overload allocates two C++ strings per call, and charging tf2 for
-    /// an allocation a C++ caller never makes would inflate exactly the number
-    /// this binary exists to report.
+    /// `N` `lookupTransform` calls over the same chain and window, via `lookup_by_name`
+    /// (the `&str` overload allocates two C++ strings per call).
     pub(super) fn lookup(n: usize) {
         let fixture = Tf2Fixture::load().expect("load tf2 fixture");
         let target = FrameName::new("imu_link").expect("imu_link");

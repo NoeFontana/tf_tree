@@ -8,23 +8,13 @@
 //!
 //! # Why this exists
 //!
-//! `0060` measured a two-phase batch fold (Decision A) and an SoA interpolation
-//! kernel on top of it (Decision B) against the synthetic fixture, and found
-//! −43% to −58% on the flagship `at_many` row. Both numbers were taken on data
-//! that keeps nearly every bracket in `slerp`'s **series region** — the regime
-//! the kernel is for. B's kernel does not apply anywhere else: a bracket outside
-//! the series region is recomputed by a scalar fix-up, and `0060` §5 measured
-//! the prototype **losing** 80% on an all-fallback cell.
-//!
-//! So the headline is a function of the data, and nobody had measured what the
-//! data is. This example is that measurement, and it deliberately contains **no
-//! engine code and no prototype**: it classifies the brackets an `at_many` sweep
-//! would read, and says nothing about how fast anything runs.
+//! `0060`'s SoA kernel is for `slerp`'s **series region** and loses elsewhere (`0060` §5: 80% on an
+//! all-fallback cell), so its headline is a function of the data. This example classifies the
+//! brackets an `at_many` sweep would read and says nothing about speed; it has no engine code.
 //!
 //! # The five classes
 //!
-//! They are the arms of [`tf_tree::slerp`] and of `dualquat`'s `screw_parts` /
-//! `ScrewParts::pow`, which is what the kernel's safe-region predicate tests:
+//! They are the arms of [`tf_tree::slerp`] and of `dualquat`'s `screw_parts` / `ScrewParts::pow`:
 //!
 //! | class | `LerpSlerp` | `ScLerp` |
 //! |---|---|---|
@@ -34,27 +24,18 @@
 //! | **series** | `1e-12 ≤ θ² ≤ 0.0225`: the polynomial weights — **the kernel's regime** | `1e-290 ≤ sin²(θ/2) ≤ 0.02233…`: same |
 //! | **large arc** | `θ² > 0.0225`: `acos` / `sin`, the exact form | `sin²(θ/2) > 0.02233…`: the exact form |
 //!
-//! A bracket is in the series region when consecutive samples are *close* — so
-//! the fraction is set by publish rate against how fast the body turns, and a
-//! low-rate edge on a moving body is pushed out of it.
+//! The series fraction is set by publish rate against how fast the body turns.
 //!
-//! # Three sweeps, because the answer depends on what you ask for
+//! # Three sweeps
 //!
-//! - **`rate`** (the headline): a fixed-rate grid at 100 Hz, offset 1 ns off the
-//!   window origin so nothing lands on a knot. This is a consumer batching
-//!   lookups at its own sensor rate, and it weights each bracket by its
-//!   **duration** — a long gap in the recording counts once per query inside it.
-//! - **`interval`**: one query at the midpoint of every sample interval. Each
-//!   bracket is counted exactly once, so this is the recording's intrinsic
-//!   per-bracket distribution with no duration weighting.
-//! - **`ongrid`**: a query at every recorded stamp, which is 100% exact hits by
-//!   construction. It is the exact-hit ceiling for a consumer whose clock is the
-//!   publisher's.
+//! - **`rate`** (the headline): a 100 Hz grid offset 1 ns off the window origin, so nothing lands on
+//!   a knot; weights each bracket by its **duration**.
+//! - **`interval`**: one query at the midpoint of every sample interval; each bracket counts once.
+//! - **`ongrid`**: a query at every recorded stamp; 100% exact hits, the exact-hit ceiling.
 //!
 //! # Four controls, so that every column can be non-zero
 //!
-//! `0060`'s plan asked for two, *"without both, a classifier reading everything
-//! as series passes"*. There are four because two of them found something:
+//! `0060` asked for two; two more found something, so every column can be non-zero:
 //!
 //! | control | `LerpSlerp` | `ScLerp` |
 //! |---|---|---|
@@ -63,24 +44,15 @@
 //! | one pose repeated, four non-zero components | 100% stationary | **100% series** |
 //! | ~1e-7 rad of jitter a sample | **100% LERP fallback** | 100% series |
 //!
-//! The third exists because the stationary control **as specified fails**: a
-//! motionless `ScLerp` edge takes its degenerate arm only when the quaternion's
-//! zero pattern makes `conj(q) ⊗ q` cancel exactly, which the recording's wheel
-//! frames happen to do and a general rotation does not. [`control_stationary`]
-//! has the arithmetic. The fourth exists because without it the LERP-fallback
-//! column reads 0.0% in every row this example prints, and a column that can
-//! only ever be zero is decoration rather than a measurement.
+//! The third exists because the stationary control **as specified fails**: a motionless `ScLerp`
+//! edge is degenerate only when the quaternion's zero pattern makes `conj(q) ⊗ q` cancel exactly
+//! ([`control_stationary`]). The fourth keeps the LERP-fallback column from being always zero.
 //!
 //! # The bracket search is checked against the engine, per stamp
 //!
-//! This example mirrors `SampleRing::sample_from` under `ExtrapPolicy::Error`
-//! rather than calling it — the bracket is not a public return. A mirror that
-//! drifted would classify pairs the engine never reads, so every swept stamp is
-//! also put through `Plan::at` on the same one-edge plan and the two are
-//! required to agree **bit-identically**: a decline against an `Err`, an exact
-//! hit against the recorded pose, and a bracket against `I::eval(a, b, s)`. The
-//! count of checked stamps is printed, so a check that stopped running is
-//! visible rather than silent.
+//! This example mirrors `SampleRing::sample_from` under `ExtrapPolicy::Error` (the bracket is not a
+//! public return), so every swept stamp is also put through `Plan::at` and the two must agree
+//! **bit-identically**. The count of checked stamps is printed.
 #![allow(clippy::print_stdout)]
 
 use std::collections::BTreeMap;
@@ -96,20 +68,13 @@ use tf_tree_bench::{fixture, replay::TfStream};
 /// The chunk a batch fold would classify and bail out on, as prototyped.
 const CHUNK: usize = 64;
 
-/// `SLERP_LERP_FALLBACK`, `tf_tree_math::interp`'s private constant.
-///
-/// Pinned there by `const _: () = assert!(SLERP_LERP_FALLBACK == 1e-6);`, so a
-/// change to it breaks that crate's build rather than silently moving this
-/// classifier's boundary.
+/// `SLERP_LERP_FALLBACK`, `tf_tree_math::interp`'s private constant, pinned there by a `const` assert.
 const SLERP_LERP_FALLBACK: f64 = 1e-6;
 
 /// `THETA_SLERP_SMALL`, pinned the same way (`assert!(THETA_SLERP_SMALL == 0.15)`).
 const THETA_SLERP_SMALL: f64 = 0.15;
 
-/// `SIN_HALF_THETA_SMALL_SQ`, `tf_tree_math::dualquat`'s private constant.
-///
-/// Pinned there against `sin(THETA_SLERP_SMALL)²` by a unit test, so it moves
-/// only when `THETA_SLERP_SMALL` does.
+/// `SIN_HALF_THETA_SMALL_SQ`, `tf_tree_math::dualquat`'s private constant, pinned there by a unit test.
 const SIN_HALF_THETA_SMALL_SQ: f64 = 0.022_331_755_437_196_99;
 
 /// `SCREW_DEGENERATE_SQ`, `tf_tree_math::dualquat`'s degenerate-screw floor.
@@ -154,15 +119,9 @@ impl Class {
     }
 }
 
-/// `θ²` for a quaternion pair, from the chord rather than from `acos`.
-///
-/// `tf_tree_math` reaches the same number through an eight-term series
-/// (`theta_sq_from_chord`) that exists to avoid forming `1 − dot`. This example
-/// is handed `h` directly and so has no cancellation to avoid: `h/2 = sin²(θ/2)`
-/// exactly, and `asin` near zero is well conditioned. Taking the independent
-/// route is deliberate — a classifier that re-derived the series would inherit
-/// whatever the series gets wrong, and [`Counts::near_boundary`] counts the
-/// brackets where the two routes could possibly disagree about a bucket.
+/// `θ²` for a quaternion pair, from the chord rather than from `acos`. Deliberately not
+/// `tf_tree_math`'s eight-term series, so the classifier does not inherit that series' errors;
+/// [`Counts::near_boundary`] counts the brackets where the two routes could disagree.
 fn theta_sq_from_chord(h: f64) -> f64 {
     let theta = 2.0 * (h * 0.5).sqrt().min(1.0).asin();
     theta * theta
@@ -229,11 +188,8 @@ enum Read {
     Bracket(Iso3, Iso3, f64),
 }
 
-/// `SampleRing::sample_from` under `ExtrapPolicy::Error`, mirrored over the
-/// recorded sample list.
-///
-/// Every caller checks the answer against `Plan::at` on the same edge, so a
-/// drift between this and the engine fails rather than skews the table.
+/// `SampleRing::sample_from` under `ExtrapPolicy::Error`, mirrored over the recorded sample list;
+/// every caller checks it against `Plan::at`.
 fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
     let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
         return Read::Declined;
@@ -260,9 +216,7 @@ fn read(samples: &[(i64, Iso3)], t: i64) -> Read {
         return Read::Hit(samples[lo].1);
     }
     let (t_i, t_j) = (samples[lo].0, samples[lo + 1].0);
-    // `span_ns`, spelled the way `sample.rs` spells it: a wrapping `u64`
-    // difference, so the two cannot diverge on a stamp pair that straddles
-    // `i64::MAX`.
+    // `span_ns` as `sample.rs` spells it: a wrapping `u64` difference.
     let span = |from: i64, to: i64| (to as u64).wrapping_sub(from as u64) as f64;
     let s = span(t_i, t) / span(t_i, t_j);
     Read::Bracket(samples[lo].1, samples[lo + 1].1, s)
@@ -274,9 +228,8 @@ struct Counts {
     per_class: BTreeMap<Class, usize>,
     /// Stamps the sweep asked for that the edge declined. Not a class.
     declined: usize,
-    /// Brackets within [`BOUNDARY_BAND`] of a class boundary — the only ones
-    /// whose bucket could depend on which route this example takes to `θ²`. A
-    /// non-zero count here means the table has a footnote to write.
+    /// Brackets within [`BOUNDARY_BAND`] of a class boundary, whose bucket could depend on the route
+    /// taken to `θ²`; a non-zero count means a footnote.
     near_boundary: usize,
     /// Stamps put through `Plan::at` and required to agree bit-for-bit.
     checked: usize,
@@ -415,10 +368,8 @@ fn sweep_edge(
     let c = tree
         .frame(child)
         .map_err(|e| anyhow!("frame {child}: {e}"))?;
-    // `plan(target, source)` is `lookup(target, source)`, so for an edge that
-    // stores `T_parent_child` the plan that returns the sample unchanged is
-    // `plan(parent, child)`. The per-stamp bit-identity check below is what says
-    // so: the wrong direction fails on the first exact hit.
+    // `plan(target, source)` is `lookup(target, source)`, so a `T_parent_child` edge returns the sample
+    // unchanged from `plan(parent, child)`; the bit-identity check below fails on the wrong direction.
     let plan = tree
         .plan(p, c)
         .map_err(|e| anyhow!("plan {parent}->{child}: {e}"))?;
@@ -449,19 +400,9 @@ fn sweep_edge(
                 Class::ExactHit
             }
             Read::Bracket(a, b, s) => {
-                // Guard the case the recording does not exercise. `s` is
-                // mathematically in `(0, 1)` — `t_i < t < t_j` — but the
-                // division can round **up** to `1.0` once one nanosecond falls
-                // below half an ulp of the interval: measured, a 2e16 ns span
-                // (232 days) queried one nanosecond short of its end yields
-                // exactly `1.0`, while 2^53 ns (104 days) still yields
-                // `0.9999999999999999`. It cannot round down to `0.0` — that
-                // would need a ratio below ~5e-324, which no pair of `i64`
-                // nanosecond stamps can produce — so only the upper endpoint is
-                // reachable, and the `s == 0.0` arm below is there for symmetry
-                // with the kernel's predicate rather than because anything hits
-                // it. The kernel answers both by selecting an endpoint, exactly
-                // as it does for a knot, so they belong in the same bucket.
+                // `s` is in `(0, 1)` mathematically but can round **up** to `1.0` for a multi-day span (2e16 ns
+                // queried 1 ns short of its end); it cannot round to `0.0`. The kernel answers both by selecting
+                // an endpoint, as for a knot, so they share a bucket.
                 let got = got.map_err(|e| anyhow!("engine declined a bracket at {t}: {e}"))?;
                 let want = match policy {
                     InterpPolicy::LerpSlerp => LerpSlerp::eval(&a, &b, s),
@@ -498,39 +439,20 @@ fn sweep_edge(
     Ok((counts, ChunkStats { fracs }))
 }
 
-/// The publish rate at which each recorded interval would fall inside the series
-/// region, and what that says about a rate this recording does not carry.
+/// The publish rate at which each recorded interval would fall inside the series region.
 ///
-/// **Both policies share one bound, and it is a statement about angle, not about
-/// either kernel.** `LerpSlerp` is in its series arm when `θ² ≤
-/// THETA_SLERP_SMALL²`, where `θ` is the *quaternion* angle between the two
-/// samples. `ScLerp` is in its series arm when `sin²(θ) ≤
-/// SIN_HALF_THETA_SMALL_SQ`, and that constant is defined as `sin(0.15)²` — so
-/// both reduce to `θ ≤ 0.15 rad`, a body rotation of `0.30 rad` (17.2°) between
-/// consecutive samples.
+/// Both policies reduce to `θ ≤ 0.15 rad` (`LerpSlerp`: `θ² ≤ THETA_SLERP_SMALL²`; `ScLerp`:
+/// `sin²(θ) ≤ SIN_HALF_THETA_SMALL_SQ = sin(0.15)²`), so an interval of length `Δt` with endpoints
+/// `θ` apart is series for every `f ≥ θ/(0.15·Δt)`: its *series rate*.
 ///
-/// So for an interval of length `Δt` whose endpoints are `θ` apart, the same
-/// motion published at `f` Hz would put `θ/(f·Δt)` between samples, and the
-/// interval is in the series region for every `f ≥ θ/(0.15·Δt)`. That number is
-/// this edge's *series rate* for that interval.
-///
-/// **This is an extrapolation and its model is ScLerp's own**: it assumes the
-/// body turns at a constant rate across the interval, which is exactly what the
-/// interpolant assumes when it answers a query inside it. It is worth taking
-/// because the alternative — reporting one recording's series fraction and
-/// stopping — says nothing about a corpus with different rates, and publish rate
-/// is the single variable the fraction is most sensitive to.
+/// **This is an extrapolation** assuming constant turn rate across the interval, as the interpolant
+/// does; publish rate is the variable the fraction is most sensitive to.
 struct SeriesRate {
-    /// Per interval, the publish rate above which it is series, in Hz. Only
-    /// intervals that rotate at all: an interval whose endpoints are the same
-    /// rotation is never series, at any rate.
+    /// Per interval, the publish rate above which it is series, in Hz; only intervals that rotate.
     hz: Vec<f64>,
     /// Intervals whose endpoints are bit-identical rotations (`θ == 0`).
     motionless: usize,
-    /// Intervals that are *large arc at the rate they were actually published
-    /// at*, with the longest such interval's duration. On a recording whose
-    /// publisher never stops these are the fast-motion intervals; on one whose
-    /// publisher does, they are the gaps.
+    /// Intervals that are *large arc at the rate they were published at*, with the longest one's duration.
     large_arc: usize,
     longest_large_arc_s: f64,
     /// The recording's own median interval, in Hz.
@@ -684,42 +606,22 @@ fn fixture_stream() -> TfStream {
     stream
 }
 
-/// Control 2: one dynamic edge pushed the **same pose** every time, in two
-/// quaternion shapes — and the two do not agree, which is the point.
+/// Control 2: one dynamic edge pushed the **same pose** every time, in two quaternion shapes; the
+/// two do not agree, which is the point.
 ///
-/// `LerpSlerp` reads a repeated pose as `h == 0` whatever the quaternion is:
-/// `qa.sub(qb)` is exactly zero when the two are the same bits. So this control
-/// pins the all-fallback regime `0060` §5 measured the prototype losing 80% on,
-/// and a classifier that read everything as `series` fails it.
+/// `LerpSlerp` reads a repeated pose as `h == 0` whatever the quaternion; this pins the all-fallback
+/// regime `0060` §5 measured the prototype losing 80% on.
 ///
-/// `ScLerp` does not, and **only one of the two shapes below reads as
-/// degenerate.** Its predicate is `sin²(θ/2)` of `inv_mul`'s rotation part, i.e.
-/// of `conj(q) ⊗ q`, whose three vector components cancel by three different
-/// routes. `x` is `((w·x − x·w) − y·z) + z·y`, two self-cancelling pairs, and is
-/// exact for every input. `y` is `(w·y + x·z) − w·y − z·x` and `z` is
-/// `((w·z − x·y) + y·x) − z·w`, where the leading sum has already rounded before
-/// the term it contains is taken back out — so those two keep the rounding:
+/// `ScLerp` is degenerate only when `conj(q) ⊗ q`'s vector components cancel exactly:
 ///
-/// - `axis`, the recorded wheel edges' shape (`w = z = 0`), zeroes every product
-///   above before it can round, so `sin²(θ/2)` is exactly `0` and the bracket is
-///   degenerate;
-/// - `generic`, all four components non-zero, keeps it. Over six fixture poses
-///   `x` is exactly `0` in all six, `y` is non-zero in all six (1.6e-19 to
-///   2.6e-18) and `z` in one. So `sin²(θ/2) ≈ 5e-36` — **4.7e254 times**
-///   `SCREW_DEGENERATE_SQ` (1e-290) — and a motionless edge lands in `ScLerp`'s
-///   **series region**, at an angle of ~4e-18 rad that is pure rounding.
+/// - `axis`, the recorded wheel edges' shape (`w = z = 0`), cancels exactly: degenerate;
+/// - `generic`, all four components non-zero, keeps rounding (`sin²(θ/2) ≈ 5e-36`, far above
+///   `SCREW_DEGENERATE_SQ`), so a motionless edge lands in the **series region**.
 ///
-/// That is not a defect: `dualquat`'s threshold was deliberately lowered by
-/// ~280 orders of magnitude because the regrouped algebra stays conditioned
-/// there, and `screw_pow_is_accurate_down_to_the_degenerate_threshold` sweeps θ
-/// to 1e-160 against the reference. It is a fact about the *mix*, and it is why
-/// this control has two arms: "the robot is not moving" and "the interpolant
-/// takes its degenerate arm" are the same statement under `LerpSlerp` and are
-/// not under `ScLerp`.
+/// That is not a defect (`screw_pow_is_accurate_down_to_the_degenerate_threshold`); "not moving" and
+/// "takes the degenerate arm" differ under `ScLerp` and coincide under `LerpSlerp`.
 fn control_stationary(sweeps: &[Sweep]) -> Result<()> {
-    // The recorded wheel edges' quaternion, w-first: a pure axis rotation with
-    // two zero components. These are the shortest literals that round-trip to
-    // the same `f64` as the recording's own 17-digit text.
+    // The recorded wheel edges' quaternion, w-first: a pure axis rotation with two zero components.
     let axis = Quat::new(0.0, 0.707_388_269_167_199_8, 0.706_825_181_105_366, 0.0);
     let repeated = |q: Quat| {
         let mut stream = TfStream::default();
@@ -748,23 +650,15 @@ fn control_stationary(sweeps: &[Sweep]) -> Result<()> {
     )
 }
 
-/// Control 3: an edge that jitters by ~1e-7 rad a sample, which is the only
-/// thing that reaches `LerpSlerp`'s **LERP fallback** arm.
-///
-/// Without it the `lerp_fb` column would read 0.0% in every row above — in the
-/// recording, in both other controls and in the fixture — and a column that can
-/// only ever be zero is decoration rather than a measurement. Under `ScLerp`
-/// the same data is series: 1e-7 rad is `sin²(θ/2) ≈ 2.5e-15`, far above
-/// `SCREW_DEGENERATE_SQ`.
+/// Control 3: an edge that jitters by ~1e-7 rad a sample, the only thing that reaches `LerpSlerp`'s
+/// **LERP fallback** arm (under `ScLerp` the same data is series).
 fn control_jitter(sweeps: &[Sweep]) -> Result<()> {
     let mut stream = TfStream::default();
     stream
         .dynamic_edges
         .push(("map".to_owned(), "base_link".to_owned()));
     for k in 0..2048i64 {
-        // A yaw of a few times 1e-8 rad, alternating, so consecutive samples
-        // differ by ~1e-7 rad: below `SLERP_LERP_FALLBACK` (1e-6) and above the
-        // `h == 0` that a repeated pose gives.
+        // A yaw of a few 1e-8 rad, alternating: below `SLERP_LERP_FALLBACK` (1e-6), above a repeated pose's `h == 0`.
         let yaw = 5e-8 * f64::from(i32::try_from(k % 3).unwrap_or(0));
         stream.samples.push(tf_tree_bench::replay::Sample {
             edge: 0,

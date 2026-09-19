@@ -1,35 +1,12 @@
 #!/usr/bin/env python3
 """One release, one version — and every recipe a document names has to exist.
 
-`just artifact-versions`. This is the third gate of the family that starts with
-`just msrv` and `scripts/evidence-audit.sh`, and it exists because the defect
-those two catch showed up three more times while this release was being cut —
-and once more after it: shipped text that contradicts a document the same text
-names as authoritative, or that no reader can see at all.
-
-  * the README's status table against the `§0.0` tables it calls the source of
-    truth;
-  * the CLI's `--help`, still saying "live external attach arrives in Phase 2"
-    two phases after it arrived;
-  * `just py-wheel`, documented in the README as "build + install" while the
-    recipe only built — so the documented quickstart ended in `ImportError`;
-  * and, later, two rows of `docs/PHASE2.md` §12.2 whose measured results
-    rendered as *nothing* on github.com, because each carried them in a third
-    cell of a two-column table (#208) — hiding a benchmark's whole answer and,
-    behind it, a figure that had gone stale.
-
-None of those was caught by a test, because none of them is a property of the
-code. They are properties of the *repository*, and this file is where the ones
-that can be checked exactly get checked.
-
-**Exactly is the operative word.** `docs/PHASE5.md` §10 makes the point about
-the benchmark baseline and it applies here: a gate that flaps is a gate people
-learn to pass by editing the gate. So every rule below was measured against the
-whole corpus before it was written down, and a rule with even one false
-positive was narrowed until it had none. What that costs is coverage — the
-README's status table is *not* checked here, because no cheap rule
-distinguishes a stale row from a differently-worded true one. That check is a
-human reading two tables, and pretending otherwise would be worse than the gap.
+`just artifact-versions`. Checks properties of the *repository* that no test
+sees and that can be checked exactly: shipped text that contradicts the
+document it names as authoritative, or that no reader can see (e.g. table cells
+GFM deletes). Every rule was measured against the whole corpus first and
+narrowed until it had no false positive; the README status table is not checked
+because no cheap rule tells a stale row from a reworded true one.
 
 Run it from anywhere; it chdirs to the repository root.
 """
@@ -44,10 +21,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# `tomllib` is 3.11+, while `pyproject.toml` sets ruff's target to py310 —
-# that floor is the *package's*, not this script's. Reported rather than left
-# as a traceback, because the fix is "run this on a newer python3" and
-# `ModuleNotFoundError: No module named 'tomllib'` does not say so.
+# `tomllib` is 3.11+ (the package's floor is py310, not this script's): report it rather than a traceback.
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -60,20 +34,12 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# **The five crates this release publishes**, and the one literal in this file
-# that is not read out of the repository. It is here rather than derived
-# because there is nothing to derive it from: `publish` in a manifest is the
-# *authority*, and a gate that reads the authority and compares it to itself
-# checks nothing. README's "Workspace" section and `CHANGELOG.md` state this
-# same set in prose; what fails here is a sixth crate quietly joining the
-# release because somebody added a manifest without `publish = false`.
+# The five crates this release publishes: the one literal not read from the repository, because `publish` in a manifest is the authority a gate would otherwise compare to itself.
 PUBLISHABLE = frozenset(
     {"tf_tree", "tf_tree_core", "tf_tree_math", "tf_tree_arena", "tf_tree_ipc"}
 )
 
-# Every file that carries a hand-kept copy of the version. Each one must yield
-# at least one site: a scan that silently finds nothing is the classic way a
-# gate keeps passing after the thing it looked at moved.
+# Every file carrying a hand-kept copy of the version; each must yield at least one site.
 VERSION_FILES = (
     "Cargo.toml",
     "pyproject.toml",
@@ -98,31 +64,20 @@ PACKAGE_XML_FILES = (
     "ros/tf_tree_bench_ros/package.xml",
 )
 
-# The manifests outside `[workspace]` — they cannot inherit
-# `[workspace.package] version`, so they spell it, and `cargo` never compares
-# the copies. Same shape as the `rust-version` arm of `just msrv`, and the same
-# reason: compared rather than compiled is the strongest check available for a
-# crate this host may not be able to build.
+# The manifests outside `[workspace]` cannot inherit `[workspace.package] version`, so they spell it and are compared.
 EXCLUDED_MANIFESTS = (
     "crates/tf_tree_py/Cargo.toml",
     "crates/tf_tree_tf2_sys/Cargo.toml",
 )
 
-# `project(<name> VERSION <v> ...)`. Anchored on the keyword rather than on the
-# line, because `cmake_minimum_required(VERSION 3.16)` is two lines above it in
-# every one of these files and matching bare `VERSION` would read the wrong
-# number and still pass.
+# `project(<name> VERSION <v> ...)`, anchored on the keyword: `cmake_minimum_required(VERSION 3.16)` precedes it.
 PROJECT_VERSION_RE = re.compile(
     r"\bproject\s*\(\s*[A-Za-z0-9_]+\s+VERSION\s+([0-9][^\s)]*)"
 )
 
 failures: list[str] = []
 
-# **Measurements, as opposed to verdicts.** A `check_*` returns a sentence that
-# *asserts* its rule, so that sentence must be withheld when the check failed —
-# otherwise the tool prints an all-clear above its own failure block. A number
-# that asserts nothing has the opposite need: the citation census is wanted most
-# by whoever is reading a ratchet failure. These print on every run.
+# Measurements, as opposed to verdicts: a `check_*` summary asserts its rule and is withheld on failure; these print on every run.
 notes: list[str] = []
 
 
@@ -134,17 +89,14 @@ def note(message: str) -> None:
     notes.append(message)
 
 
-# One spelling of the `subprocess.run` boilerplate that was written out five
-# times.
+# One spelling of the `subprocess.run` boilerplate.
 def _git(*args: str) -> str:
     return subprocess.run(
         ["git", *args], cwd=ROOT, capture_output=True, text=True, check=True
     ).stdout
 
 
-# NUL-split so a path with a space survives; sorted so reporting order is the
-# repository's, not git's. Cached so the two rules that ask for `*.md` cannot be
-# handed different corpora — not for speed, which it does not measurably change.
+# NUL-split so a path with a space survives; sorted; cached so two rules asking for `*.md` see one corpus.
 @functools.cache
 def tracked(*globs: str) -> tuple[str, ...]:
     listed = _git("ls-files", "-z", *globs)
@@ -156,19 +108,14 @@ def load_toml(rel: str) -> dict:
         return tomllib.load(handle)
 
 
-# ---------------------------------------------------------------------------
 # 1. Every version string in the repository agrees.
-# ---------------------------------------------------------------------------
 
 
 def local_crate_names() -> frozenset[str]:
     """Every package name this repository defines, read out of the manifests.
 
-    Derived rather than listed, because the list would be the third copy of the
-    crate set in this file after `PUBLISHABLE` and `EXCLUDED_MANIFESTS`, and
-    the two crates outside `[workspace]` mean `cargo metadata` cannot answer it
-    either — it sees the workspace, and `tf_tree_py`/`tf_tree_tf2_sys` are
-    excluded from it by design.
+    Derived rather than listed: `cargo metadata` cannot answer it, since
+    `tf_tree_py`/`tf_tree_tf2_sys` are excluded from the workspace.
     """
     names = set()
     for rel in tracked("*Cargo.toml"):
@@ -185,32 +132,10 @@ def local_crate_names() -> frozenset[str]:
 def tracked_lockfiles() -> tuple[str, ...]:
     """Every tracked `Cargo.lock`, read out of git rather than listed here.
 
-    **Not hand-kept — generated, and that is exactly why they drift.** `cargo`
-    rewrites a lockfile on any command that resolves, so a lock only stays
-    current where somebody builds that crate, and two of the three here build
-    nowhere on an ordinary host. `crates/tf_tree_tf2_sys/Cargo.lock` sat at
-    `0.0.1` from the `0.0.1` release until a container run regenerated it —
-    four releases, held by nothing, because building it needs ROS 2 and neither
-    CI nor `just lint` can.
-
-    **Nothing else reports the drift, and that is the argument for this gate
-    rather than against it.** A stale lock entry for a *path* dependency is not
-    a resolution failure: cargo recomputes the version from the manifest and
-    silently rewrites the lock (measured — seeding `tf_tree_math` back to
-    `0.0.1` here and running `cargo metadata --offline` exits 0, prints
-    `Updating tf_tree_math v0.0.1 -> v0.0.5`, and leaves the lock correct on
-    disk). No path in this repository builds either excluded crate with
-    `--locked`, so there is no invocation anywhere that turns the drift into an
-    error. The committed artifact is simply wrong until somebody happens to
-    build in the container, and what they get then is a diff they did not ask
-    for in a file they did not touch.
-
-    Derived, for the same reason `local_crate_names()` is: a fourth tracked
-    lockfile added to a hand-kept tuple is outside the gate silently, which is
-    the exact shape of the defect this rule was written for. `PUBLISHABLE`
-    stays a literal because `publish` in a manifest is the authority a gate
-    would otherwise be comparing to itself; a lockfile list has no such
-    problem.
+    Generated, so they drift: cargo rewrites a path dependency's lock version
+    silently, and nothing builds the excluded crates `--locked`
+    (`crates/tf_tree_tf2_sys/Cargo.lock` sat at `0.0.1` for four releases).
+    Derived so a fourth lockfile cannot fall outside the gate.
     """
     found = tracked("*Cargo.lock")
     if not found:
@@ -221,22 +146,14 @@ def tracked_lockfiles() -> tuple[str, ...]:
 def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
     """(file, where-in-it, value) for every hand-kept version in the repo.
 
-    TOML is parsed rather than grepped, and so is `package.xml`. That is not
-    fastidiousness: three of these files carry the version *in prose* in the
-    comment directly above the field — `crates/tf_tree_c/CMakeLists.txt` names
-    `find_package(tf_tree 0.0.1 CONFIG REQUIRED)` as an example — and a grep
-    for the number would report those comments as sites, which means the next
-    bump would fail the gate on an illustration rather than on a fact.
+    TOML and `package.xml` are parsed, not grepped: comments above the field
+    quote versions and would be read as sites.
     """
     sites: list[tuple[str, str, str]] = []
 
     root = load_toml("Cargo.toml")
 
-    # The intra-workspace pins. A publishable crate wired by path *alone* is
-    # unpublishable — cargo refuses "dependency `x` does not specify a
-    # version" — so a missing pin is a release-blocking defect and not just a
-    # drift, and it is reported as its own failure rather than as a missing
-    # site.
+    # The intra-workspace pins: a publishable crate wired by path alone is unpublishable, so a missing pin is its own failure.
     for name, dep in sorted(root["workspace"]["dependencies"].items()):
         if not isinstance(dep, dict):
             continue
@@ -281,10 +198,7 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
     )
 
     for rel in CMAKE_FILES:
-        # Comment lines stripped for the same reason `evidence-audit.sh` strips
-        # them: the comment above `project()` in all three of these files
-        # quotes a version, and one of them quotes it inside a `find_package`
-        # call that would match a laxer regex.
+        # Comment lines stripped (as `evidence-audit.sh` does): the comment above `project()` quotes a version.
         body = "\n".join(
             line.split("#", 1)[0] for line in (ROOT / rel).read_text().splitlines()
         )
@@ -298,27 +212,17 @@ def collect_version_sites(authority: str) -> list[tuple[str, str, str]]:
         sites.append((rel, "project(... VERSION ...)", found[0]))
 
     for rel in PACKAGE_XML_FILES:
-        # ElementTree drops comments, so the "Hand-kept copy of the root
-        # Cargo.toml's version" note above the tag cannot be read as a site.
+        # ElementTree drops comments, so the note above the tag is not a site.
         version = ET.fromstring((ROOT / rel).read_text()).findtext("version")
         if version is None:
             fail(f"{rel}: no <version> element")
             continue
         sites.append((rel, "<version>", version.strip()))
 
-    # A lockfile records a version for every package in the graph, ours and the
-    # registry's alike, so the entries are filtered **two** ways. By name, to
-    # the packages this repository defines — a third-party crate's version is
-    # nothing to do with this release. And by the absence of a `source` key,
-    # which is how cargo spells "this came from a path": that excludes a
-    # registry or git copy of a crate we *also* publish, which would otherwise
-    # be read as a site and compared against a number it has no reason to
-    # equal. What this does **not** exclude is a path
-    # `[patch]` pointing at another checkout: cargo writes no `source` key for
-    # one, so it is read as ours and compared. That fails loudly if its version
-    # differs, which is the right way round — a second checkout of one of our
-    # crates wired into this build is a thing somebody should have to argue
-    # for, not a thing this gate should silently skip.
+    # A lockfile lists every package in the graph, so entries are filtered by name
+    # (packages this repository defines) and by the absence of `source` (a path
+    # package). A path `[patch]` to another checkout has no `source` key, so it is
+    # read as ours and compared.
     ours = local_crate_names()
     for rel in tracked_lockfiles():
         for package in load_toml(rel).get("package", []):
@@ -358,9 +262,7 @@ def check_versions() -> str:
                 f"is hand-kept."
             )
 
-    # `covered`, not `len(VERSION_FILES)`: the root `Cargo.toml` is both the
-    # authority and a carrier — its five intra-workspace pins are hand-kept
-    # copies like any other — so counting it out would understate by one.
+    # `covered`, not `len(VERSION_FILES)`: the root `Cargo.toml` is both authority and carrier.
     return (
         f"{len(sites)} version sites in {len(covered)} files all read "
         f"{authority} — the root Cargo.toml's [workspace.package] version"
@@ -382,9 +284,7 @@ def check_publishable(authority: str) -> str:
     ).stdout
     packages = json.loads(out)["packages"]
 
-    # cargo spells `publish = false` as an empty allow-list and "publishable
-    # anywhere" as null. Nothing here uses a registry allow-list; if one ever
-    # appears this reads it as not-publishable, which is the safe direction.
+    # `publish = false` is an empty allow-list, "anywhere" is null; a registry allow-list reads as not-publishable (the safe direction).
     publishable = {p["name"] for p in packages if p.get("publish") is None}
 
     if publishable != set(PUBLISHABLE):
@@ -443,33 +343,17 @@ def check_changelog(authority: str) -> str:
 # 4. Every `just <recipe>` a maintained document or a workflow names exists.
 # ---------------------------------------------------------------------------
 
-# A recipe name as this repository spells them: lowercase, digits, hyphens.
-# Anything else in the argument position is deliberately *not* checked, and it
-# is a FAMILY rather than a short list: a flag (`just --list`), a glob naming a
-# family of recipes rather than calling one (`just py-*`), a metavariable
-# (`just <recipe>`), and a token whose trailing backtick or quote the span
-# regexes carry in. Narrowing the rule to exclude that family is what took this
-# check from three findings to one. **No count is written here** — this comment
-# said "exactly two such tokens in the corpus today" and was wrong by four,
-# which is the shape `CLAUDE.md` and PHASE5 §10 both name: a measurement in
-# prose beside no instrument.
+# A recipe name: lowercase, digits, hyphens. Anything else in the argument
+# position (a flag, a glob like `just py-*`, a metavariable, a token carrying a
+# trailing backtick) is deliberately not checked.
 #
-# **The one skipped shape worth naming, because it is a real reference and not
-# prose:** `.github/workflows/nightly.yml`'s `just ${{ matrix.recipe }}`. Its
-# two values (`tsan`, `shm-torture-asan`) are recipe references this check does
-# not resolve — resolving them means reading `strategy.matrix`, which is more
-# YAML parsing than a version-skew gate should carry. Both are named in the
-# maintained documents and therefore checked by the doc arm above, so the hole
-# is currently covered from the other side; the day one of them stops being
-# documented, this note is what says the workflow arm never saw it.
+# Skipped real reference: `.github/workflows/nightly.yml`'s `just ${{ matrix.recipe }}`
+# (`tsan`, `shm-torture-asan`); both are named in the maintained documents and
+# checked by the doc arm.
 RECIPE_TOKEN_RE = re.compile(r"[a-z][a-z0-9-]*")
 
-# Root markdown, the phase specs, and the benchmark register. **`docs/decisions/`
-# is deliberately out of scope** even though all of its `just` references
-# resolve today: a `ready` decision record is a dated artifact — this release
-# left `0019`'s "0.1.0 scope" prose alone for exactly that reason — so renaming
-# a recipe must not force an edit to a historical document. The maintained
-# documents are the ones a reader is told to trust today.
+# Root markdown, the phase specs and the benchmark register. `docs/decisions/` is
+# out: a dated record must not be edited for a recipe rename.
 DOC_GLOBS = ("*.md", "docs/*.md", "docs/benchmarks/*.md")
 
 FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
@@ -480,14 +364,9 @@ JUST_CALL_RE = re.compile(r"\bjust\s+(\S+)")
 def code_spans(markdown: str) -> list[tuple[int, str]]:
     """(offset, text) for every fenced block and inline code span — and nothing else.
 
-    Prose is excluded on purpose. "just build it" is English; `just build` is a
-    claim about this file. Scanning prose would put the gate at the mercy of a
-    sentence, which is how a checker earns its reputation for flapping.
-
-    Offsets are into the original document so a finding can name a line. The
-    fences are blanked to spaces rather than deleted before the inline pass —
-    same length, newlines kept — because deleting them would shift every offset
-    after the first code block and the line numbers would be quietly wrong.
+    Prose is excluded: "just build it" is English, `just build` is a claim.
+    Offsets index the original document; fences are blanked to spaces (same
+    length) before the inline pass so line numbers stay right.
     """
     spans = [(m.start(1), m.group(1)) for m in FENCE_RE.finditer(markdown)]
     blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
@@ -498,11 +377,9 @@ def code_spans(markdown: str) -> list[tuple[int, str]]:
 def blank_code(markdown: str, *, fences: bool = True) -> str:
     """`code_spans`' inverse: the document with its code blanked to spaces.
 
-    Same length, newlines kept, so every offset still names its own line. Two
-    callers want two different dispositions of *fenced* blocks and the flag is
-    what keeps that one function rather than two: a link inside a ```sh``` block
-    is a shell argument and not a link, while a version literal inside a fence
-    on a crates.io front page is exactly the claim that check is looking for.
+    Same length, newlines kept. The flag chooses whether *fenced* blocks are
+    blanked: a link in a ```sh``` block is not a link, but a version in a fence
+    on a front page is the claim that check looks for.
     """
     blanked = FENCE_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), markdown)
     keep = blanked if fences else markdown
@@ -524,9 +401,7 @@ def check_recipe_references() -> str:
 
     doc_checked = 0
     doc_files = sorted({p for glob in DOC_GLOBS for p in ROOT.glob(glob)})
-    # Sorted before reporting: `code_spans` yields every fenced block first and
-    # then every inline span, so unsorted output walks one file's line 238
-    # before its line 60 and reads like a bug in the checker.
+    # Sorted: `code_spans` yields fences first, then inline spans.
     doc_findings: list[tuple[str, int, str]] = []
     for path in doc_files:
         rel = path.relative_to(ROOT)
@@ -548,12 +423,7 @@ def check_recipe_references() -> str:
                     doc_findings.append((str(rel), line, message))
     for _, _, message in sorted(doc_findings):
         fail(message)
-    # **Anti-vacuity, in the shape this file's own siblings use** — `if not X`,
-    # never a magnitude: `check_markdown_tables` floors on `if not tables` and
-    # the recipe census above on `if not recipes`. A number here would be one
-    # more measurement in prose with nothing re-taking it. What each of these
-    # catches is a scan that stopped matching: a moved doc tree, a `code_spans`
-    # or `JUST_CALL_RE` that no longer fires, a workflow directory that moved.
+    # Anti-vacuity, in the shape siblings use (`if not X`, never a magnitude): catches a scan that stopped matching.
     if not doc_files:
         fail(f"DOC_GLOBS {DOC_GLOBS} matched no document; this check scanned nothing")
     if not doc_checked:
@@ -564,8 +434,7 @@ def check_recipe_references() -> str:
         )
 
     wf_checked = 0
-    # Both spellings. Every workflow here is `.yml` today; a `.yaml` one that
-    # nothing scanned would be the silent half of this check.
+    # Both `.yml` and `.yaml`.
     workflows = sorted(
         {
             p
@@ -576,9 +445,7 @@ def check_recipe_references() -> str:
     for path in workflows:
         rel = path.relative_to(ROOT)
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            # Inline `#` truncates the line. That can hide a reference (a false
-            # negative) and cannot invent one, which is the direction to err in
-            # for a gate wired into `just lint`.
+            # Inline `#` truncates the line: may hide a reference, cannot invent one.
             for match in JUST_CALL_RE.finditer(line.split("#", 1)[0]):
                 token = match.group(1)
                 if not RECIPE_TOKEN_RE.fullmatch(token):
@@ -612,56 +479,17 @@ def check_recipe_references() -> str:
 # ---------------------------------------------------------------------------
 # 5. Every Markdown table row has as many cells as its header.
 # ---------------------------------------------------------------------------
-
-# GFM truncates a row to the header's column count and **says nothing**. A cell
-# past the last column is not a rendering wart, it is deletion: it is gone on
-# github.com while every local editor, every `less` and every diff still shows
-# it, so the author who wrote it has no way to notice. Twice now that has hidden
-# something that mattered:
 #
-#   * `docs/API.md` row 16 shipped with two unescaped pipes inside `|s| ≈ 2.3`
-#     and split into seven cells of a five-column table. The commit that landed
-#     the row said it had fixed exactly that, and had not; a review found it by
-#     counting pipes by hand.
-#   * `docs/PHASE2.md` §12.2 carried two three-cell rows in a two-column table
-#     for five days (#208). Invisible in them were a benchmark's whole result
-#     and a stale figure that a later change had split in two — a wrong number
-#     no reader could see to challenge.
+# GFM truncates a row to the header's width and says nothing, so a cell past the
+# last column is deleted invisibly (#208). Rows with too few cells are reported
+# too. The splitter is escape-aware (`\|` is legitimate in a cell). A false
+# positive blocks a correct document, so three constructions GFM does not render
+# as tables are guarded:
 #
-# **Escape-aware, because `\|` is legitimate inside a cell** and is how API.md's
-# row was fixed. A naive `line.count("|")` false-positives on §3.6's
-# `SHRINK\|GROW` row, which is well formed; that false positive is the reason
-# the rule is written against a splitter rather than a count.
-#
-# Rows with too *few* cells are reported as well, even though GFM pads those and
-# nothing is lost. A table whose rows disagree with its header is a table
-# somebody edited without counting the columns, and the next such edit is the
-# one that deletes.
-#
-# **The risk runs both ways, and the second direction is the dangerous one.** A
-# false *negative* — a ragged row this walks past — leaves the corpus exactly
-# where it was. A false *positive* blocks a correct document, and a gate that
-# does that is a gate somebody switches off. Three constructions put a pipe
-# table where GFM renders none, and each is guarded rather than argued away:
-#
-#   * a **setext H2** — a prose line containing a `|`, then a bare `---` under
-#     it — is a heading. GFM will not read a delimiter row without a `|` in it,
-#     so neither does this, and every table in the corpus has one. Unguarded,
-#     the check calls a heading "1 cells in a 2-column table", and 59 Markdown
-#     files are each one missing blank line away from writing that heading by
-#     accident.
-#   * a **4-space-indented code block** is code, and a table drawn in one
-#     renders as text. Skipped — but the threshold is four spaces past the
-#     innermost open list item's content, not four from the margin, because
-#     `docs/decisions/0005` has a real, rendered table indented four spaces
-#     inside item 11 of an ordered list. A blanket "skip four spaces" would
-#     stop checking it.
-#   * an **HTML comment** hides everything through `-->`, and `CHANGELOG.md`
-#     opens one. Skipped.
-#
-# Each guard was verified by writing the construction it describes into a file
-# and watching the check stay silent, then breaking a row inside a *rendered*
-# table in the same file and watching it fire.
+#   * a setext H2 (prose containing `|`, then a bare `---`): a delimiter row must contain a `|`;
+#   * a 4-space-indented code block: the threshold is four past the innermost
+#     open list item's content, not the margin (`docs/decisions/0005`);
+#   * an HTML comment, through `-->`.
 
 # A delimiter cell: `---`, `:--`, `--:`, `:-:`, any width.
 TABLE_DELIM_CELL_RE = re.compile(r"^\s*:?-+:?\s*$")
@@ -669,26 +497,18 @@ TABLE_DELIM_CELL_RE = re.compile(r"^\s*:?-+:?\s*$")
 # Only ``` and ~~~ fences, up to three leading spaces, as CommonMark has it.
 MD_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 
-# A list marker, which is what moves the indented-code threshold: content of an
-# item indented by the marker's own width is content, not code.
+# A list marker (moves the indented-code threshold).
 LIST_MARKER_RE = re.compile(r"^(\s*)(?:[-*+]|\d{1,9}[.)])(\s+)")
 
-# A blockquote marker, possibly nested, stripped before anything else looks at
-# the line. Seven documents put tables inside `>` blocks — `docs/API.md`'s
-# inlining measurements are the largest — and those render as tables on
-# github.com and truncate exactly like any other. Without this the check walks
-# past all of them: `> |` makes the first cell `> `, which no delimiter pattern
-# matches, so the table is never recognised at all.
+# A blockquote marker, possibly nested, stripped first: tables inside `>` blocks render and truncate like any other.
 QUOTE_PREFIX_RE = re.compile(r"^\s*(?:>\s?)+")
 
 
 def table_cells(line: str) -> list[str]:
     r"""Split a table row on unescaped `|`, the way GFM does.
 
-    A backslash consumes the character after it, so `\|` stays inside its cell.
-    The leading and trailing pipes every table in this repository carries are
-    decoration: GFM drops the empty edge cells they produce, and dropping them
-    here is what makes a row written without them count the same.
+    A backslash consumes the next character, so `\|` stays in its cell; the empty
+    edge cells from leading and trailing pipes are dropped.
     """
     cells: list[str] = []
     current: list[str] = []
@@ -716,9 +536,7 @@ def table_cells(line: str) -> list[str]:
 def strip_html_comments(line: str, inside: bool) -> tuple[str, bool]:
     """Drop `<!-- ... -->` spans, carrying the open/closed state across lines.
 
-    An HTML comment is raw HTML through its `-->`: whatever is inside it does
-    not render, so a table drawn there is not a table. Returns what is left of
-    the line and whether a comment is still open after it.
+    Returns what is left of the line and whether a comment is still open.
     """
     kept: list[str] = []
     i = 0
@@ -743,17 +561,9 @@ def strip_html_comments(line: str, inside: bool) -> tuple[str, bool]:
 def parsed_lines(text: str) -> list[str]:
     """Blank every line GFM will not read as Markdown, keeping line numbers.
 
-    Fenced code, HTML comments and indented code come back as empty strings
-    rather than being dropped, so a finding's line number is still the line
-    number in the file. Blanking is also how each of them *ends* a table, which
-    is what GFM does with them.
-
-    The indented-code threshold is four spaces past the innermost open list
-    item's content indent. Four from the margin would be wrong in exactly one
-    place that exists today — `docs/decisions/0005`'s table inside item 11 of an
-    ordered list — and wrong in the direction that stops checking a real table.
-    Where the list tracking guesses, it guesses the marker into existence and
-    so raises the floor, which skips *less* and checks *more*.
+    Fenced code, HTML comments and indented code come back empty, which also ends
+    a table. The indented-code threshold is four spaces past the innermost open
+    list item's content indent (`docs/decisions/0005` has a table inside a list item).
     """
     out: list[str] = []
     fenced = False
@@ -789,15 +599,10 @@ def parsed_lines(text: str) -> list[str]:
 def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
     """(tables, body rows, findings) — findings are (line, found, expected, row).
 
-    A table is recognised the way GFM recognises one: a header line followed by
-    a delimiter line of the same width, where the delimiter row **carries a
-    `|`**. That last clause is the whole difference between a one-column table
-    and a setext `---` heading, and without it a heading over a prose line
-    holding a pipe is reported as a one-cell row. Fenced blocks, HTML comments
-    and indented code are skipped, so a document that *shows* a broken table as
-    an example is not a finding — and the counts come back with the findings
-    because a detector that quietly stops matching would otherwise report a
-    clean corpus forever.
+    A table is a header line plus a delimiter line of the same width that
+    **carries a `|`** (else it is a setext heading). Fences, HTML comments and
+    indented code are skipped. Counts come back so a matcher that stopped
+    matching cannot report a clean corpus.
     """
     lines = parsed_lines(text)
     findings: list[tuple[int, int, int, str]] = []
@@ -808,8 +613,7 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
         if "|" not in lines[i] or i + 1 >= len(lines):
             i += 1
             continue
-        # A delimiter cell holds only `-`, `:` and spaces, so no backslash can
-        # reach one and a plain `in` is exactly "an unescaped pipe" here.
+        # A delimiter cell holds no backslash, so a plain `in` is "an unescaped pipe".
         if "|" not in lines[i + 1]:
             i += 1
             continue
@@ -819,9 +623,7 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
             continue
         header = table_cells(lines[i])
         tables += 1
-        # A delimiter row that does not match its own header is the same defect
-        # one line earlier: GFM stops seeing a table at all, and the whole thing
-        # renders as a paragraph full of pipes.
+        # A delimiter row that does not match its header: GFM renders no table.
         if len(header) != len(delim):
             findings.append((i + 2, len(delim), len(header), lines[i + 1]))
         j = i + 2
@@ -838,13 +640,8 @@ def scan_tables(text: str) -> tuple[int, int, list[tuple[int, int, int, str]]]:
 def check_markdown_tables() -> str:
     """**Every tracked Markdown file**, `docs/decisions/` included.
 
-    Wider than the recipe scan above, and for a reason that does not contradict
-    it. That one holds records out because a recipe rename must not force an
-    edit to a dated document. A ragged row is not a rename: it is a defect the
-    document had on the day it was written, and a record that renders with a
-    cell missing is misleading today. The corpus was measured before the rule
-    was written — across every tracked Markdown file the only findings were
-    `PHASE2.md` §12.2's two rows, which #208 fixed.
+    Wider than the recipe scan: a ragged row is a defect the document had on the
+    day it was written, not a rename a dated record should not track.
     """
     files = tracked("*.md")
     if not files:
@@ -858,9 +655,7 @@ def check_markdown_tables() -> str:
         tables += found_tables
         rows += found_rows
         for lineno, found, expected, row in findings:
-            # Two different defects, and the advice differs. Too many cells is
-            # the one that deletes; too few is a table somebody stopped
-            # counting, which is how the next edit becomes the first kind.
+            # Too many cells deletes; too few is a table somebody stopped counting.
             why = (
                 "GFM drops every cell past the header count and warns nobody, "
                 "so what is written past the last column renders as nothing at "
@@ -887,40 +682,17 @@ def check_markdown_tables() -> str:
     )
 
 
-# `](target` — an inline link's destination, taken up to the first whitespace or
-# `)` so an optional title is not swallowed. Reference definitions
-# (`[label]: target`) are deliberately out of scope: the three in this
-# repository are all `https:`, and a rule measured against no in-scope subject
-# is a rule nobody has tested.
+# `](target` — an inline link's destination up to the first whitespace or `)`. Reference definitions are out of scope.
 MD_LINK_RE = re.compile(r"\]\(\s*([^)\s]+)")
 
 
 def check_relative_links() -> str:
     """Every relative Markdown link resolves to a file that exists.
 
-    **Two were broken when this was written**, and both had been for a while:
-    `docs/PHASE1.md`'s citation of `0013` climbed one directory too far
-    (`../decisions/` from inside `docs/`, which is the repository's parent),
-    and `docs/decisions/0046` cited `0010` by a title that record does not have.
-    Neither is visible in a diff, both render as ordinary links, and github.com
-    answers a 404 only to the reader who clicks.
-
-    **Code is blanked first, fences included**, which is the difference from
-    `check_front_page_versions`: a link-shaped path inside a ```sh``` block is
-    an argument to a command, not a link. That is a rule on principle, not a
-    rule with a case behind it — measured over every tracked Markdown file, the
-    scan sees the same links and reports the same zero failures with the
-    blanking removed outright. The one hit blanking removes is a rustdoc path
-    in a code span, and the scheme filter below already skips it. Kept because
-    a fenced example of a *broken* link is a thing documentation does, and it
-    should not fail this gate.
-
-    **Anchors are not checked, only the file.** `](#section)` is skipped
-    outright and a `#fragment` is stripped before resolving, because heading
-    slugs are a renderer's business and GFM's rule is not the only one in play.
-
-    The floor below is the point of the exercise: a scan of these documents that
-    silently matched nothing would print the same "all resolve" as a clean one.
+    Code is blanked first, fences included (unlike `check_front_page_versions`):
+    a path in a ```sh``` block is an argument. Anchors are not checked; a
+    `#fragment` is stripped before resolving. The floor fails a scan that matched
+    nothing.
     """
     files = tracked("*.md")
 
@@ -930,8 +702,7 @@ def check_relative_links() -> str:
         prose = blank_code(text)
         for hit in MD_LINK_RE.finditer(prose):
             target = hit.group(1)
-            # A scheme (`https:`, `mailto:`) before the first `/`, or a bare
-            # in-page anchor. Neither names a file in this repository.
+            # A scheme before the first `/`, or a bare in-page anchor: not a file.
             head = target.split("/", 1)[0]
             if ":" in head or target.startswith("#"):
                 continue
@@ -966,61 +737,13 @@ PROSE_VERSION_RE = re.compile(r"\bv?[0-9]+\.[0-9]+\.[0-9]+\b")
 def check_front_page_versions() -> str:
     """No three-component version literal in prose on a crates.io front page.
 
-    **What it cost to not have this.** Four of the five publishable crates'
-    `README.md` — the pages crates.io renders — opened their Version section with
-    ``**0.0.1, and `0.0.x` promises nothing.**`` while `[workspace.package]
-    version` was `0.0.3`. Wrong on the front page of `tf_tree`, `tf_tree_core`,
-    `tf_tree_arena` and `tf_tree_ipc` for three releases. `tf_tree_math` had hit
-    it first and fixed it the right way — by deleting the number and recording
-    why — and **that fix reached one crate of five**, which is the whole argument
-    for a gate: a lesson written into prose only propagates if the next person
-    reads the prose.
-
-    **Scope is derived from a listed set**, and the distinction is worth the
-    sentence because the earlier phrasing here — *"scope is derived, not
-    listed"* — read as stronger than it is. `PUBLISHABLE` is the one literal in
-    this file that is not read out of the repository, with the argument for that
-    at its definition; what is derived is each crate's front *page*, which its
-    own manifest names in `[package] readme`. A crate that publishes without a
-    `readme` key is itself a failure, in the same shape as `check_versions`'
-    "no version site found" — a scan that silently finds nothing is how a gate
-    keeps passing after its subject moved.
-
-    **The sixth front page is the root `README.md`, and it is not merely the
-    GitHub landing page.** `pyproject.toml`'s `[project] readme` names it, so it
-    is what PyPI renders for `transform_tree` — a package index front page by
-    the same argument as the five, and uncovered here until 2026-09-05. It is
-    read out of `pyproject.toml` rather than hard-coded, and a `[project]`
-    without a `readme` key fails: the distribution would render no description
-    at all, which is a defect in its own right.
-
-    **Why three components, and why inline code is exempt.** Both narrower than
-    they look, and both were measured against the whole corpus before being
-    written, per this module's standard:
-
-    * "no version-shaped literal at all" fails **57** times on these five files
-      today, every one correct: `MSRV is **1.87**`, `Apache-2.0`, and
-      `tf_tree_math`'s SE(3) worked examples with their `0.0` and `0.15`.
-    * a bare three-component rule still fails **9** times, and all 9 are
-      deliberate — `tf_tree/README.md`'s worked example of cargo's caret
-      semantics, and the past-tense sentence #236 added to record this very bug.
-      A gate in that shape would demand deleting the sentence that documents it.
-    * exempting inline code spans is not a loophole, because the defect was not
-      in code. It was **bold** — `**0.0.1, and ...**`. Measured: 0 hits across
-      the five files today, and exactly 4 against `abd2fd9^` (the tree #236
-      fixed), on exactly the four defective files, with `tf_tree_math` silent.
-
-    Fenced blocks stay in scope deliberately, at no cost today — no README
-    carries a versioned install snippet — so a future ```toml``` block pinning
-    `tf_tree = "0.0.4"` is covered rather than exempt.
-
-    **What this buys today: nothing, and that is the honest description.** After
-    #236 no tracked Markdown file makes a live claim about the current version.
-    This is purely a regression guard. Its value is that #236's lesson stops
-    depending on anybody re-reading it.
+    Each crate's front page is named by its manifest's `readme`; the root
+    `README.md` is also checked (PyPI's, per `pyproject.toml`). A crate or
+    project with no `readme` key fails. Inline code is exempt (the defect was
+    bold text); fenced blocks stay in scope. A regression guard: no page makes a
+    live version claim today.
     """
-    # (index name, front page) for every page a package registry renders: the
-    # five crates.io pages, then the PyPI one.
+    # (index name, front page) for the five crates.io pages, then the PyPI one.
     pages: list[tuple[str, str]] = []
     for name in sorted(PUBLISHABLE):
         manifest = f"crates/{name}/Cargo.toml"
@@ -1050,8 +773,7 @@ def check_front_page_versions() -> str:
     for name, rel in pages:
         text = (ROOT / rel).read_text(encoding="utf-8")
 
-        # Blank the inline code, keep the prose *and the fences* — see
-        # `blank_code`, whose flag is why this is not a second spelling of it.
+        # Blank inline code, keep prose and fences (see `blank_code`'s flag).
         prose = blank_code(text, fences=False)
 
         for hit in PROSE_VERSION_RE.finditer(prose):
@@ -1077,19 +799,9 @@ def check_front_page_versions() -> str:
 def check_distribution_name() -> str:
     """The PyPI distribution name, wherever it is written by hand.
 
-    It is **not** the import name, and that split is the reason this check
-    exists. `tf_tree` could not be registered on PyPI — it is refused as too
-    close to the existing `tftree`, because the similarity check strips
-    separators — so the distribution is `transform_tree` while the module stays
-    `tf_tree` (`docs/decisions/0008`'s correction records the measurement).
-
-    Two consequences a reader will not expect, and each is a place to drift:
-    `importlib.metadata.version(...)` takes the *distribution* name, so
-    `tests/python/test_version.py` must ask for `transform_tree`; and a wheel is
-    named after the distribution, so the globs that unpack one must match it.
-    Neither is checked by anything else — `test_version.py` would fail with
-    `PackageNotFoundError` at some later date, and the justfile globs would
-    silently select nothing and assert on an empty list.
+    It is not the import name: the distribution is `transform_tree`, the module
+    stays `tf_tree` (`docs/decisions/0008`). `importlib.metadata.version(...)` and
+    wheel globs take the distribution name.
     """
     dist = load_toml("pyproject.toml")["project"]["name"]
 
@@ -1103,10 +815,7 @@ def check_distribution_name() -> str:
             )
 
     justfile = Path("justfile").read_text(encoding="utf-8")
-    # Executable lines only. A comment may legitimately quote a historical
-    # filename — the recipe that unpacks a wheel carries one naming the
-    # `tf_tree-0.1.0` wheel that existed before this rename — and a gate that
-    # fails on prose about the past is a gate people edit the prose to silence.
+    # Executable lines only: a comment may quote a historical filename.
     stale = [
         line.strip()
         for line in justfile.splitlines()
@@ -1126,39 +835,17 @@ DECISION_SETTLED_VERB = re.compile(
     r"[*_`]{0,2}\s+by\s+[*_`]{0,2}\[?[*_`]{0,2}(\d{4})[*_`]{0,2}\]?"
 )
 
-# Leading continuation markers stripped before the corpus is joined into one
-# line. Without this, a citation split across a blockquote or a `//!` doc block
-# is invisible to the scan — measured, see the docstring.
+# Leading continuation markers stripped before joining, so a citation split across a blockquote or `//!` block is seen.
 _CONTINUATION = re.compile(r"^\s*(?:>|//!|///|//|#)+\s?")
 
 
 def check_decision_status_citations() -> str:
     """A `draft` decision record may not be cited as settled.
 
-    `docs/decisions/README.md`'s lifecycle says a draft authorises nothing, and
-    `docs/PROJECT.md` §5.1 used to say it of `0031` in a ledger row — removed
-    2026-09-18 with that record's answer; the rule is unchanged. **It was not
-    held.** `0047`, `0048` and `0049` were cited as settled declines and
-    amendments at fourteen sites — spec §0.0 rows marking work "Declined, not
-    merely absent", amendment banners, and `CLAUDE.md`'s hard-rules bullet —
-    while all three records read `**Status:** draft`. Two `PHASE2.md` §0.0 rows
-    recorded work as *not owed* on that authority, which makes a phase's
-    completeness claim rest on an undecided document.
-
-    **Two normalisation steps are load-bearing and each was measured against
-    this repository rather than assumed.** Stripping leading continuation
-    markers (`>`, `//!`, `///`, `//`, `#`) before joining takes the count from
-    35 to 37, because a blockquote banner splits `are DECLINED by` from its
-    `[`0047`]` link across lines. Tolerating Markdown emphasis around the verb
-    and the link takes it from 33 to 35, because a bolded verb in front of a
-    bracketed, backticked id is otherwise invisible. The naive pattern misses
-    4 of the 14 sites this exists to find.
-
-    **What this does NOT prove.** It sees `<verb> by <NNNN>` and nothing else.
-    A citation with the verb *after* the link ("[`0047`] declines §10's ..."),
-    a dash form ("DECLINED - [`0047`]"), and bare adjacency ("(0048; the
-    register is ...)") are all outside it and stay held by review. The checked
-    spelling is the one §0.0 status rows and amendment banners actually use.
+    A draft authorises nothing (`docs/decisions/README.md`). Matches
+    `<verb> by <NNNN>` after normalising continuation markers and Markdown
+    emphasis. Does NOT see a verb after the link, a dash form or bare adjacency;
+    those stay held by review.
     """
     statuses: dict[str, str] = {}
     for path in sorted((ROOT / "docs" / "decisions").glob("0*.md")):
@@ -1179,15 +866,7 @@ def check_decision_status_citations() -> str:
 
     settled = 0
     for rel in files:
-        # A record may discuss its OWN state, and only its own. Skipping the
-        # whole file was wrong and blinded the check to its own subject: a
-        # record citing a *different* record as settled is the amendment-banner
-        # form, and two of the fourteen sites this exists to find are exactly
-        # that: two records carried an amendment banner naming a third record
-        # that was `draft` at the time. The banner text is not quoted here,
-        # because this file is inside the corpus and a quoted example matches
-        # itself — which it did, twice, while this check was being written.
-        # The skip is per match, below, against this file's own id.
+        # A record may discuss its own state only; the skip is per match, against this file's own id.
         own = rel.rsplit("/", 1)[-1][:4] if rel.startswith("docs/decisions/") else None
         try:
             raw = (ROOT / rel).read_text(encoding="utf-8").splitlines()
@@ -1222,15 +901,7 @@ def check_decision_status_citations() -> str:
             else:
                 settled += 1
 
-    # Anti-vacuity floor. A pattern or corpus that stopped matching would
-    # otherwise report success on an empty subject set.
-    #
-    # **The number is measured at the tip, not remembered.** This comment first
-    # read "23 citations land on non-draft records today" against a check that
-    # reported 31 — 23 was counted before the three promotions in the same
-    # commit, and a floor 11 below the real count would not notice a corpus
-    # change that lost a third of its subject. Set just under the live count so
-    # it bites; raise it with the count, never independently.
+    # Anti-vacuity floor, set just under the live count; raise it with the count.
     floor = 34
     if settled < floor:
         fail(
@@ -1249,12 +920,7 @@ def check_decision_status_citations() -> str:
 # 10. The changelog is not behind the code a user can observe.
 # ---------------------------------------------------------------------------
 
-# Paths whose contents reach somebody who never clones this repository.
-# `publish = false` is not the criterion — shipping inside something is, which is
-# why the bridge (via `tf_tree_c`/`tf_tree_ros`) and ingest (via the CLI and the
-# wheel) are here. Not the whole tree: `docs/`, `xtask/`, the justfile and
-# `tf_tree_bench` change on most branches, and a rule that fires on everything is
-# the flapping this file's header refuses.
+# Paths whose contents reach somebody who never clones this repository (shipping inside something counts, not `publish = false`).
 RELEASE_VISIBLE = (
     "crates/tf_tree/src/",
     "crates/tf_tree_arena/src/",
@@ -1276,38 +942,17 @@ RELEASE_VISIBLE = (
     "ros/",
 )
 
-# Reported in the summary line rather than swallowed — a silently unfailable
-# override is the defect `0023` step 5 is about.
+# Reported in the summary line: a silently unfailable override is what `0023` step 5 is about.
 NO_CHANGELOG = "[no changelog]"
 
 
 def strip_fenced_blocks(text: str) -> tuple[str, bool]:
     """Blank fenced code blocks, recognising a fence only at the start of a line.
 
-    **The first spelling was a regex, and it was a silent false pass.** It read
-    ``re.sub(r"```.*?```", "", text, flags=re.S)``, which treats *any* triple
-    backtick as a fence — including one written inside an inline code span, as
-    `docs/PHASE5.md` and `CHANGELOG.md` each do. That makes the marker count
-    odd, and an odd count does not merely lose a block: it **inverts the
-    pairing** for the rest of the file, so prose is blanked and the code blocks
-    are scanned instead. `docs/PHASE5.md` reported 0 citations that way while
-    carrying two in prose, and was therefore ungated with no row in the budget
-    at all.
-
-    Found 2026-09-19 while writing a changelog sentence that would have
-    explained the zero as "its citations are inside fenced blocks". They were
-    not.
-
-    A fence inside a blockquote counts, because the documents use them; a
-    triple backtick anywhere but the start of a line does not.
-
-    **An unclosed fence is reported, not absorbed**, which is why the caller
-    gets a flag back rather than just the text. Left to itself this function
-    would blank the whole tail of such a file and the caller would see a lower
-    count — landing in the "shed" report rather than in a failure naming the
-    cause, the same silent-false-pass shape the regex had, narrowed rather than
-    closed. The flag also stops the caller reporting that file as having *shed*
-    citations, which it has not: they are merely unreadable.
+    A triple backtick inside an inline span is not a fence (a regex spelling
+    inverted the pairing for the rest of the file). A fence inside a blockquote
+    counts. An unclosed fence is reported through the returned flag, so the
+    caller does not read the blanked tail as shed citations.
     """
     out: list[str] = []
     opened = 0
@@ -1317,12 +962,7 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
             stripped = stripped[1:].lstrip()
         run = len(stripped) - len(stripped.lstrip("`"))
         if run >= 3:
-            # CommonMark: a fence closes only on a run at least as long as the
-            # one that opened it, so a ``` line *inside* a ```` block is
-            # content. Toggling on any run of three inverts the pairing there,
-            # with the marker count still even — the same silent false pass as
-            # the regex, one nesting level down. Latent today; no tracked file
-            # opens a four-backtick fence.
+            # CommonMark: a fence closes only on a run at least as long as the one that opened it.
             if opened == 0:
                 opened = run
                 out.append("")
@@ -1338,47 +978,11 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
 def check_line_citations() -> str:
     """`path.rs:LINE` citations in Markdown may not increase, per file.
 
-    **A line number into a churning file is a citation the next edit to that
-    file silently breaks**, and nothing noticed until it was measured
-    (2026-09-19): four citations into `crates/tf_tree/src/{open,tree}.rs`
-    already pointed at a blank or bare-`///` line on `main`, and a seven-line
-    rustdoc edit in a single PR moved twenty-two more. Twenty-three of the sites
-    are in `implemented` records, which this project freezes — their corrections
-    belong in `decisions/README.md`'s errata, and twenty-three line-number
-    errata would bury that file's real ones.
-
-    So this is a **ratchet, not a ban**: the ones that exist are grandfathered
-    per file in `scripts/line-citation-budget.txt` and the count may only fall.
-    Cite a symbol instead; a symbol survives every edit that does not rename it.
-
-    **Each row is an equality, not a ceiling** — over budget fails, and so does
-    under. A row left above its file is headroom for a citation nobody had to
-    justify, and it is also the only way to raise a budget without saying so: a
-    row added at 50 for a file carrying 2 used to print "within budget" and a
-    "48 shed" note, and exit 0.
-
-    **The equality is with what the pattern matches, and the pattern sees only
-    the prefixed form.** A citation beginning `crates/`, `xtask/`, `scripts/` or
-    `ros/` is counted; a bare `tree.rs:2182` is not, and `CLAUDE.md`'s rule
-    names the bare form explicitly. The gate covers well under half of what it
-    is named for, and it is the *later*-written half, since the bare spelling is
-    what a record reaching for brevity produces. **Both totals are printed on
-    every run, failing ones included** rather than recorded in prose: the figure
-    went stale in three documents inside the change that first measured it,
-    because the same branch kept converting bare citations. Extending the
-    pattern grandfathers a few hundred more sites, which is its own change and
-    its own review; it is not folded in here.
-
-    **Per file rather than in total**, because a total is not a ratchet: one
-    document could shed five citations while another gained five and the sum
-    would not move. That is the same defect `0055` step 6 found in a
-    max-over-a-set bound.
-
-    **Fenced blocks are excluded and code spans are not.** A `path:line` inside
-    a fenced block is compiler output or a shell transcript; the citations this
-    gate is about are written inside single-backtick spans, and blanking those
-    took the scan from 157 hits to 0 — which is how the first version of this
-    check would have passed vacuously.
+    A ratchet: existing citations are grandfathered per file in
+    `scripts/line-citation-budget.txt`, each row an equality (over or under
+    fails), and the count may only fall. Cite a symbol instead. The pattern sees
+    only the prefixed form (`crates/`, `xtask/`, `scripts/`, `ros/`); both totals
+    print on every run. Fenced blocks are excluded, code spans are not.
     """
     budget_path = "scripts/line-citation-budget.txt"
     budget: dict[str, int] = {}
@@ -1393,9 +997,7 @@ def check_line_citations() -> str:
     )
     files = tracked("*.md")
     found: dict[str, int] = {}
-    # The same citation with the directory prefix made optional — the form
-    # `CLAUDE.md`'s rule names and this gate does not hold. Counted in the same
-    # pass, so the two figures cannot be taken over different corpora.
+    # The same citation with the prefix optional (the form `CLAUDE.md` names), counted in the same pass.
     bare = re.compile(r"\b[A-Za-z0-9_][A-Za-z0-9_./-]*\.(?:rs|py):\d+")
 
     total = 0
@@ -1427,9 +1029,7 @@ def check_line_citations() -> str:
                 f"message cannot give you."
             )
 
-    # A file whose fence is unclosed reports a partial count; it is already
-    # failing above, and calling it "shed" would name a second cause that is
-    # not there.
+    # A file with an unclosed fence reports a partial count; it already fails above.
     dropped = sorted(
         (rel, budget[rel], found.get(rel, 0))
         for rel in budget
@@ -1437,18 +1037,7 @@ def check_line_citations() -> str:
     )
     gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
-    # **An empty scan is not a pass**, and since 2026-09-19 the equality above
-    # is what says so: a pattern that stopped matching drops every row at once
-    # and fails loudly, naming each file. This used to be `if total < 100`,
-    # which was a floor on the corpus rather than on the pattern — and once a
-    # row became an equality that floor would have refused a commit which
-    # legitimately shed its way below 100 and lowered every row correctly, with
-    # a message blaming the regex.
-    #
-    # What is left to assert is the pattern's own shape, which no corpus size
-    # can show: that it still matches the form it is for, and still does not
-    # match the bare form, which is the documented scope limit rather than an
-    # accident.
+    # An empty scan is not a pass: the equality above fails when the pattern stops matching. Assert the pattern's shape: it matches the prefixed form and not the bare form (the documented scope limit).
     if not pattern.search("see `crates/tf_tree/src/tree.rs:2182` for it"):
         fail(
             "the `path.rs:LINE` pattern no longer matches a full-path citation; "
@@ -1461,19 +1050,11 @@ def check_line_citations() -> str:
             "the rows must be re-derived in the same commit"
         )
 
-    # **A drop is a failure, not a note, and that is what makes "a row may only
-    # fall" a rule rather than a preference.** It was a note until 2026-09-19,
-    # and the hole is arithmetic: a commit adding `50\tdocs/PHASE5.md` for a
-    # file carrying two prints "within budget" plus "48 shed" and exits 0, so
-    # the budget can be raised to any number as long as the same commit does not
-    # also add citations. Failing here means a row that no longer matches its
-    # file has to be brought down in the commit that shed it, which is the only
-    # moment anybody knows why.
+    # A drop is a failure, not a note: a row must be brought down in the commit that shed the citations.
     if dropped:
         shed = sum(was - now for _, was, now in dropped)
         listed = ", ".join(f"{rel} {was}->{now}" for rel, was, now in dropped)
-        # Two remedies, because a row for a file that no longer exists cannot be
-        # "lowered" alongside citations that are not there to shed.
+        # Two remedies: a row for a file that no longer exists has nothing to lower.
         remedy = f"lower them in {budget_path} in the same commit"
         if gone:
             remedy += (
@@ -1487,12 +1068,7 @@ def check_line_citations() -> str:
             f"from here. {remedy}: {listed}. A row above its file is headroom "
             f"for a citation nobody had to justify."
         )
-    # **The uncounted half went into three documents and went stale in all of
-    # them inside one branch**, so it is printed rather than written down — and
-    # a printed number nothing can contradict is the shape this gate keeps
-    # finding, so it gets the same anti-vacuity treatment as the pattern above.
-    # `bare` is a strict superset of `pattern` by construction: every prefixed
-    # citation is also a bare one.
+    # The uncounted half is printed, not written down; `bare` is a superset of `pattern`.
     if wider < total:
         fail(
             f"the wider citation census counted {wider} against the gated "
@@ -1504,11 +1080,7 @@ def check_line_citations() -> str:
             "the wider census pattern no longer matches a bare citation; the "
             "figure it prints is asserting nothing"
         )
-    # A file whose fence never closed was read to the point of the fence and no
-    # further, so both totals are partial on that run. The shed report already
-    # excludes it; a census printed beside the failure has to say so too, or the
-    # number offered *because* a run failed is the number that run could not
-    # take.
+    # A file whose fence never closed is read only to the fence, so both totals are partial.
     partial = (
         f" — PARTIAL: {len(unreadable)} file(s) were read only as far as an "
         f"unclosed fence, so both totals are short"
@@ -1531,22 +1103,11 @@ def check_line_citations() -> str:
 def check_changelog_freshness() -> str:
     """`CHANGELOG.md` must not sit behind a release-visible commit.
 
-    `check_changelog` only asks whether a section for the *current* version
-    exists, which stays true while the version has not moved — so `#312`-`#323`
-    went unrecorded with every gate green, `#316` among them, which took the C
-    ABI from `7` to `8`.
-
-    An ordering, not a per-commit rule: batching entries is normal, leaving them
-    unwritten is not. A dirty `CHANGELOG.md` counts as current — that is somebody
-    writing them now.
-
-    **What this does NOT prove.** That the entries are correct, only that the file
-    was edited after the last observable change — so a gap *behind* that edit is
-    invisible (`#310` changed a published error's text and `#311` edited the
-    changelog after it). Reads paths, not diffs. Scoped to commits since the most
-    recent `v*` tag, and reports *not checked* without one rather than passing
-    quietly. `git log --name-only` prints nothing for a merge commit; the history
-    is squash-only.
+    An ordering, not a per-commit rule: no commit since the last `v*` tag
+    touching a shipped path may land after the newest `CHANGELOG.md` commit. A
+    dirty `CHANGELOG.md` counts as current. Does NOT prove the entries are
+    correct, only that the file was edited after the last observable change.
+    Reads paths, not diffs; reports *not checked* without a `v*` tag.
     """
     try:
         tag = _git("describe", "--tags", "--abbrev=0", "--match", "v*", "HEAD").strip()
@@ -1558,8 +1119,7 @@ def check_changelog_freshness() -> str:
     if not order:
         return f"changelog freshness: no commits since {tag}"
 
-    # One walk, two answers. `--name-only` with an empty format prints the hash
-    # on its own line ahead of that commit's paths.
+    # One walk, two answers: `--name-only` with an empty format prints the hash ahead of that commit's paths.
     newest: dict[str, str] = {}
     touches_visible: set[str] = set()
     current = ""
@@ -1596,8 +1156,7 @@ def check_changelog_freshness() -> str:
             "and counts as current"
         )
 
-    # Read from the walk above rather than a `git show` per commit: `git show` on
-    # a merge prints no paths, so a second derivation would disagree.
+    # Read from the walk above: `git show` on a merge prints no paths.
     cut = order[changelog] if changelog is not None else len(order)
     waived, owed = [], []
     for h, i in sorted(order.items(), key=lambda kv: kv[1]):
@@ -1634,14 +1193,7 @@ def check_changelog_freshness() -> str:
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
 
-    # **A check's summary sentence is unconditional, so it must not be printed
-    # for a check that failed.** Every `check_*` ends by *asserting* its rule —
-    # "all read 0.0.5", "each matching its row" — and `fail()` only appends
-    # elsewhere, so printing the summaries on a failing run (added 2026-09-19 so
-    # a ratchet failure would still carry the census) made the tool emit an
-    # all-clear about the very rule in the failure block beneath it. The
-    # snapshot of `failures` around each call is what tells them apart, and it
-    # is the whole mechanism: a check that added a message loses its sentence.
+    # A check's summary sentence asserts its rule, so it is withheld when the check added a failure (snapshot of `failures` around each call).
     lines: list[str] = []
     for call in (
         check_versions,
@@ -1662,20 +1214,10 @@ def main() -> int:
             lines.append(summary)
 
     if failures:
-        # **What goes out on a failing run is the measurements and the surviving
-        # verdicts.** A check that failed loses its summary in the loop above,
-        # because every summary asserts its own rule; `notes` carries the
-        # numbers that assert nothing and prints regardless, which is what a
-        # person reading a ratchet failure actually wants. Both halves of that
-        # arrangement were wrong in turn: summaries were suppressed entirely
-        # until 2026-09-19, then printed unconditionally on the same day, which
-        # put an all-clear above its own failure block.
+        # A failing run prints the measurements (`notes`) and the surviving verdicts; a failed check loses its summary.
         for line in [*lines, *notes]:
             print(f"artifact-versions: {line}")
-        # stdout is block-buffered under a pipe — `just lint`, CI — so without
-        # this the failure block on stderr arrives first and the summaries land
-        # after it. The claim "printed before the failure block" held on a tty
-        # and nowhere else.
+        # stdout is block-buffered under a pipe, so flush before the failure block on stderr.
         sys.stdout.flush()
         print(
             "artifact-versions: the repository disagrees with itself.\n",

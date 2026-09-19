@@ -3,76 +3,37 @@
 // `unsafe` boundary: raw arena memory, in `buffer` and `arena_view` only.
 // See `docs/decisions/0007`.
 #![deny(unsafe_op_in_unsafe_fn)]
-// `PHASE1.md` §13 asks for this at the root. The workspace sets
-// `missing_docs = "warn"` and `just lint`'s `-D warnings` promotes it, so the
-// gate was already effective — but only inside that recipe. This makes a plain
-// `cargo build` of this repository say so too.
-//
-// **It does not bind a downstream consumer, and an earlier version of this
-// comment claimed it did.** Cargo builds registry dependencies with
-// `--cap-lints allow`, which caps an attribute-level `deny` as well, so for
-// somebody building `tf_tree` from crates.io this attribute has no effect at
-// all. What it binds is builds of this repository and its path dependents —
-// which is where a missing doc would be introduced, so the box is still worth
-// closing this way.
+// `PHASE1.md` §13. Binds this repository and its path dependents only: cargo
+// caps lints on registry dependencies.
 #![deny(missing_docs)]
 //! `no_std + alloc` single-process transform tree engine.
 //!
-//! This is the source of truth: frame interning, topology, edge records, the
-//! seqlock sample buffers, plan compilation, and typed errors. It is the
-//! shared-memory design (Phase 1) backed by a heap allocation — every layout
-//! decision exists so Phase 2's `MappedArena` is a one-line swap.
-//!
-//! The whole of `docs/PHASE1.md`'s implementation order lives here: the
-//! concurrency core — frame interning ([`frame`]), topology ([`topology`]),
-//! edge records and the claim table ([`edge`]), the seqlock sample buffer
-//! ([`buffer`]), bracket search ([`sample`]) — and, above it, plan compilation
-//! and evaluation ([`plan`]: [`plan::Plan`], [`plan::Guard`], `at`/`at_many`).
-//! Phase 2's participant table ([`participant`]) and Phase 5's diagnostic
-//! counters ([`counters`]) sit alongside them. `TreeBuilder` and the public
-//! convenience API live in the `tf_tree` facade, which drives the primitives
-//! here.
+//! The engine: frame interning, topology, edge records, seqlock sample buffers
+//! ([`buffer`]), bracket search ([`sample`]), plan compilation and evaluation
+//! ([`plan`]), the participant table ([`participant`]) and diagnostic counters
+//! ([`counters`]), backed by a heap allocation so Phase 2's `MappedArena` is a
+//! one-line swap. `TreeBuilder` and the convenience API live in the `tf_tree`
+//! facade.
 //!
 //! # Stability — this crate's `pub` surface is not the project's API
 //!
-//! **`tf_tree` is the stable surface; this is the engine underneath it.** The
-//! split is `docs/API.md` §2.6 applied one crate down: that section's problem is
-//! that Rust has a single visibility tier, so everything `pub` reads as a
-//! semver promise whether it was meant as one or not. The facade answers it with
-//! a `tf_tree::unstable` module behind a feature. This crate cannot — it is a
-//! dependency of the facade and has to be published for the facade to be — so it
-//! answers with a statement instead, which is the honest form of the same thing:
+//! **`tf_tree` is the stable surface** (`docs/API.md` §2.6, applied one crate
+//! down).
 //!
-//! * **What `tf_tree` re-exports is the promise.** [`plan`]'s `Plan`, `Guard`,
-//!   `Stamp`, `Query`, the [`error`] types, [`layout`] — those are the API, and
-//!   they are stable because their shape is the *engine's* contract.
-//! * **Everything else here is shaped by the arena**, and the arena is scheduled
-//!   to change: `docs/PHASE5.md` §1 bumps `FORMAT_VERSION` to 3 and adds regions
-//!   Phase 6 fills. [`arena_view`], [`buffer`], [`frame`], [`edge`]'s records,
-//!   [`participant`], [`counters`] and [`topology`] move with it. Depend on them
-//!   and expect to be rebuilt; that is what `tf_tree::unstable` says out loud
-//!   for the two of them the facade used to re-export. **The exception is
-//!   [`ParticipantError`]**: it is the payload of the stable
-//!   `tf_tree::BuildError::Participant`, so the facade re-exports it at its
-//!   root and it is on the promise with the other error types.
+//! * **What `tf_tree` re-exports is the promise**: [`plan`]'s `Plan`, `Guard`,
+//!   `Stamp`, `Query`, the [`error`] types, [`layout`], and [`ParticipantError`]
+//!   (the payload of `tf_tree::BuildError::Participant`).
+//! * **Everything else is shaped by the arena**, which changes (`docs/PHASE5.md`
+//!   §1): [`arena_view`], [`buffer`], [`frame`], [`edge`]'s records,
+//!   [`participant`], [`counters`], [`topology`]. Depend on them and expect to be
+//!   rebuilt.
 //!
 //! ## The `#[non_exhaustive]` rule this crate applies
 //!
-//! Stated once, because a pre-tag audit went type by type and the *decisions*
-//! are worth less than the rule that produced them. `#[non_exhaustive]` is free
-//! to add before a published tag and a major bump after, so the default is to
-//! add it — but not everywhere, because it is not free of consequence:
-//!
-//! > **It goes on a type the engine *produces* and a caller only *reads*, or one
-//! > a caller *builds through a constructor*. It does not go on a type a caller
-//! > must *dispatch on*.**
-//!
-//! The reason is what the forced `_ =>` arm does. On a produced type there is no
-//! arm, so growth costs a downstream crate nothing. On a dispatched type the arm
-//! has to have a body, and every honest body is a lie about a variant that did
-//! not exist when it was written — so the attribute converts a compile error
-//! saying "teach me the new case" into a silent wrong answer. A major version
-//! bump is the cheaper of those two.
+//! `#[non_exhaustive]` goes on a type the engine *produces* and a caller only
+//! *reads*, or *builds through a constructor*; **not** on a type a caller must
+//! *dispatch on*, where the forced `_ =>` arm turns a compile error into a silent
+//! wrong answer.
 //!
 //! Carrying it: every error enum a caller sees, [`plan::Query`],
 //! [`layout::Layout`], [`plan::Sample`], [`plan::ErrBound`] (with
@@ -80,15 +41,11 @@
 //! each with the argument at the type: [`plan::InterpPolicy`], [`plan::Step`],
 //! [`edge::EdgeKind`], [`topology::TopoLockError`].
 //!
-//! **The `#[repr(C)]` arena records are deliberately not `#[non_exhaustive]`** —
-//! [`edge::EdgeRecord`], [`edge::ClaimRecord`], [`frame::FrameRecord`],
-//! [`participant::ParticipantRecord`], [`buffer::PoseSlot`],
-//! [`counters::EdgeCounters`], [`counters::ParticipantCounters`]. A field
-//! appended to one of those is not a source-compatibility event, it is a
-//! `FORMAT_VERSION` / `layout_hash` event, and that is already checked on every
-//! attach by a mechanism stronger than the type system. Marking them would claim
-//! a growth path the arena does not have while blocking the literal construction
-//! the builders use.
+//! The `#[repr(C)]` arena records ([`edge::EdgeRecord`], [`edge::ClaimRecord`],
+//! [`frame::FrameRecord`], [`participant::ParticipantRecord`],
+//! [`buffer::PoseSlot`], [`counters::EdgeCounters`],
+//! [`counters::ParticipantCounters`]) are deliberately not: a new field is a
+//! `FORMAT_VERSION` / `layout_hash` event, checked on every attach.
 //!
 //! # Load-bearing invariants
 //!
@@ -111,29 +68,18 @@
 //!
 //! # Concurrency abstraction (`loom`)
 //!
-//! All atomics are imported from `crate::sync`, which is `core::sync::atomic`
-//! normally and `loom::sync::atomic` under `--cfg loom`. The publish/read/claim/
-//! intern algorithms compile unchanged in both modes; the arena-byte views are
-//! `#[cfg(not(loom))]` (loom atomics cannot live in mapped bytes), and the loom
-//! tests drive the shared algorithms over heap-allocated instances.
+//! Atomics come from `crate::sync`: `core::sync::atomic`, or `loom::sync::atomic`
+//! under `--cfg loom`. The publish/read/claim/intern algorithms compile in both;
+//! the arena-byte views are `#[cfg(not(loom))]` and loom tests use heap instances.
 
 extern crate alloc;
 
-// proptest and loom require `std`; so does `crash`'s environment-variable read
-// (`docs/PHASE2.md` §11.3). The crate itself stays `no_std + alloc`: this is an
-// `extern crate` under a `cfg`, not a `std` *feature* — a feature unifies across
-// the graph, so one crate turning it on would make everybody's `tf_tree_core`
-// link `std`, and `#![no_std]` above would be decided by somebody else's
-// dependency.
+// proptest, loom and `crash`'s env read (`docs/PHASE2.md` §11.3) need `std`, via
+// `extern crate` under a `cfg`, not a feature (features unify across the graph).
 #[cfg(any(test, feature = "crash-points"))]
 extern crate std;
 
-// **The crates.io front page, wired to the doctest harness.** `README.md` has
-// no `rust` fence today — it is a page about *not* depending on this crate
-// unless you are `no_std` — but nothing parses a README, so an example added
-// there later would be the one piece of published documentation no recipe
-// compiles. This makes the first one a doctest. `cfg(doctest)` keeps it out of
-// `cargo doc`, which renders the module docs above.
+// Compiles any `rust` fence in `README.md` as a doctest.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}
@@ -151,26 +97,16 @@ pub mod sample;
 
 pub(crate) mod sync;
 
-// The arena-byte views and the `AtomicU16`-backed topology block cannot be
-// modeled by loom (loom atomics are not `repr(C)` and loom does not provide the
-// narrow-width atomics the topology depth array uses). They compile only in the
-// production configuration; the loom tests reimplement the protocols they need.
+// Not loom-modelable (loom atomics are not `repr(C)`; no narrow-width atomics).
 #[cfg(not(loom))]
 pub mod arena_view;
-// Builds on `crate::sync` and nothing arena-shaped, so unlike its neighbours it
-// *is* model-checkable: `loom_tests` drives the real `register`/`release` to
-// check the slot-handover race, which no single-threaded test can reach.
+// Model-checkable: `loom_tests` drives the real `register`/`release`.
 pub mod participant;
-// Plan compilation, typed time, and evaluation. Depends on `arena_view`/
-// `topology` (production-only), so it is `not(loom)`; the loom suite exercises
-// the concurrency core beneath it, not the plan layer.
+// Depends on `arena_view`/`topology`, so `not(loom)`.
 #[cfg(not(loom))]
 pub mod plan;
-// **Default-off, and no shipped configuration turns it on.** `docs/API.md` §2.3
-// item 3's gated row compares the facade path called from a separate crate
-// against the in-crate path, and the in-crate half has to be compiled here —
-// see the module's own docs for the measurement that rules out putting it in
-// the facade instead. Same pattern as `tf_tree_c`'s `test-hooks`.
+// Default-off; `docs/API.md` §2.3 item 3's gated row needs the in-crate path
+// compiled here (see the module docs). Like `tf_tree_c`'s `test-hooks`.
 #[cfg(all(feature = "bench-probe", not(loom)))]
 pub mod bench_probe;
 #[cfg(not(loom))]
@@ -190,53 +126,22 @@ pub use sample::ExtrapPolicy;
 /// Maximum length of a **compiled** plan: the number of [`plan::Step`] slots a
 /// [`plan::Plan`] carries, counted *after* constant folding.
 ///
-/// A slot here costs **64 bytes** — `size_of::<Step>()`, measured: `Iso3`'s 56
-/// plus the discriminant, rounded to `Iso3`'s 8-byte alignment. It was **128**
-/// until [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md),
-/// when `Iso3` was a padded 64-byte cacheline and the discriminant forced a
-/// second one — and every `Plan`
-/// carries `MAX_DEPTH` of them by value whatever its real length, in the facade's
-/// 16-slot thread-local plan cache and behind every Python `Plan`. That is the
-/// slot this constant prices, and it is why it is not the walk's bound: see
-/// [`MAX_PATH_EDGES`].
-///
-/// Raised 16 → 32 by
-/// [`0034`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md).
-/// The survey behind 32 is `docs/PHASE1.md` §7.1, *Two bounds, and they price
-/// different slots*. And the cost 16 was defended on,
-/// "everyone pays, on the hot path", did not survive being taken: the criterion
-/// `lookup`, `query_mix` and `at_many` rows are flat within ±0.5% at 32, and no
-/// evaluate row measured since moves more than ±2% in either direction. What is
-/// not flat is `compile`'s cache-miss path, which is why `0034` deletes the
-/// second `[Step; MAX_DEPTH]` array in the same change — measured, that pays
-/// back 14% of a 114% regression rather than all of it.
+/// A slot is 64 bytes (`size_of::<Step>()`, `0042`); every `Plan` carries
+/// `MAX_DEPTH` of them by value, which is why it is not the walk's bound
+/// ([`MAX_PATH_EDGES`]). Set to 32 by
+/// [`0034`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md);
+/// survey in `docs/PHASE1.md` §7.1, *Two bounds, and they price different slots*.
 pub const MAX_DEPTH: usize = 32;
 
 /// Maximum number of **raw** path edges [`plan::compile`] will walk, counted
 /// across both sides of the lowest common ancestor before folding.
 ///
-/// A slot here is a `u32` edge id in `compile`'s stack frame: **4 bytes**, paid
-/// once, on a call D3 already places off the hot path. Why one number cannot
-/// price both slots: `docs/PHASE1.md` §7.1, *Two bounds, and they price
-/// different slots*.
+/// A slot is a `u32` edge id in `compile`'s stack frame (`docs/PHASE1.md` §7.1).
 ///
-/// Exceeding it is [`LookupError::TreeTooDeep`]; so is a path that *fits* the
-/// walk but still folds to more than [`MAX_DEPTH`] steps. The two are told apart
-/// by the reported `depth` — see that variant's own documentation.
-///
-/// 64 is ~1.9× the floor the survey sets: a 30-joint diameter plus a deployed
-/// `/tf` prefix (`map → odom → base_footprint`) is ~33. It is deliberately not
-/// 256: this constant sets the worst *accepted* compile latency — **0.9-1.1 µs**
-/// here for 64 static edges folding to one step, against 3.97 µs for the same
-/// shape at 256 — and a refused pair is not cached
-/// (`tf_tree`'s `cache`), so it recompiles on every lookup with nothing
-/// amortising it.
-///
-/// The range on that number is not hedging: two independently written harnesses
-/// on this host measured the same shape at 904 ns and at 1092 ns, 21% apart, and
-/// neither is wrong about what it timed. Quoting one to three digits would claim
-/// a precision the pair does not support. What both agree on, and what chooses
-/// the constant, is the ~4x between 64 and 256.
+/// Exceeding it, or folding to more than [`MAX_DEPTH`] steps, is
+/// [`LookupError::TreeTooDeep`]; `depth` tells them apart. 64 is ~1.9x the
+/// surveyed floor and not 256, which would set the worst accepted compile latency
+/// ~4x higher (refused pairs are not cached).
 pub const MAX_PATH_EDGES: usize = 64;
 
 #[cfg(all(test, loom))]
@@ -245,9 +150,6 @@ mod loom_tests;
 #[cfg(all(test, not(loom)))]
 mod tests;
 
-// `docs/PHASE2.md` §11.3's crash points: the child-process abort tests are
-// `#[cfg(feature = "crash-points")]`, the recovery assertions beside them are
-// not — the state a crash leaves is repairable by code that ships in every
-// build, so `cargo test -p tf_tree_core` must exercise the repair.
+// §11.3: abort tests need `crash-points`; recovery assertions run in every build.
 #[cfg(all(test, not(loom)))]
 mod crash_tests;

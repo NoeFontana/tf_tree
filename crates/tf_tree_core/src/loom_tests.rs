@@ -1,14 +1,11 @@
 //! `loom` model-checked concurrency tests (run under `--cfg loom`).
 //!
-//! These are the hard gate for step 5 of `docs/PHASE1.md`'s implementation
-//! order, and for its §10.2 *Concurrency (loom)*: the publish/read/claim/
-//! intern protocols must be sound under every interleaving loom explores, not
-//! merely on x86. Buffers are capacity 4 and push counts <= 5 to keep the state
-//! space tractable — small, but never so small that the code under test becomes
-//! unreachable, which is a failure mode these models have already had once (see
-//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the
-//! *shared* algorithm code (the same functions the production arena view calls)
-//! over heap-allocated instances built from `crate::sync` (loom) atomics.
+//! The hard gate for `docs/PHASE1.md`'s implementation step 5 and §10.2: the
+//! publish/read/claim/intern protocols must be sound under every interleaving
+//! loom explores. Buffers are capacity 4 with push counts <= 5 to bound the state
+//! space, but never so small that the code under test becomes unreachable (see
+//! [`writer_wraps_reader_gets_valid_or_recycled`]). Each test drives the *shared*
+//! algorithm code over heap instances built from `crate::sync` atomics.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use loom::sync::Arc;
@@ -64,40 +61,14 @@ impl HeapRing {
     }
 }
 
-/// Run a `loom` model under a preemption bound that the environment can raise
-/// but **cannot lower**.
+/// Run a `loom` model under a preemption bound the environment can raise but
+/// **cannot lower**.
 ///
-/// # Why this is not `loom::model` directly
-///
-/// `loom::model` reads `LOOM_MAX_PREEMPTIONS` and uses `None` — unbounded — when
-/// it is unset. Unbounded sounds strictly stronger and is not. Measured on
-/// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` with its liveness
-/// predicate deliberately broken, so a real violation is present to find:
-///
-/// | `LOOM_MAX_PREEMPTIONS` | result | wall clock |
-/// |---|---|---|
-/// | unset (loom's `None`) | **ok — the violation is missed** | 8143 ms |
-/// | 0, 1, 2 | ok — missed | fast |
-/// | 3 | **FAILED, correctly** | 373 ms |
-///
-/// So the unbounded search runs **22x longer and still finds nothing**, which is
-/// preemption-bounded search behaving as designed: it enumerates every schedule
-/// with at most *k* preemptions before going deeper, and almost every real
-/// concurrency bug needs few. An unbounded depth-first walk can descend one
-/// branch of an enormous space and never come back to the shallow interleaving
-/// that exhibits the fault.
-///
-/// **The consequence is that the bound was load-bearing and lived outside the
-/// code.** `xtask loom` sets 3; a developer running
-/// `RUSTFLAGS='--cfg loom' cargo test -p tf_tree_core` by hand — which is what
-/// debugging one model looks like — got a materially weaker check *and* a much
-/// slower one, with nothing to say so. A test whose power depends on an
-/// environment variable set by one caller is the shape
-/// `docs/benchmarks/EVIDENCE.md` exists to catch, one layer down.
-///
-/// The floor is a floor, not a value: `LOOM_MAX_PREEMPTIONS=5` still explores
-/// more, because a deliberate deeper run is a thing somebody should be able to
-/// ask for.
+/// `loom::model` is unbounded when `LOOM_MAX_PREEMPTIONS` is unset, which is
+/// weaker, not stronger: on `two_mutators_race_the_lock_and_a_reader_sees_no_mix`
+/// with its liveness predicate broken, unbounded search missed the violation in
+/// 8143 ms, bounds 0-2 missed it, and bound 3 found it in 373 ms. `xtask loom`
+/// sets 3; this floor keeps a hand-run `cargo test` from being a weaker check.
 fn model(f: impl Fn() + Sync + Send + 'static) {
     /// Enough to reach the topology lock's steal path, which needs the spin
     /// budget (`MODEL_SPIN_LIMIT`) exhausted while another thread holds the
@@ -152,27 +123,15 @@ fn writer_three_pushes_reader_never_torn() {
 
 /// Loom test 2 (`docs/PHASE1.md` §10.2, bullet 2): the writer **laps** the ring
 /// while a reader samples. The reader returns the one interpolation the
-/// published history permits, or a documented error — never a pose assembled
-/// from two eras.
+/// published history permits, or a documented error — never a pose from two eras.
 ///
-/// # Why capacity 4 and five pushes, and not capacity 2 and three
+/// Capacity 4 and five pushes: [`SampleRing::retained`] is `capacity - 1`, so
+/// capacity 2 leaves a one-sample window that can only answer `NoData` or
+/// `Extrapolation`, making the bracket search, interpolation and trailing
+/// revalidation unreachable (a planted `panic!` in the `Ok` arm never fired).
 ///
-/// [`SampleRing::retained`] is `capacity - 1`, so a capacity-2 ring has a
-/// readable window of exactly *one* sample. `sample()` then finds `t_old ==
-/// t_new` and can only ever answer `NoData` or `Extrapolation`: the bracket
-/// search, the interpolation and the trailing `head - i > retained`
-/// revalidation — the entire subject of this test — are unreachable. That was
-/// this test's shape until it was measured: a `panic!` planted in the `Ok` arm
-/// never fired, across every interleaving loom explores. Five pushes into four
-/// slots is the smallest configuration in which the ring genuinely laps a
-/// reader *and* the reader has something to interpolate.
-///
-/// The assertion is bit equality against the single legal answer, not
-/// finiteness. Finiteness was the old check and it proves nothing here: a pose
-/// interpolated between two samples from different eras is perfectly finite.
-/// Whether the writer has landed three, four or five pushes when the reader
-/// looks, the only bracket containing `t = 25` is `(20, 30)` at `s = 0.5`, so
-/// any other value the reader could return is a splice.
+/// The assertion is bit equality, not finiteness: a splice across eras is still
+/// finite. The only bracket containing `t = 25` is `(20, 30)` at `s = 0.5`.
 #[test]
 fn writer_wraps_reader_gets_valid_or_recycled() {
     model(|| {
@@ -213,61 +172,31 @@ fn writer_wraps_reader_gets_valid_or_recycled() {
 
 /// The same lap, through [`SampleRing::sample_from`] and a **caller-held cursor
 /// that points at the slot the lap destroys** — the shape `Plan::at` and every
-/// monotone batch actually use.
+/// monotone batch use.
 ///
-/// # Why the model above does not cover it
+/// [`writer_wraps_reader_gets_valid_or_recycled`] drives [`SampleRing::sample`],
+/// which production reaches from `Plan::latest` alone. Everything else goes
+/// through `sample_from`, whose read carries its own trailing
+/// `head - i > retained` revalidation (in [`SampleRing::read_from`] since
+/// `docs/decisions/0060` step 2); deleting it passed `writer_wraps_...`.
 ///
-/// [`writer_wraps_reader_gets_valid_or_recycled`] calls [`SampleRing::sample`],
-/// which production reaches from `Plan::latest` alone. `Plan::at` samples
-/// through `Guard::sample_hinted` -> `sample_from`, and so do
-/// `at_extrapolating`, `latest_common`, the adaptive path and both batch loops.
-/// `sample_from`'s read carries **its own copy** of the trailing
-/// `head - i > retained` revalidation, separate from `sample`'s, and no loom
-/// model executed that copy: deleting it passes `writer_wraps_...` (run, 20.9 s
-/// green). Since `docs/decisions/0060` step 2 that copy lives in
-/// [`SampleRing::read_from`], which `sample_from` is one `Interp::eval` away
-/// from; the mutant below was re-run against it there.
+/// Capacity 4; `10, 20, 30` are published before the threads start and the writer
+/// lands `40, 50`, the fifth overwriting logical 0 (stamp 10). The only bracket
+/// for `t = 25` is `(20, 30)` at `s = 0.5`, so that is the only legal `Ok`. The
+/// cursor is seeded **`0`**, where a batch starts and the recycled index: once the
+/// lap lands, `bracket_from` gallops down to a next-era slot that only the
+/// trailing check refuses.
 ///
-/// # Shape
-///
-/// Capacity 4. `10, 20, 30` are published **before** the threads start and the
-/// writer lands `40, 50` concurrently; the fifth push overwrites physical slot
-/// 0, logical 0, stamp 10. Publishing the first three up front costs nothing
-/// the model is about — the only bracket for `t = 25` is `(20, 30)`, answerable
-/// at `head` 3 or 4, which a reader only meets once three samples exist either
-/// way — and it takes the model from a writer of five pushes to one of two.
-///
-/// The reader's cursor is seeded **`0`**, the index a batch starts from and the
-/// one the fifth push recycles. The only legal `Ok` is `(20, 30)` at `s = 0.5`,
-/// bit for bit. A hint at 0 makes `bracket_from` load `stamp[0]` first; once the
-/// lap has landed that slot holds stamp 50, the gallop turns downward and the
-/// search settles on logical 0 — a slot from the next era — which only the
-/// trailing check can refuse.
-///
-/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`, which the
-/// environment cannot lower): delete the trailing
-/// `if self.head.load(Ordering::Acquire) - i > retained { return
+/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): delete that
+/// trailing `if self.head.load(Ordering::Acquire) - i > retained { return
 /// Err(LookupError::SlotRecycled { .. }); }` from `read_from` (`sample.rs`).
-/// **FAILS** on the assertion below, found in the first milliseconds of the
-/// search.
-/// `writer_wraps_...` passes under the same deletion.
+/// **FAILS**; `writer_wraps_...` passes under it.
 ///
-/// **The seed is the test.** Under that same deletion, seeding the cursor at `1`
-/// or `2` instead **passes** (in 0.01 s): a hint inside the surviving window
-/// gallops straight to `(1, 2)` and never reads the recycled slot as a bracket
-/// member. So this model checks the
-/// revalidation *against a stale caller-held cursor*, not in general; the
-/// interior-bracket race without a stale hint is `sample_from`'s share of
-/// `sample.rs`'s hazard 1, which nothing here claims to close.
+/// **The seed is the test:** seeded at `1` or `2` the deletion passes, since the
+/// hint gallops to `(1, 2)` inside the surviving window. Dropping the `.clamp(..)`
+/// in `bracket_from` also passes; the cursor sweeps in `tests.rs` kill that mutant.
 ///
-/// **What it does not control, run and recorded so nobody tries it as the
-/// control:** dropping the `.clamp(lo_logical, newest)` in `bracket_from`
-/// **passes** this model (12.2 s). `rebase_hint` and the clamp are arithmetic on
-/// values the reader already holds, loom adds nothing to arithmetic, and the
-/// sequential cursor sweeps in `tests.rs` are what kill that mutant.
-///
-/// Not reached here: `sample_from`'s `Hold` and exact-newest short-circuit
-/// arms, which read the *newest* slot. Those are
+/// The `Hold` and exact-newest arms are
 /// [`sample_from_hold_revalidates_across_a_lap`] and
 /// [`sample_from_exact_newest_revalidates_across_a_lap`].
 #[test]
@@ -316,41 +245,21 @@ fn sample_from_with_a_stale_cursor_across_a_lap() {
 
 /// `sample_from`'s **`Hold` arm** revalidates the newest slot against a lap.
 ///
-/// # Why it needs its own model
+/// The `Hold` and exact-newest arms skip the bracket search and read the newest
+/// slot; removing either `revalidated` call passed the whole suite and
+/// [`sample_from_with_a_stale_cursor_across_a_lap`], which takes neither.
 ///
-/// The `Hold` arm and the exact-newest arm (the next model) never reach the
-/// bracket search: they read **the newest slot** and return it. Both belong to
-/// the six-site fix `CHANGELOG.md` records under *"An exact query returns the
-/// pose of the stamp it named, or refuses"*, and `sample_from`'s two sites had
-/// no executor. **Measured, not reported:** removing either site's `revalidated`
-/// call (the two mutants below) passes `cargo nextest run -p tf_tree_core -p
-/// tf_tree` — 195 run, 195 passed — and passes
-/// [`sample_from_with_a_stale_cursor_across_a_lap`], which never takes either
-/// arm.
+/// The newest slot is overwritten only after `capacity` pushes, so this is
+/// **capacity 2**; a one-sample window is fine for an arm that never
+/// interpolates. `10` is published first; the writer lands `20` and `30`
+/// (overwriting `10`). The reader calls `sample_from(15, Hold)` once; only at
+/// `head == 1` is `15` past the newest stamp, so the only legal `Ok` is `pose(1)`.
+/// One arm per model keeps each at ~30 s.
 ///
-/// # Shape
-///
-/// The newest slot of a ring is overwritten only after `capacity` further
-/// pushes, so this is **capacity 2**, the one size a lap reaches it in two
-/// pushes. [`writer_wraps_reader_gets_valid_or_recycled`]'s objection to
-/// capacity 2 — a one-sample window cannot interpolate — does not apply to an
-/// arm that never interpolates. `10` is published before the threads start; the
-/// writer lands `20` (slot 1) and `30` (slot 0, overwriting `10`).
-///
-/// The reader holds a cursor and calls `sample_from(15, Hold)` once. Only at
-/// `head == 1` is `15` past the newest stamp; at 2 or 3 the window's oldest
-/// stamp is above 15 and the call is `Extrapolation`. So the only legal `Ok` is
-/// `pose(1)`, bit for bit. One call per model, one arm per model: this model
-/// runs 30.2 s alone, and both arms behind one reader measured 234.6 s.
-///
-/// **Mutant M279, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): remove
-/// `.and_then(|p| self.revalidated(newest, retained, p))` from the `Hold` arm
-/// of `read_from`, which is where `sample_from`'s arm has lived since
-/// `docs/decisions/0060` step 2 (`sample.rs`). **FAILS** on the assertion
-/// below, in 0.00 s — the
-/// reader loads `head == 1` and stamp 10, both pushes land, and slot 0 holds
-/// `pose(3)`. Under it the exact-newest model and the stale-cursor model both
-/// pass, so each model's control is its own arm.
+/// **Mutant M279, run** at [`model`]'s floor: remove
+/// `.and_then(|p| self.revalidated(newest, retained, p))` from `read_from`'s
+/// `Hold` arm (`sample.rs`). **FAILS**; the exact-newest and stale-cursor models
+/// pass under it, so each model's control is its own arm.
 #[test]
 fn sample_from_hold_revalidates_across_a_lap() {
     model(|| {
@@ -392,20 +301,14 @@ fn sample_from_hold_revalidates_across_a_lap() {
 /// `sample_from`'s **exact-newest arm** (`t == t_new`) revalidates the newest
 /// slot against a lap.
 ///
-/// Same ring, same writer and the same reasoning as
-/// [`sample_from_hold_revalidates_across_a_lap`]; the reader calls
-/// `sample_from(10, Error)` once. Only at `head == 1` is `10` the newest stamp;
-/// at 2 the call brackets `(10, 20)` and returns through the trailing check,
-/// which the stale-cursor model covers, and at 3 the window starts at 20 and the
-/// call is `Extrapolation`. The only legal `Ok` is `pose(1)`, bit for bit.
+/// Same ring and writer as [`sample_from_hold_revalidates_across_a_lap`]; the
+/// reader calls `sample_from(10, Error)`. Only at `head == 1` is `10` the newest
+/// stamp, so the only legal `Ok` is `pose(1)`.
 ///
-/// **Mutant M288, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): replace
-/// the `t == t_new` arm's `return self.revalidated(newest, retained, p)
-/// .map(Bracket::Exact);` with `return Ok(Bracket::Exact(p));` (`sample.rs`,
-/// inside `read_from` only — the arm `sample_from` reaches, and not `sample`'s
-/// copy of it). **FAILS** on the
-/// assertion below, in 0.00 s; the `Hold` model (30.2 s) and the stale-cursor
-/// model pass under it. This model runs 30.5 s alone.
+/// **Mutant M288, run** at [`model`]'s floor: replace the `t == t_new` arm's
+/// `return self.revalidated(newest, retained, p).map(Bracket::Exact);` with
+/// `return Ok(Bracket::Exact(p));` in `read_from` (`sample.rs`). **FAILS**; the
+/// `Hold` and stale-cursor models pass under it.
 #[test]
 fn sample_from_exact_newest_revalidates_across_a_lap() {
     model(|| {
@@ -444,40 +347,20 @@ fn sample_from_exact_newest_revalidates_across_a_lap() {
     });
 }
 
-/// [`SampleRing::read_from`] validates the bracket **before it hands it back**,
-/// so a caller that interpolates later still interpolates validated endpoints.
+/// [`SampleRing::read_from`] validates the bracket **before it hands it back**.
 ///
-/// # Why it needs its own model, given the three above
+/// `sample_from` is `read_from` plus one `Interp::eval` (`docs/decisions/0060`
+/// step 2), so the three models above drive that body with the evaluation the next
+/// instruction. `Plan::fold_batch` carries the [`Bracket`] across up to fifteen
+/// further reads first, so the *endpoints* must have been judged, not the pose:
+/// an `Ok(Bracket::Between { .. })` must carry `(20, 30)` bit for bit.
 ///
-/// Since `docs/decisions/0060` step 2 there is one read body: `sample_from` is
-/// `read_from` plus one `Interp::eval`, and `Plan::fold_batch` is `read_from`
-/// for a whole chunk and then one `Interp::eval` per lane. The three models
-/// above drive that body — but all three drive it through `sample_from`, where
-/// the evaluation is the next instruction. **The batch fold's shape is the one
-/// where it is not**: the returned [`Bracket`] is carried across up to fifteen
-/// further reads before anything is done with it, so what has to hold is that
-/// the *endpoints* were judged, not that the pose was.
+/// Ring, writer, cursor seed and query are those of
+/// [`sample_from_with_a_stale_cursor_across_a_lap`].
 ///
-/// That is what this asserts, on the endpoints themselves rather than on a
-/// pose folded from them: an `Ok(Bracket::Between { .. })` must carry `(20, 30)`
-/// bit for bit, whatever the writer did while it was being read.
-///
-/// # Shape
-///
-/// [`sample_from_with_a_stale_cursor_across_a_lap`]'s ring, writer, cursor seed
-/// and query, for that model's reasons — capacity 4, `10, 20, 30` published
-/// before the threads start, the writer landing `40` and `50`, the reader's
-/// cursor seeded at `0` because that is where a batch starts and it is the
-/// index the fifth push recycles.
-///
-/// **Mutant, run** at [`model`]'s floor (`LOOM_MAX_PREEMPTIONS=3`): delete
-/// `read_from`'s trailing `if self.head.load(Ordering::Acquire) - i > retained
-/// { return Err(LookupError::SlotRecycled { .. }); }` (`sample.rs`). **FAILS**
-/// on the assertion below. It is the same deletion that fails
-/// [`sample_from_with_a_stale_cursor_across_a_lap`], and necessarily so — there
-/// is one check now, and a control that killed only one of two models would
-/// mean there were still two. What this model adds is not a second check to
-/// break, it is the deferred-evaluation caller.
+/// **Mutant, run** at [`model`]'s floor: the same deletion of `read_from`'s
+/// trailing `head - i > retained` check fails this model and that one, necessarily
+/// (there is one check). This adds the deferred-evaluation caller.
 #[test]
 fn read_from_validates_the_bracket_it_hands_back() {
     model(|| {
@@ -530,46 +413,21 @@ fn read_from_validates_the_bracket_it_hands_back() {
 }
 
 /// Loom test 3 (`docs/PHASE1.md` §10.2's *mutation test*): the invariant
-/// `head`'s `Release` store carries — that observing `head == h` makes the
-/// stamps of all `h` published samples visible.
+/// `head`'s `Release` store carries — observing `head == h` makes the stamps of
+/// all `h` published samples visible.
 ///
-/// # Why this model exists
+/// Weakening [`SampleRing::push`]'s `head.store(h + 1, Release)` survived the
+/// models above, and no `sample`-shaped fixture can catch it: `push`'s
+/// `fence(Release)` precedes its own stamp store, so a reader seeing `head == h`
+/// is guaranteed stamps `0 ..= h-2` but not the newest, `sample`'s `t_new`. A
+/// stale `t_new` is always below the fresh one, so every `t` above it exits
+/// through the tolerated `Extrapolation` arm; reaching a bit-equality assertion
+/// needs `t < 0`, which would pin the zero sentinel and not the ordering.
 ///
-/// §10.2 asks that weakening each §6.2/§6.3 ordering to `Relaxed`, one at a
-/// time, break a model, and that a **survivor be investigated rather than
-/// assumed benign**. Run over the five orderings, four die against the two
-/// models above. The fifth — [`SampleRing::push`]'s
-/// `self.head.store(h + 1, Release)` — survived the entire suite, because
-/// neither model above ever reads a *stamp*: `writer_three_pushes_...` calls
-/// `read_slot` directly, and `writer_wraps_...` does call `sample`, but cannot
-/// observe the difference, for the reason below.
+/// So the reader is transcribed as [`SampleRing::sample`] does it — `head`
+/// `Acquire`, stamps `Relaxed` — and the writer is the real `push`.
 ///
-/// ## Why no `sample`-shaped fixture can catch it
-///
-/// In `push`, the `fence(Release)` sits *before* that push's stamp store. So a
-/// reader that observes `head == h` synchronises with push `h`'s release fence
-/// and is guaranteed stamps `0 ..= h-2` — every stamp except the newest.
-/// `stamps[h-1]` is the single unprotected one, and `sample` reads it as
-/// `t_new`. An unpublished stamp reads as the arena's zero-initialised `0`, and
-/// a lapped one reads as its previous era's value; stamps only increase, so a
-/// stale `t_new` is always *below* the fresh one. Every `t` above it therefore
-/// leaves through the tolerated `Extrapolation` arm instead of reaching a
-/// bit-equality assertion. Reaching it needs `t < 0` so the zero sentinel sits
-/// above `t` — a fixture that exists only to dodge the sentinel, and would pin
-/// the sentinel rather than the ordering.
-///
-/// So this model asserts the invariant directly, in the shape the reader
-/// actually uses it: [`SampleRing::sample`] loads `head` `Acquire`
-/// (`sample.rs`) and then loads stamps `Relaxed`, and `stamp_at`'s own doc
-/// rests that `Relaxed` on this edge — *"the `head` Acquire load in `sample`
-/// already ordered every stamp of a published sample into view"*. That sentence
-/// is the property below. The writer is the real [`SampleRing::push`]; only the
-/// reader is transcribed, which is the same division the reclaim model uses.
-///
-/// **Mutation-verified**: with `head.store(h + 1, Relaxed)` this fails on the
-/// assertion below; at `Release` it passes. That is what makes `buffer.rs`'s
-/// "every ordering below is load-bearing and is exercised by the loom tests"
-/// true of all five orderings rather than four.
+/// **Mutation-verified**: with `Relaxed` this fails; at `Release` it passes.
 #[test]
 fn head_publishes_every_stamp_below_it() {
     model(|| {
@@ -578,9 +436,7 @@ fn head_publishes_every_stamp_below_it() {
         let w = Arc::clone(&hr);
         let writer = thread::spawn(move || {
             let ring = w.ring();
-            // Four pushes into four slots: nothing laps, so every stamp
-            // location is written exactly once and a stale read can only be the
-            // zero-initialised value. That keeps the assertion unambiguous.
+            // No lap: every stamp is written once, so a stale read is the zero value.
             for i in 1..=4u64 {
                 ring.push(i as i64 * 10, &pose(i)).unwrap();
             }
@@ -605,12 +461,9 @@ fn head_publishes_every_stamp_below_it() {
 }
 
 /// The interning table's three parallel arrays plus its id allocator, on the heap
-/// and built from loom atomics — the same shape `ArenaView` hands `intern_core`.
-///
-/// Every array is **zero-initialized, exactly like the production arena**
-/// (`alloc_zeroed`). Seeding `ids` with a different "unpublished" sentinel is what
-/// once let this model check pass while the real publish-then-spin handshake was
-/// inert: nothing in the arena ever writes a non-zero unpublished marker.
+/// from loom atomics — the shape `ArenaView` hands `intern_core`. Zero-initialized
+/// like the production arena: a different "unpublished" sentinel once made the
+/// publish-then-spin handshake inert.
 struct HeapInternTable {
     hashes: alloc::vec::Vec<AtomicU64>,
     ids: alloc::vec::Vec<AtomicU32>,
@@ -684,15 +537,10 @@ fn intern_race_same_id() {
 /// Loom test 6 — **amendment A8** (`docs/PHASE2.md` §1 A8, §11.3 crash point
 /// `intern.after_hash_cas_before_id_store`).
 ///
-/// One thread plays the process that wins the hash slot and is `SIGKILL`ed before
-/// publishing the id: it performs exactly the stores a killed interner would have
-/// completed and then vanishes. The other thread must still terminate with the
-/// name interned. Before A8 it spun forever, in every interleaving where the
-/// "dead" thread got there first.
-///
-/// The dying thread's writes are open-coded rather than done through
-/// `intern_core` because there is no way to abandon that function part-way; the
-/// two CASes below are precisely its prefix up to the crash point.
+/// One thread performs exactly the stores a killed interner completed (the two
+/// CASes below, open-coded because `intern_core` cannot be abandoned part-way)
+/// and vanishes. The other must still terminate with the name interned; before A8
+/// it spun forever.
 #[test]
 fn intern_takes_over_from_a_claimant_that_died_before_publishing() {
     /// Participant slot of the doomed interner, as stored in `claiming` (slot + 1).
@@ -782,62 +630,29 @@ fn claim_race_exactly_one_wins() {
 
 /// A model of the topology protocol as amended by `docs/PHASE2.md` §1 — A1's
 /// packed word and A2's in-arena mutation lock — mirroring
-/// `topology::{TopologyView, TopoLockView}` step for step.
+/// `topology::{TopologyView, TopoLockView}` step for step. Keep the two in step;
+/// the real code ships.
 ///
-/// It is a reimplementation rather than a call into the real code because the
-/// lock word and the topology blocks live in a `#[repr(C)]` arena header, and
-/// loom's atomics cannot inhabit one: they carry instrumentation state and are
-/// not constructible from the zeroed bytes an arena hands out. That is the same
-/// constraint `buffer::PoseSlot` meets, and it is why `crate::topology` is
-/// `#[cfg(not(loom))]` in the first place. Everything that matters is preserved
-/// — the same orderings, the same single publishing store, the same bounded spin
-/// and liveness-gated steal. Keep the two in step; the real code is the one that
-/// ships.
+/// It is a reimplementation because the lock word and blocks live in a
+/// `#[repr(C)]` arena header, which loom's instrumented atomics cannot inhabit
+/// (hence `crate::topology` is `#[cfg(not(loom))]`).
 ///
-/// **This paragraph gave a second reason until 2026-08-28 and that reason was
-/// false**: *"its `depth` array is an `AtomicU16`, which loom does not provide"*.
-/// loom 0.7 exports `AtomicU16` beside `AtomicU8`/`U32`/`U64`/`Usize`
-/// (`loom::sync::atomic`), so the width was never the obstacle. Recorded rather
-/// than deleted, because the false reason is the one that makes the twin look
-/// unavoidable — the real one is about `#[repr(C)]`, and anybody trying to
-/// delete this model has to answer *that*.
+/// # The control run
 ///
-/// # The control run, which is what stops this being a theorem about itself
+/// A model that idealises the exclusion it checks proves it by construction.
+/// With `is_alive`'s refusal removed (every holder read as dead),
+/// `two_mutators_race_the_lock_and_a_reader_sees_no_mix` fails with *"two mutators
+/// inside the critical section"* while
+/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes. Its
+/// holder is live and unstealable, so the gate alone keeps the second mutator out;
+/// the other's is a corpse, so the gate alone lets the rescuer in. The control
+/// fires only under [`model`]'s preemption bound.
 ///
-/// A model that idealises the exclusion it is checking proves the safety
-/// property by construction. So the predicate was **disabled and the model
-/// re-run**: with `is_alive`'s refusal removed — every holder read as dead, so
-/// every contended acquire steals — `two_mutators_race_the_lock_and_a_reader_sees_no_mix`
-/// fails with *"two mutators inside the critical section"*, while
-/// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`] still passes,
-/// because it wants the steal.
-///
-/// That is the pair that matters. The first test passes `|_| true`, so its
-/// holder is **live and unstealable**, and the liveness gate is the only thing
-/// keeping the second mutator out; the second test's holder is a corpse, so the
-/// gate is the only thing letting the rescuer in. One of them fails whichever
-/// way the predicate is broken, which is what makes the green run mean
-/// something.
-///
-/// **The control only fires under a preemption bound, and finding that out is
-/// why [`model`] exists** — the floor it pins is what makes this control hold
-/// however the suite is invoked.
-///
-/// `MODEL_BLOCKS` matches production's [`tf_tree_arena::TOPO_BLOCKS`] and that is
-/// **load-bearing, not decoration**. A first draft of this model used two blocks
-/// on the theory that the count is a tuning knob, and loom immediately produced
-/// a reader that observed `(P_OLD, D_A)` — a genuine mix of two generations. The
-/// mechanism is worth writing down, because it is the whole reason A1 says four:
-///
-/// The reader's re-check (`word.load(Relaxed) == w1`) detects a mutation only if
-/// the word *changed*. Cache coherence guarantees the second load sees `w1` or
-/// something newer, but a `Relaxed` load is free to keep returning `w1` after
-/// other threads have moved on. So the re-check is not a proof that nothing
-/// happened — it is a proof that nothing has become *visible here* yet. What
-/// actually protects the reader is that a mutator never writes the block the
-/// reader is walking, and with `N` blocks that needs `N` publications inside one
-/// read. With two blocks and two mutators, `N` is reachable and the reader tore.
-/// With four it is not, which is precisely A1's "four flips" argument.
+/// `MODEL_BLOCKS` matches [`tf_tree_arena::TOPO_BLOCKS`] and that is load-bearing:
+/// with two blocks loom produced a reader observing `(P_OLD, D_A)`. The reader's
+/// `Relaxed` re-check proves only that no change has become *visible here*; what
+/// protects it is that a mutator never writes the block being read, and with `N`
+/// blocks that takes `N` publications inside one read (A1's "four flips").
 struct TopoModel {
     /// A2: `0` = free, else `participant_slot + 1`.
     lock: AtomicU64,
@@ -1005,19 +820,12 @@ fn topology_read_sees_old_or_new_never_mixed() {
 }
 
 /// Loom test 6 (`docs/PHASE2.md` §1, A2): two participants racing the mutation
-/// lock, with a third thread compiling a plan against the topology throughout.
+/// lock, with a reader compiling a plan throughout. Asserted:
 ///
-/// Three properties, all of which fail without A2:
-///
-/// * **Exactly one mutator at a time** — asserted from inside the critical
-///   section by `in_section`, so a broken lock is caught where it happens rather
-///   than inferred from the wreckage.
-/// * **Every published generation is accounted for.** A mutation that succeeded
-///   published exactly once; one that lost the lock published nothing. Two
-///   mutators sharing a scratch block would lose one.
-/// * **The reader sees one generation or the other, never a mix.** The
-///   `(parent, depth)` pair is written as a unit under the lock, so any pairing
-///   the reader observes must be one that some single mutator wrote.
+/// * exactly one mutator at a time (`in_section`, from inside the section);
+/// * every published generation is accounted for: a winner publishes once, a
+///   loser not at all;
+/// * the reader sees one generation or the other, never a mix.
 #[test]
 fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
     const P_A: u32 = 11;
@@ -1070,28 +878,15 @@ fn two_mutators_race_the_lock_and_a_reader_sees_no_mix() {
 
 /// Loom test 7 — the `topo.holding_lock` crash point (`docs/PHASE2.md` §11.3).
 ///
-/// One participant takes the lock, scribbles on the inactive block the way a
-/// half-finished copy would, and dies without releasing or publishing. A second
-/// participant must steal the lock and complete, and the result must carry **no
-/// trace** of the first — which is A2's claim that recovery is a no-op, because
-/// A1 left the dead holder nothing observable to undo.
+/// One participant takes the lock, scribbles on the inactive block, and dies
+/// without releasing or publishing. A second must steal the lock and complete
+/// with **no trace** of the first (A2: recovery is a no-op), and a concurrent
+/// reader must never see the scribble.
 ///
-/// A reader runs throughout, and must never see the scribble: it was written to
-/// a block the topology word never pointed at.
-///
-/// # Why the death is not a thread
-///
-/// The first draft ran the dying participant as a loom thread, and loom
-/// immediately scheduled its scribble *after* the rescuer had published —
-/// leaving `0xDEAD` in the block that was by then active. That is a real hazard,
-/// but it is **not this one**: it is the false-negative case, where liveness
-/// wrongly declares a live-but-stalled participant dead and it later resumes.
-/// `docs/PHASE2.md` §6.2 addresses that by making the predicate fail safe, and
-/// §6.1 removes it entirely once claims are kernel locks.
-///
-/// A participant that actually died executes no further instruction, ever. So
-/// the death is modelled inline, before the rescuer exists: every store the
-/// corpse will ever make has already happened.
+/// The death is modelled inline, before the rescuer exists: a thread scheduled
+/// its scribble after the rescuer published, which is the false-negative hazard
+/// (a live-but-stalled participant declared dead; `docs/PHASE2.md` §6.1, §6.2),
+/// not this one.
 #[test]
 fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
     const P_GARBAGE: u32 = 0xDEAD;
@@ -1147,21 +942,11 @@ fn a_dead_lock_holder_is_stolen_from_and_leaves_no_trace() {
 
 /// A late `release` racing a reap + re-`register` must not free the new occupant.
 ///
-/// The single-threaded version of this (`tests.rs`) cannot fail on the code this
-/// guards against, and saying so matters: the old guard *did* reject a stale
-/// incarnation — but as a load of `incarnation` followed by a CAS on `state`,
-/// two words apart. The bug lives entirely in the window between them, so only
-/// an interleaving exhibits it. Here, thread A is the departing participant's
-/// late `release(slot, 1)`; thread B reaps the same slot and hands it to a new
-/// process. Loom explores the schedule where A reads "still incarnation 1",
-/// B completes the whole handover, and A's CAS then lands on the new occupant.
-///
-/// Packing the incarnation into `state` makes that schedule harmless: there is
-/// one word, so "still LIVE and still mine" is decided by the CAS itself.
-///
-/// The consequence of getting it wrong is not a lost slot — it is two live
-/// processes sharing a slot index, after which the `slot + 1` owner encoding
-/// used by claims (A3) and by the topology lock (A2) no longer names one process.
+/// Thread A is the departing participant's late `release(slot, 1)`; B reaps the
+/// slot and hands it to a new process. A load-then-CAS guard fails only in the
+/// window between its two words; the incarnation packed into `state` makes it one
+/// CAS. The failure is two live processes sharing a slot index, breaking the
+/// `slot + 1` owner encoding (A2, A3).
 #[test]
 fn a_late_release_racing_a_slot_handover_frees_nobody() {
     const P_LATE: u32 = 111;
@@ -1201,30 +986,19 @@ fn a_late_release_racing_a_slot_handover_frees_nobody() {
     });
 }
 
-/// Two joiners told to take the *same* slot: exactly one may get it.
+/// Two joiners told to take the *same* slot: exactly one may get it
+/// (`docs/PHASE2.md` §3.7, `docs/decisions/0005`).
 ///
-/// `docs/PHASE2.md` §3.7 has the owner hand each client a `participant_slot`,
-/// and `docs/decisions/0005` makes that integer double as the lock-file byte.
-/// Two clients can be handed the same slot — by an owner bug, by a takeover
-/// mid-handshake, or by a stale `HelloResponse` replayed after a reap — and the
-/// arena must be the thing that says no.
-///
-/// This has to be a loom test rather than a sequential one. The window is
-/// between `register_at`'s CAS and its release-store: a sequential test calls
-/// them in order and can never place a second thread inside. Restore the
-/// pre-CAS shape (load `state`, compare to `FREE`, store `RESERVED`) and loom
-/// finds the interleaving where both threads observe `FREE` and both proceed to
-/// publish — two live processes sharing one slot index, which is exactly what
-/// the `slot + 1` owner encoding behind A3 claims cannot happen.
+/// Loom-only: the window is between `register_at`'s CAS and its release-store,
+/// which a sequential test cannot enter. A load-compare-store shape lets both
+/// threads see `FREE` and publish, sharing one slot index.
 #[test]
 fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
     const P_A: u32 = 101;
     const P_B: u32 = 202;
 
     model(|| {
-        // Four slots, so a losing thread has somewhere it *could* have gone —
-        // the assertion is that it does not go there, because `register_at`
-        // takes the named slot or nothing.
+        // Four slots, so a loser could have gone elsewhere; `register_at` takes the named slot or nothing.
         let table = Arc::new(alloc::vec![
             ParticipantRecord::default(),
             ParticipantRecord::default(),
@@ -1247,8 +1021,7 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
 
         let t = ParticipantTable::new(&table);
         let (pid, _, inc) = t.identity(2).expect("the winner published a LIVE record");
-        // The record must belong to the winner *entire* — not a mix of A's pid
-        // and B's incarnation, which is what a torn publication would leave.
+        // The record must belong to the winner entire, not a torn mix.
         let (winner_pid, winner_inc) = if let Ok(i) = ra {
             (P_A, i)
         } else {
@@ -1262,91 +1035,40 @@ fn two_joiners_handed_the_same_slot_cannot_both_take_it() {
     });
 }
 
-/// A reclaimer sweeping the table while a joiner registers: **the caller's**
-/// read order. The state word is observed before the lock byte is probed, and no
-/// record a joiner published is erased.
-///
-/// # What this model pins — and what it does not
-///
-/// Both properties it asserts are properties of the **caller** of
-/// [`ParticipantTable::reclaim`], not of `reclaim`:
+/// A reclaimer sweeping the table while a joiner registers: pins **the caller's**
+/// read order (`docs/decisions/0028` open question 6). The state word is observed
+/// before the lock byte is probed, and no record a joiner published is erased.
 ///
 /// - **Ordering.** An `Acquire` load returning a `live_word` synchronises-with
-///   `fill_slot`'s publishing `Release` store, so the byte its holder took
-///   *before* that store must read held to any probe sequenced after the load.
-///   A sweep that reads the byte first — or takes one up-front holder mask,
-///   which is the shape `LockFile::held_participants()` invites — has no such
-///   edge. This is the assertion with teeth: at `LOOM_MAX_PREEMPTIONS=3` the
-///   sweeper observes slot 1 carrying a published `live_word` in 38 of 294
-///   executions, and in every one of those the byte reads held.
+///   `fill_slot`'s `Release`, so the byte its holder took before that store reads
+///   held to any later probe. A byte-first sweep or an up-front holder mask has no
+///   such edge.
 /// - **No erasure.** A joiner that returned `Ok` is never left with a `FREE`
 ///   record.
 ///
-/// It does **not** pin `reclaim`'s own CAS guard, and this comment claimed
-/// otherwise until a verifier measured it. Measured, at
-/// `LOOM_MAX_PREEMPTIONS=3` (294 executions) and `=5` (781): the sweeper reaches
-/// the CAS on the joiner's slot in **zero** of them — every execution either
-/// observes slot 1 `FREE` or finds its byte held, which is the ordering property
-/// above doing its job. The only CAS that ever fires here is the corpse's, on a
-/// word no other thread writes, so its success in all 294 and all 781 is a fact
-/// about the harness and not about the guard: **a `reclaim` that ignored
-/// `observed` entirely passes this model.** What pins the guard is the unit test
-/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`]; what pins
-/// the *strength* of `reclaim`'s own orderings is nothing in this workspace, a
-/// gap stated with its argument on `reclaim` itself rather than left for the
-/// next reader to rediscover here.
+/// It does **not** pin `reclaim`'s own CAS guard: the sweeper never reaches that
+/// CAS on the joiner's slot, so a `reclaim` ignoring `observed` passes.
+/// [`crate::tests::reclaim_fails_when_the_observed_word_has_changed`] pins the
+/// guard; nothing pins the CAS's strength (stated on `reclaim`). "No two
+/// occupants" is not asserted either: the byte being an exclusive lock entails it
+/// without schedule exploration (0028 steps 0b, 0c).
 ///
-/// The corpse is still staged and its CAS still asserted, because a model that
-/// never enters the code under test would be vacuous in a second and worse way.
-/// That assertion is labelled below for what it is: harness liveness.
+/// # Controls
 ///
-/// "No two occupants" is **not** asserted either. Two independently-built models
-/// were vacuous for it in the same structural way — 0028 open question 6 records
-/// a byte-blind hostile reclaimer passing it over 1 140 088 executions while
-/// erasing 151 590 `LIVE` records — because it is entailed by the byte being an
-/// exclusive lock and needs no schedule exploration at all. What makes
-/// `reclaim`'s widening to `RESERVED` safe is the same non-C11 fact: every
-/// writer holds its byte across the whole of `fill_slot` (0028 step 0b) and the
-/// byte index and the record index are the same integer (step 0c).
+/// Both ship as runnable `#[should_panic]` tests, so a model that stops being
+/// falsifiable fails the suite:
 ///
-/// # The controls, which ship runnable
-///
-/// 0028's plan requires this model to ship with the control that fails, because
-/// a model with no failing control proves nothing — question 6's own finding.
-/// Both controls are `#[test]`s in this file rather than a paragraph, so
-/// `cargo xtask loom` re-runs them and a model that has quietly stopped being
-/// falsifiable fails the suite instead of waiting to be believed:
-///
-/// - [`control_reclaim_races_register_probes_the_byte_first`] — the two reads
-///   swapped. Loom finds the execution where the sweeper reads byte 1 free
-///   before the joiner takes it, observes the `live_word` the joiner has since
-///   published, and CASes a live participant's record to `FREE`.
-/// - [`control_reclaim_races_register_observes_relaxed`] — the right order, but
-///   the word observed `Relaxed`. It erases too, which is what says the property
-///   is carried by the synchronises-with edge and not by the order two lines
-///   happen to be written in.
-///
-/// Both witnesses are legal C11 executions: the sweeper reads the byte's
-/// *initial* store because nothing orders it after the joiner's acquisition.
-/// Each is `#[should_panic]` on the erasure assertion; the ordering flag trips
-/// in the same execution.
+/// - [`control_reclaim_races_register_probes_the_byte_first`] — reads swapped.
+/// - [`control_reclaim_races_register_observes_relaxed`] — right order, word
+///   observed `Relaxed`.
 ///
 /// # Modelling notes
 ///
-/// Slot 0's corpse is reclaimed uncontended, which is also what keeps this model
-/// clear of loom 0.7.2's `match_rmw_to_stores` over-approximation: an RMW is
-/// offered every store back to the first in its own causality, so a second
-/// writer to a slot a stale verdict names lets a `RESERVED -> FREE` CAS match a
-/// modification-order-superseded store and report a C11-illegal erasure. A pass
-/// here is sound; a failure needs its witness hand-checked before it is
-/// believed. That is also why the same-slot race is not modelled here.
-///
-/// The byte is modelled as an exclusive per-slot lock word, taken and never
-/// released: `Session` outlives the `Tree`'s registration, and `Tree::drop`
-/// releases the record before the byte, never the reverse. The probe is a
-/// `Relaxed` load deliberately — `F_OFD_GETLK` is a syscall and is at least that
-/// strong, so a property that holds against the weakest read holds against the
-/// real one. The corpse is staged inline: the idiom of
+/// Slot 0's corpse is reclaimed uncontended, which keeps the model clear of loom
+/// 0.7.2's `match_rmw_to_stores` over-approximation; a failure needs its witness
+/// hand-checked. The byte is an exclusive per-slot lock word, taken and never
+/// released, probed `Relaxed` (`F_OFD_GETLK` is at least that strong). The corpse
+/// is staged inline, as in
 /// [`a_dead_lock_holder_is_stolen_from_and_leaves_no_trace`].
 #[test]
 fn reclaim_races_register() {
@@ -1440,9 +1162,7 @@ fn reclaim_races_register_model(shape: Sweep) {
             AtomicU32::new(BYTE_FREE)
         ]);
 
-        // The corpse in slot 0. `register` can never collect it — it only ever
-        // CASes from FREE — which is why such a slot was lost to everybody for
-        // ever before `reclaim` existed.
+        // The corpse in slot 0: `register` never collects it (it only CASes from FREE).
         table[0].pid.store(P_CORPSE, Ordering::Relaxed);
         table[0].state.store(RESERVED, Ordering::Release);
 

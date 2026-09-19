@@ -1,28 +1,14 @@
-//! The differential harness (`docs/PHASE1.md` §10.5 *Differential against tf2*).
+//! The differential harness (`docs/PHASE1.md` §10.5): an identical tree and
+//! sample stream through two independent lookup pipelines, compared over random
+//! queries with [`InterpPolicy::LerpSlerp`].
 //!
-//! Drives an identical tree and an identical sample stream through two
-//! independent lookup pipelines and compares the results across many random
-//! queries with [`InterpPolicy::LerpSlerp`] (tf2's policy).
+//! * [`Reference::NaiveRust`]: an independent Rust lookup sharing only the input
+//!   data with the engine. Runs anywhere.
+//! * [`Reference::Tf2`] (`--features tf2`): ROS 2's `tf2::BufferCore` via
+//!   `tf_tree_tf2_sys`; `just tf2-differential`.
 //!
-//! The reference is **pluggable**:
-//!
-//! * [`Reference::NaiveRust`] (the default, runs now): an independent Rust
-//!   lookup — its own LCA walk, its own linear-scan bracket search, its own
-//!   `LerpSlerp` composition over the *same* sample values the engine holds. It
-//!   shares only the input data, never the engine's code path, so agreement to
-//!   ~`1e-12` is a real cross-check of the seqlock ring + plan evaluation.
-//! * [`Reference::Tf2`] (behind `--features tf2`): drives ROS 2's real
-//!   `tf2::BufferCore` through the `tf_tree_tf2_sys` FFI bridge. This is the
-//!   migration-credibility test — if it fails, code moving from tf2 to tf_tree
-//!   would observe a different transform. It needs a ROS 2 install; run it with
-//!   `just tf2-differential`, which containerises the toolchain.
-//!
-//! Both references implement one private `Oracle` trait and go through the
-//! *same* query loop, so a disagreement is attributable to the engine under test
-//! rather than to two subtly different harnesses.
-//!
-//! Queries an oracle declines are skipped and counted, never scored as
-//! agreement — see [`DiffReport::compared`].
+//! Both go through one private `Oracle` trait and query loop. Queries an oracle
+//! declines are skipped and counted, never scored ([`DiffReport::compared`]).
 
 use std::collections::HashMap;
 
@@ -61,10 +47,8 @@ pub struct DiffReport {
     pub reference: Reference,
     /// How many random queries were drawn.
     pub queries: usize,
-    /// How many were actually scored. Lower than `queries` because identical
-    /// target/source pairs are skipped, and because an oracle may decline a
-    /// query (tf2 does, past its cache horizon). A run with a low `compared`
-    /// proved little, so this is reported rather than hidden.
+    /// How many were actually scored (identical pairs and oracle-declined
+    /// queries are skipped); a low value proved little.
     pub compared: usize,
     /// The worst observed disagreement (max of rotation-angle error in radians
     /// and translation error in metres) across all scored queries.
@@ -76,11 +60,8 @@ pub struct DiffReport {
 }
 
 impl DiffReport {
-    /// Whether the run stayed within [`Self::tolerance`].
-    ///
-    /// A run that scored **nothing** does not pass: an oracle that declined every
-    /// query would otherwise report a `max_error` of `0.0` and look like perfect
-    /// agreement.
+    /// Whether the run stayed within [`Self::tolerance`]. A run that scored
+    /// nothing does not pass.
     #[must_use]
     pub fn passed(&self) -> bool {
         self.compared > 0 && self.max_error <= self.tolerance
@@ -111,9 +92,8 @@ struct RefFrame {
     samples: Vec<(i64, Iso3)>,
 }
 
-/// An in-memory tree the reference lookup walks — built from the *same*
-/// declarations and the *same* synthetic sample stream as the engine tree, but
-/// entirely independent of the engine's arena, seqlock, and plan machinery.
+/// An in-memory reference tree built from the same declarations and sample
+/// stream as the engine tree, independent of its arena and plan machinery.
 struct RefModel {
     index: HashMap<&'static str, usize>,
     frames: Vec<RefFrame>,
@@ -186,8 +166,7 @@ impl RefModel {
     }
 
     /// Independent `lookup(target, source)` at stamp `t`, returning
-    /// `T_target_source`. Mirrors the engine's LCA walk and inverted/forward step
-    /// emission, but composes freshly sampled poses with no shared code.
+    /// `T_target_source`, composing freshly sampled poses with no shared code.
     fn lookup(&self, target: usize, source: usize, t: i64) -> Iso3 {
         let mut a = target;
         let mut b = source;
@@ -222,9 +201,8 @@ impl RefModel {
     }
 }
 
-/// Independent bracket-search + `LerpSlerp` sample of a `(stamp, pose)` stream at
-/// `t`. Assumes `t` lies inside `[first, last]` (the harness only draws in-window
-/// stamps); clamps to the endpoints otherwise.
+/// Independent bracket-search + `LerpSlerp` sample of a `(stamp, pose)` stream
+/// at `t`; assumes an in-window `t`, clamps otherwise.
 fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
     if stream.is_empty() {
         return Iso3::IDENTITY;
@@ -251,11 +229,8 @@ fn ref_sample(stream: &[(i64, Iso3)], t: i64) -> Iso3 {
 }
 
 /// The disagreement between two poses: `max(rotation-angle error, translation
-/// error)`.
-///
-/// `pub(crate)` so [`crate::ratio`] can make the same check with the same metric
-/// before it times anything: a ratio between two arms answering different
-/// questions is not a measurement, and "same" has to mean what it means here.
+/// error)`. `pub(crate)` so [`crate::ratio`] applies the same check before it
+/// times anything.
 pub(crate) fn pose_error(x: &Iso3, y: &Iso3) -> f64 {
     let dq = x.q.conjugate() * y.q;
     let rot = log_so3(dq).norm();
@@ -278,19 +253,11 @@ impl Rng {
     }
 }
 
-/// The agreement bound both references are held to.
-///
-/// `1e-12` is `docs/PHASE1.md` §10.5's number. It is far above `f64` epsilon and far
-/// below anything a robot cares about, so it catches a genuine algorithmic
-/// divergence (a wrong branch, a transposed quaternion, an off-by-one bracket)
-/// without tripping on the last bits of a different-but-equivalent operation
-/// order.
+/// The agreement bound both references are held to (`docs/PHASE1.md` §10.5).
 pub const TOLERANCE: f64 = 1e-12;
 
-/// The oracle a differential run compares the engine against.
-///
-/// Both references answer the same question — `T_target_source` at a stamp — so
-/// [`run`] drives them through one identical query loop.
+/// The oracle a differential run compares the engine against; both answer
+/// `T_target_source` at a stamp, and [`run`] drives them identically.
 trait Oracle {
     /// `T_target_source` at `stamp_ns`, or `None` if this oracle cannot answer
     /// (only tf2 declines, at its cache horizon).
@@ -308,16 +275,10 @@ impl Oracle for RefModel {
     }
 }
 
-/// Run the differential query loop against an arbitrary oracle.
-///
-/// Builds a `LerpSlerp` engine tree with pre-populated history, then compares
-/// `queries` random `lookup(target, source)` results at random in-window stamps.
+/// Run the differential query loop against an arbitrary oracle: `queries`
+/// random lookups at random in-window stamps on a `LerpSlerp` engine tree.
 /// Returns the worst disagreement; the caller asserts it is within [`TOLERANCE`].
-///
-/// Queries the oracle declines are **skipped, not scored**, and counted in
-/// [`DiffReport::compared`] — so a tf2 cache-horizon miss never masquerades as
-/// agreement, and a run where the oracle answered almost nothing is visible
-/// rather than a silent pass.
+/// Declined queries are skipped and counted in [`DiffReport::compared`].
 fn run(reference: Reference, oracle: &dyn Oracle, queries: usize, seed: u64) -> Result<DiffReport> {
     let tree: Tree = fixture::build_tree_with(InterpPolicy::LerpSlerp)?;
     let (_writers, _samples) = fixture::spin_up(&tree)?;
@@ -381,26 +342,19 @@ fn run(reference: Reference, oracle: &dyn Oracle, queries: usize, seed: u64) -> 
     })
 }
 
-/// Run the differential harness against the naive Rust reference.
-///
-/// The reference is an independent Rust lookup over the *same* sample values,
-/// sharing no code with the engine, so agreement is a real cross-check of the
-/// seqlock ring and plan evaluation. Always available.
+/// Run the differential harness against the naive Rust reference. Always
+/// available.
 ///
 /// # Errors
 ///
-/// Propagates fixture build / spin-up failures, or an engine lookup error (a
-/// disconnected pair, which the connected fixture never produces).
+/// Propagates fixture build / spin-up failures, or an engine lookup error.
 pub fn run_naive_rust(queries: usize, seed: u64) -> Result<DiffReport> {
     let model = RefModel::build();
     run(Reference::NaiveRust, &model, queries, seed)
 }
 
-/// Run the differential harness against ROS 2's `tf2::BufferCore`.
-///
-/// This is the migration-credibility test from `docs/PHASE1.md` §10.5: identical tree,
-/// identical sample stream, `LerpSlerp` on both sides (tf2's policy), compared
-/// across `queries` random lookups.
+/// Run the differential harness against ROS 2's `tf2::BufferCore`
+/// (`docs/PHASE1.md` §10.5): identical tree and stream, `LerpSlerp` both sides.
 ///
 /// # Errors
 ///

@@ -1,10 +1,7 @@
 # tf_tree vs ROS 2 `tf2` — validation and benchmarks
 
-This document records what has actually been measured against ROS 2's `tf2`, how,
-and what the numbers do and do not support. Numbers here are **reproducible** —
-every row names the command that produced it.
-
-Reproduce everything with:
+What has been measured against ROS 2's `tf2`, how, and what the numbers support.
+Every row names the command that produced it.
 
 ```bash
 just tf2-differential   # correctness, synthetic fixture
@@ -12,22 +9,19 @@ just tf2-replay         # correctness, real recorded /tf stream
 just tf2-bench          # performance, head-to-head, single-threaded
 just tf2-scaling        # concurrent read scaling, 1/2/4/8 threads
 just tf2-native-control # pure C++ tf2, no Rust and no FFI — the bias control
-just footprint           # memory + instructions per lookup (no idle machine needed)
-just shm-test            # multi-process gate: another process, bit-identical
-just shm-scaling         # N reader PROCESSES on one shared arena (roofline)
-just mp-bench            # N node-shaped consumers at a fixed rate (deployment)
-just mp-bench-tf2        # the same, both engines, in the ROS container
-just py-vs-tf2           # tf_tree's Python API vs tf2_ros's (PHASE3 §12.1)
-just profile-lookup      # where the lookup spends itself, by file
+just footprint          # memory + instructions per lookup (no idle machine needed)
+just shm-test           # multi-process gate: another process, bit-identical
+just shm-scaling        # N reader PROCESSES on one shared arena (roofline)
+just mp-bench           # N node-shaped consumers at a fixed rate (deployment)
+just mp-bench-tf2       # the same, both engines, in the ROS container
+just py-vs-tf2          # tf_tree's Python API vs tf2_ros's (PHASE3 §12.1)
+just profile-lookup     # where the lookup spends itself, by file
 ```
 
-All of them run in a container (`docker/tf2/`), so no ROS install is needed on
-the host.
-
-The bridge all five go through has its own check, `just tf2-check`: fmt, clippy
-and the unit tests of `tf_tree_tf2_sys` and of `tf_tree_bench --features tf2`.
-It exists because that crate is excluded from the workspace (it only builds
-where ROS 2 does), so `just lint` and `just test` cannot see it.
+All run in a container (`docker/tf2/`); no ROS install is needed on the host.
+`just tf2-check` (fmt, clippy, unit tests of `tf_tree_tf2_sys` and of
+`tf_tree_bench --features tf2`) covers the crate `just lint` and `just test`
+cannot see, because it is excluded from the workspace.
 
 ## Setup
 
@@ -38,61 +32,36 @@ where ROS 2 does), so `just lint` and `just test` cannot see it.
 | **Bridge** | `tf_tree_tf2_sys` — `extern "C"` shim over `tf2::BufferCore` |
 | **Interpolation** | `LerpSlerp` on both sides (tf2's policy) |
 
-`tf2::BufferCore` links against `-ltf2` alone: no rclcpp, no DDS, no ROS graph.
-Both engines are therefore plain in-process libraries driven from the same loop
-with the same inputs. **No middleware is in any measurement.** A comparison that
-included DDS would measure the transport, not the transform engine, and would
-flatter tf_tree for the wrong reason.
+`tf2::BufferCore` links against `-ltf2` alone: no rclcpp, no DDS. Both engines
+are plain in-process libraries driven from the same loop with the same inputs.
+**No middleware is in any measurement** except the transport section.
 
 ## Correctness
 
-The claim that matters for migration is that code moving from tf2 to tf_tree sees
-the *same transform*. Both engines are given an identical topology and an
-identical sample stream, then asked the same random queries.
+Both engines get an identical topology and sample stream, then the same random
+queries.
 
 | Load | Queries scored | Max disagreement | Bound |
 |---|---|---|---|
 | Synthetic fixture (24 frames, depth 6) | 95,909 | **2.876e-15** | 1e-12 |
 | Recorded `/tf` stream (10 frames, depth 3) | 50,000 | **6.665e-15** | 1e-12 |
 
-Both are ~150-350x tighter than [`PHASE1.md`](../PHASE1.md) §10.5's 1e-12 gate, and are at the
-level of `f64` round-off for the composition depths involved.
+Bound is [`PHASE1.md`](../PHASE1.md) §10.5's 1e-12 gate. On the recorded stream
+the engines also declined **exactly the same queries** (`tf_tree-only 0,
+tf2-only 0`). Disagreement is `max(rotation-angle error in radians, translation
+error in metres)`, so a quaternion sign flip cannot pass.
 
-On the recorded stream the two engines also declined **exactly the same queries**
-(`tf_tree-only 0, tf2-only 0`): they agree on *which* lookups are answerable, not
-merely on the values of the ones they both answer. That is the stronger property
-and the one a migration actually depends on.
-
-Disagreement is measured as `max(rotation-angle error in radians, translation
-error in metres)` — not a component-wise comparison, which would let a
-quaternion sign flip pass.
-
-### Guarding against a vacuous pass
-
-A differential can "pass" by comparing nothing. Two safeguards:
-
-* `DiffReport::passed()` requires `compared > 0`, so an oracle that declined
-  every query reports failure rather than a `max_error` of `0.0`.
-* The scored count is reported alongside the error, so a run that only compared
-  a handful of queries is visible rather than silently reassuring.
+`DiffReport::passed()` requires `compared > 0`, so an oracle that declined every
+query fails rather than reporting `max_error` 0.0; the scored count is printed.
 
 ## Performance
 
-All figures below were taken on an **idle** machine (load < 0.6, nothing running
-but the harness), 8 logical CPUs / **4 physical cores** (2-way SMT), AMD
-EPYC-Milan pinned at 2445 MHz with no frequency governor exposed. Criterion
-confidence intervals were within ±0.2%.
+Idle machine (load < 0.6), 8 logical CPUs / **4 physical cores** (2-way SMT),
+AMD EPYC-Milan at 2445 MHz, no governor exposed. Criterion intervals ±0.2%.
+This is **not** [`PHASE1.md`](../PHASE1.md) §11.3's go/no-go gate, which needs
+dedicated core-pinned hardware.
 
-These are still **not** the [`PHASE1.md`](../PHASE1.md) §11.3 go/no-go gate, which calls for
-dedicated core-pinned hardware; a shared-tenancy VM with SMT is closer than
-before but is not that.
-
-### Measuring the measurement: four biases found and removed
-
-Three of the four favoured tf_tree; the fourth favoured tf2. They are listed
-here, with what each cost, because a benchmark whose author only checked in one
-direction is not evidence — and checking in both directions is what turned up
-number 4.
+### Measurement biases
 
 | # | Bias | Cost charged to tf2 | Found by |
 |---|---|---|---|
@@ -101,58 +70,28 @@ number 4.
 | 3 | Residual FFI boundary (cross-TU, no inlining, extra copy) | **45.3 ns (10%)** | native C++ control |
 | 4 | `setTransform` authority passed as a string *literal* | **~8 ns + 1 malloc/free per publish** | `just footprint` |
 
-Bias 4 was found last and is the only one so far that ran the *other* way — it
-was charged to tf2 and made tf_tree look better. `tf2::BufferCore::setTransform`
-takes `const std::string&`, so a literal constructs a temporary per call, and at
-20 characters `"tf_tree_differential"` is past libstdc++'s 15-byte SSO buffer:
-one heap allocation on every publish. A real broadcaster stores its authority
-once. Fixing it (a `static const std::string`) moved tf2's publish from 123 ns to
-114 ns and **the published push ratio from 14.1x to 12.1x**. It was found only
-because the allocation-count measurement below asked a question timing does not:
-*how many times did each engine call the allocator?*
+Biases 1-3 favoured tf_tree; bias 4 favoured tf2. `setTransform` takes
+`const std::string&`, so a 20-character literal (past libstdc++'s 15-byte SSO)
+heap-allocates on every publish; a real broadcaster stores its authority once.
+Fixed with a `static const std::string`: tf2 publish 123 -> 114 ns, push ratio
+14.1x -> 12.1x.
 
-Bias 2 is the instructive one. The in-tree `shim_overhead` probe reported only
-11 ns and **missed it entirely**, because the probe measured the Rust side while
-the cost was incurred inside C++ at the `lookupTransform` call site. No amount of
-staring at the Rust code would have found it. What found it was
-`docker/tf2/native_scaling.cpp` — the same load and the same queries with the
-binding deleted outright.
+Fixes for 1-2: `FrameName` owns a heap `std::string` on the C++ side and
+`tft2_lookup_pre` passes it by `const&`, the call a native C++ user makes.
+`tf2/lookupTransform_alloc` (the naive binding) and `tf2/shim_overhead` run on
+every benchmark invocation as controls. Bias 3 is irreducible for any FFI
+comparison, so **the single-threaded ratio is reported against native C++**.
 
-Fixes: `FrameName` now owns a heap `std::string` on the C++ side and
-`tft2_lookup_pre` passes it by `const&`, which is byte-for-byte the call a native
-C++ user makes. Two controls run on every benchmark invocation so this cannot
-silently regress — `tf2/lookupTransform_alloc` re-measures the naive binding, and
-`tf2/shim_overhead` isolates what the bridge still costs.
-
-Bias 3 is irreducible for any FFI comparison, so **the single-threaded ratio is
-reported against the native C++ figure**, which has no binding in it at all.
-
-**Where the 45.3 ns comes from, and why this row used to say ~21 ns (8%).** The
-figure is a subtraction between two rows of this document's own bracket table
-below: the same depth-3 pair, the same 256 stamps, tf2 at **498.2 ns through
-`tf_tree_tf2_sys`** (the Rust harness row) against **452.9 ns called natively**
-(the C++ harness row) — 45.3 ns, or 10.0% of the native figure. The earlier
-~21 ns (8%) had **no derivation recorded anywhere in this document**, disagreed
-with the bracket table by a factor of two, and nothing reconciled the two; it is
-withdrawn rather than explained, because guessing at how a number was obtained is
-how the wrong attributions in this file's history started.
-
-Independent support for the order of magnitude, from a different measurement
-entirely: [`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
-amendment 3 prices a **non-inlined call boundary on this same fixture** at
-**~55 ns** (native Rust with the guard hoisted, 242 ns, against `tft_plan_at`
-called across `libtf_tree_c.so`, 297 ns), measured at `[profile.embedder]`
-(`lto = false`) precisely so LTO could not erase the boundary being priced. That
-is our own C ABI rather than tf2's, so it is not the same boundary and is not
-offered as a second measurement of it — but a cross-TU, un-inlinable call with
-one argument marshalling step costs tens of nanoseconds on this host, which is
-the 45 and not the 21.
-
-What would falsify the 45.3: a paired run of the two harnesses in one process, or
-any pair of tf2 rows on this fixture whose binding-versus-native difference is not
-~45 ns. Both bracket-table halves are unpaired point estimates from different
-processes, so the figure carries this host's run-to-run spread; it is documentary,
-and — see below — it is deliberately **not** what `ratio.rs`'s floor rests on.
+**Where the 45.3 ns comes from.** tf2 at **498.2 ns through `tf_tree_tf2_sys`**
+(Rust harness row of the bracket table below) against **452.9 ns called
+natively** (C++ harness row): 45.3 ns, 10.0% of native. It is an unpaired
+difference between two processes and carries this host's run-to-run spread; it
+is documentary and is not what `ratio.rs`'s floor rests on. Independent order-
+of-magnitude support: [`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
+amendment 3 prices a non-inlined call boundary on this fixture at ~55 ns (our
+own C ABI, not tf2's). It would be falsified by a paired run of the two
+harnesses in one process, or any tf2 row pair on this fixture whose
+binding-versus-native difference is not ~45 ns.
 
 ### Steady-state lookup
 
@@ -163,28 +102,17 @@ and — see below — it is deliberately **not** what `ratio.rs`'s floor rests o
 | Fixture, depth 6 | 178 ns | 379 ns | - | 2.1x |
 | Recorded stream, depth 3 | 94 ns | 292 ns | **253 ns** | **2.7x** |
 
-The honest headline is therefore **~2.7x**, not the 3.3x first reported.
+The headline is **~2.7x**.
 
-### The binding cuts both ways, and the honest answer is a bracket
+### The binding cuts both ways: a bracket
 
-Every ratio above this line puts tf2 behind `tf_tree_tf2_sys`. Bias 3 prices that
-boundary at 45.3 ns — 10% — **by subtracting the first two rows of the table just
-below**, and calls it irreducible *for a Rust harness* — which is true,
-and which is why the single-threaded headline is quoted against the native C++
-figure. `docker/tf2/native_ratio.sh` closes the loop: **both engines in one C++
-process**, tf2 called natively, `tf_tree` through its C ABI as a shared library.
-An arena owner (`native_arena`) serves the fixture over the rendezvous and dumps
-the identical `.tfstream`, because `tft_tree_open` attaches and cannot create
-(D18); both engines are checked to agree on all 256 stamps before either is
-timed, at a max deviation of **2.05e-15**.
-
-**The table now carries a profile column, and it is not decoration** — see
-[the section after it](#the-bracket-has-a-second-axis-and-it-is-the-consumers-profile).
-Every Rust-side `tf_tree` number here is taken under this workspace's
-`[profile.release]` (`lto = "thin"`); a consumer's `cargo build --release` is
-`lto = false` and measures a different arm. The tf2 columns have no Rust profile
-to speak of on the native rows, and are measured invariant under it on the
-binding row.
+Ratios that put tf2 behind `tf_tree_tf2_sys` pay bias 3. `docker/tf2/native_ratio.sh`
+runs **both engines in one C++ process**, tf2 called natively, `tf_tree` through
+its C ABI as a shared library. An arena owner (`native_arena`) serves the fixture
+over the rendezvous and dumps the identical `.tfstream` (`tft_tree_open` attaches
+and cannot create, D18); both engines agree on all 256 stamps to **2.05e-15**
+before either is timed. Rust-side `tf_tree` numbers use this workspace's
+`[profile.release]` (`lto = "thin"`).
 
 | Harness | tf_tree profile | tf_tree | tf2 | Ratio | Who pays the boundary |
 |---|---|---|---|---|---|
@@ -193,36 +121,25 @@ binding row.
 | Neither, unpaired | `release`, `lto = "thin"` | 201.5 ns | 452.9 ns | **2.25×** | nobody |
 | Neither, unpaired | `embedder`, `lto = false` | 244.2 ns | 439.2 ns | **1.80×** | nobody |
 
-**The true figure is bracketed by the first two, and the third is the best point
-estimate** *for a build like this workspace's*. It is unpaired — the two numbers
-come from different processes — so it carries this host's run-to-run spread and is
-not gate material; but each half is measured in its own native environment with no
-FFI in it, and it lands close to the 2.7× the depth-3 recorded-stream row reports
-independently. **The fourth row is the same construction for the build a consumer
-actually gets, and it is the one that does not clear 2.0.**
+The first two bracket the truth; the third is the best point estimate for a
+build like this workspace's (unpaired, so not gate material) and lands near the
+2.7× recorded-stream row. The fourth is the build a consumer actually gets, and
+does not clear 2.0.
 
-**Correcting bias 3 from ~21 ns to 45.3 ns does not move the gate.**
 `crates/tf_tree_bench/src/ratio.rs` gates on `FLOOR = 2.0`, bounded by
-`UNBIASED_ESTIMATE = 2.25`, and that constant is row 3 above — 201.5 ns native
-Rust against 452.9 ns native C++, with **no binding on either arm**. Bias 3 is
-the price of the binding, so it does not appear in either half of that quotient.
-It is the *first* row (2.47×) that carries the binding, and that row is reported,
-never gated, for exactly this reason.
+`UNBIASED_ESTIMATE = 2.25` — row 3, with **no binding on either arm**. The
+binding price therefore appears in neither half of that quotient; row 1, which
+carries it, is reported and never gated.
 
-### The bracket has a second axis, and it is the consumer's profile
+### The bracket's second axis: the consumer's profile
 
-Everything above holds `tf_tree`'s build constant at this workspace's
-`[profile.release]` without saying so, and that turns out to be load-bearing.
-**Cargo applies the top-level package's profile to the whole dependency graph**,
-so a consumer who runs `cargo add tf_tree` and builds `--release` compiles the
-engine under *cargo's* release defaults — which set no LTO.
-`[profile.embedder]` in the workspace manifest is those defaults written out
-field by field, and it exists because `docs/API.md` §2.3 item 3 already priced
-this: thin LTO inlines `Plan::at` across the `tf_tree` crate boundary into the
-caller and `lto = false` does not.
+Cargo applies the top-level package's profile to the whole dependency graph, so
+`cargo add tf_tree` + `--release` compiles the engine with no LTO.
+`[profile.embedder]` is those defaults written out; thin LTO inlines `Plan::at`
+across the crate boundary and `lto = false` does not (`docs/API.md` §2.3 item 3).
 
-`just tf2-ratio-profiles` builds `ratio.rs`'s paired harness twice and runs both,
-in `docker/tf2`, `taskset -c 2`, one session (2026-08-15):
+`just tf2-ratio-profiles` (`docker/tf2`, `taskset -c 2`, one session,
+2026-08-15):
 
 | build | `lto` | tf_tree | tf2 (via binding) | **paired ratio** | band |
 |---|---|---|---|---|---|
@@ -230,84 +147,43 @@ in `docker/tf2`, `taskset -c 2`, one session (2026-08-15):
 | `[profile.profiling]` — control, inherits `release`, only debuginfo differs | `"thin"` | 200.4 ns | 494.7 ns | 2.468× | 2.408–2.485 |
 | `[profile.embedder]` — cargo's release defaults, i.e. a consumer | `false` | 244.2 ns | 506.1 ns | **2.075×** | 2.063–2.080 |
 
-Two controls make this readable as evidence rather than as two numbers from two
-processes:
+The tf2 column is invariant (504.4 -> 506.1 ns, +0.34%; it is an `extern "C"`
+call no Rust LTO can inline into) and the tf_tree column moves +21.1%.
+`profiling` lands on the LTO arm, so the number tracks `lto`, not the profile's
+name.
 
-* **The tf2 column holds: 504.4 → 506.1 ns, +0.34%.** That arm is an
-  `extern "C"` call into a C++ shim that no Rust LTO setting can inline into, so
-  it *should* be invariant across the two builds, and it was checked rather than
-  assumed. The tf_tree column moves +21.1% and is the entire difference.
-* **`[profile.profiling]` is the axis that should not matter.** It inherits
-  `[profile.release]` and differs only in debuginfo; it lands on the LTO arm
-  (0.6% from it), not the embedder one. So the number tracks `lto`, not "a
-  profile whose name is not `release`". Taking that control also caught a wrong
-  build fact: `embed::lto_for_profile_dir` did not follow `inherits` and had been
-  reporting `false (cargo's default; …)` for `profiling`, whose `lto` is in fact
-  `"thin"`. Fixed, with a test, in the same commit.
+At `[profile.embedder]` the unbiased estimate is 439.2 / 244.2 = **1.80×**,
+below the floor; the row still passes there at a paired 2.075×, on binding bias.
+**The floor was not lowered**: `just tf2-bench-check` builds `--release` in this
+workspace, so the gate is a regression detector for that build and not a
+consumer-facing guarantee (`FLOOR`'s doc comment;
+[`0025`](../decisions/0025-what-build-the-tf2-ratio-gate-speaks-for.md)). The
+consumer-facing headline stays ~2.7×. A second gated row at `[profile.embedder]`
+would need a decision record; `runstore::BUILD_CRITICAL_FACTS` already refuses to
+score two profiles against one baseline.
 
-**What this costs the gate.** `ratio.rs`'s floor of 2.0 is justified by sitting
-under the unbiased estimate, so that the ~10% the binding hands tf2 cannot pass
-the row on its own. At `[profile.embedder]` the unbiased estimate is 439.2 /
-244.2 = **1.80×** (1.86× against the older 452.9 ns tf2 half), and 1.80 is
-*below* the floor. The row still passes there at a paired 2.075×, which is the
-problem rather than the reassurance: it passes on binding bias.
+### The C ABI's 52%
 
-**The floor was not lowered**, and the reasoning is in `FLOOR`'s doc comment.
-The short version: the gate is measured by `just tf2-bench-check`, which builds
-`--release` in this workspace, so it always *was* a statement about this
-workspace's build; that is honest as a regression detector, which is the only
-thing it ever claimed to be, and it is not a consumer-facing guarantee. The
-consumer-facing headline stays the ~2.7× recorded-stream row, whose provenance is
-its own. Widening the gate to speak for a consumer's build would change what the
-floor means, and by `CLAUDE.md`'s rule that is a decision record — the shape it
-would take is a second gated row at `[profile.embedder]` with its own floor under
-1.80, since `runstore::BUILD_CRITICAL_FACTS` already refuses to score two
-profiles against one baseline. Nothing is drafted yet; this section is the
-measurement such a record would rest on.
+[`PHASE4.md`](../PHASE4.md) §7 gate 1 once recorded `tft_plan_at` at 1.020×
+native Rust; that was Rust calling the ABI inside one build, where the linker
+sees across the call. A C++ caller against `libtf_tree_c.so` pays 52% on the same
+host and fixture.
 
-**The C ABI's 52% is the finding here, and it contradicted a gate.**
-[`PHASE4.md`](../PHASE4.md) §7 gate 1 recorded `tft_plan_at` at **1.020× native
-Rust**, and that measurement is `examples/abi_cost.rs` — Rust calling the ABI
-*from inside the same build*, where the linker still sees across the call. A C++
-caller against `libtf_tree_c.so` does not, and pays 52% on the same host and the
-same fixture. Both numbers are real; they are answers to different questions, and
-§7 gate 1 did not say which one it was asking.
-
-> **Amended 2026-08-28: the 1.020× is not what gates, and neither is the
-> 1.34–1.46× that replaced it further down.** This paragraph, the FAIL below and
-> item 3 of the guidance were all written against a §7 gate 1 that was a single
-> quotient — `tft_plan_at` over a native Rust arm. `docs/PHASE4.md` §0.0's §7
-> row now records that criterion **NOT EVALUABLE**: its denominator moved 43%
-> on an edit that did not touch the ABI at all
-> ([`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s *Context*), so
-> neither 1.020× nor 1.34–1.46× is a statement about the ABI. What gates today is
-> [`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s re-cut, run by
-> `just abi-cost` and recorded in [`EVIDENCE.md`](./EVIDENCE.md)'s `abi_cost`
-> row: **four quotients on one interleaved ladder** at `[profile.embedder]` — R1
-> the ABI < 1.10 (measured **1.025–1.038**), R2 the panic guard < 1.05, R3 the
-> per-call guard < 1.25, and a control at 1 ± 0.02 — all PASS, and the recipe
-> exits non-zero when they do not. The durable number is the decomposition rather
-> than any ratio: because every rung shares one build, **the ABI's own cost is
-> about +6 ns**. None of this touches the 52% measured in this section, which is
-> a C++ caller against a *shared* arena and is a different configuration.
+> **What gates today** is [`0023`](../decisions/0023-the-gate-that-could-not-gate.md)'s
+> re-cut, run by `just abi-cost` and recorded in [`EVIDENCE.md`](./EVIDENCE.md)'s
+> `abi_cost` row: four quotients on one interleaved ladder at
+> `[profile.embedder]` — R1 the ABI < 1.10 (measured **1.025–1.038**), R2 the
+> panic guard < 1.05, R3 the per-call guard < 1.25, and a control at 1 ± 0.02.
+> The ABI's own cost is about **+6 ns**. `PHASE4.md` §0.0 records the old
+> single-quotient §7 criterion as NOT EVALUABLE; neither 1.020× nor the
+> 1.34–1.46× that briefly replaced it is a statement about the ABI. The 52%
+> below is a C++ caller against a *shared* arena, a different configuration.
 
 #### Where the 52% actually goes: the C ABI's per-call work
 
-That run moved two variables at once — the cross-`.so` call, and the fact that
-the C++ arm reads a shared `memfd` arena where the Rust arm reads a heap one —
-and separating them was owed here. It is now done, and the answer is **neither**
-of them.
-
-**A first version of this section said "it is the linker, not the mapping" and
-that was wrong.** It reached the boundary by subtraction — measuring the mapping,
-finding it ~free, and attributing the whole residue to the `.so`. Nothing had
-measured the `.so`. Running the *same* `tests/cpp/bench.cpp` source against
-`libtf_tree_c.a` and against `libtf_tree_c.so` settles it: **245.4 ns against
-244.4 ns**, a difference of 0.4%. A subtraction is not a measurement, and this
-is the second time in this document that lesson has had to be relearned.
-
-The full ladder, every rung on the same §11.1 fixture and the same off-grid
-sweep, `imu_link ← map`:
+The same `tests/cpp/bench.cpp` against `libtf_tree_c.a` and `libtf_tree_c.so`
+measures **245.4 ns against 244.4 ns**: link mode is not the cause. Full ladder,
+§11.1 fixture, same off-grid sweep, `imu_link ← map`:
 
 | Rung | API | Arena | ns/lookup |
 |---|---|---|---|
@@ -317,114 +193,48 @@ sweep, `imu_link ← map`:
 | C | **C ABI** (`tft_plan_at`) | same arena as A | **302.0** |
 | C′ | **C ABI** (`tft_plan_at_many`) | same arena as A | **261.0** |
 
-Read down the Rust rungs: the shared mapping costs **≤ 9.6 ns** (paired over
-nine runs, median quotient 1.0066–1.0112×, point estimate ~1.8 ns), and
-attaching read-only *from another process* costs **−0.7 ns** — nothing. Link
-mode costs ~1 ns. Then the C ABI costs **+99.5 ns, or +49%**, on the identical
-arena.
+The shared mapping costs **≤ 9.6 ns** (paired, nine runs, median quotient
+1.0066–1.0112×, ~1.8 ns typical); attaching read-only from another process
+costs **−0.7 ns**; the C ABI costs **+99.5 ns (+49%)** on the identical arena.
 
-**So it is the ABI, and specifically it is per-call work the Rust API lets you
-hoist.** `tft_plan_at` builds a `Guard` on every call (`lib.rs:684`), inside a
-`catch_unwind`, after validating the handle; the Rust arm acquires one guard and
-reuses it across all 10,240 lookups. `tft_plan_at_many` — which pays the guard
-once per batch rather than once per element — recovers **41 ns** of the 99.5,
-which is the direct evidence for that attribution rather than an inference from
-reading the source.
+The cause is per-call work the Rust API lets you hoist: `tft_plan_at` builds a
+`Guard` on every call inside a `catch_unwind`, where the Rust arm acquires one
+guard for all 10,240 lookups. `tft_plan_at_many` pays it once per batch and
+recovers **41 ns** of the 99.5. The `is_shared()` fork check in `Tree::guard` is
+noise (+2.1 ns counters off, −8.4 ns on); the per-call guard costs ~17 ns on both
+backings and Phase 5's counters roughly double it. The `Guard` constructor
+allocates nothing and takes no lock — a single acquire load — so
+[`API.md`](../API.md) §1 R2 is not violated
+([`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
+*Decision* item 4), and the `tft_guard` handle is declined.
 
-**And §7 gate 1 turns out to be failing, which is the larger finding.** The
-tempting explanation was that the guard is expensive only on a shared arena —
-`Tree::guard` adds a fork check when `is_shared()` (`crates/tf_tree/src/tree.rs`) — making the
-gate's 1.020× honest for heap trees and blind to shared ones. Measured, that
-branch is worth **+2.1 ns** (counters off) and **−8.4 ns** (counters on): noise.
-The per-call guard costs ~17 ns on *both* backings, and Phase 5's diagnostic
-counters roughly double it (+35.4 heap / +27.0 memfd).
+The mapping-is-free claim rests on a run that interpolates. The 213-vs-217 ns
+row in the multi-process section compares two harnesses unpaired (spread ~4%),
+and `examples/heap_vs_shared` queries one exact grid hit
+([`0013`](../decisions/0013-the-benchmark-gate-never-interpolated.md)'s defect).
 
-Running `examples/abi_cost.rs` — which is what gate 1 *is* — settles it: on a
-plain heap tree it measures **1.34–1.46× against a 1.05 gate and prints FAIL**.
-The 1.020× in `docs/PHASE4.md` was real when written and has been stale since,
-because **the example is executed by no recipe and no workflow**; it appeared in
-one `justfile` comment. `just abi-cost` now runs it. There is no configuration
-in which the ABI currently costs 2% on this path.
+**What a C++ embedder should do, in order of leverage:**
 
-**The 1.34–1.46× is itself superseded** — see the amendment above. It is what
-the one-quotient gate read *before* `0023` interleaved the ladder, and the swing
-was in the comparand, not the ABI. The half of this paragraph that stands is the
-process failure: a benchmark no recipe runs is a benchmark nobody sanity-checks.
+1. **Use `tft_plan_at_many` on any hot path** — 41 ns of the 99.5 at a batch of
+   256. Sort the stamps.
+2. **Do not switch link mode expecting a win** (within 0.4%).
+3. A private (non-`shm`) arena does not pay this: `0023`'s ladder prices the
+   whole C ABI at R1 = 1.025–1.038×, **~6–9 ns on a ~245 ns lookup**.
 
-`docs/PHASE4.md` §7 records the failing gate; `docs/decisions/0022` carried the
-open question and has since closed it. **Its answer is the first item of the
-guidance below, not a new API**: `tft_plan_at_many` pays one guard per batch and
-recovers ~41 of the 43–47 ns the per-call guard costs, so the proposed
-`tft_guard` handle is declined. The counter flush, which that record's first item
-used to be, is withdrawn too — a C consumer attaches read-only and never reaches
-it.
-
-`MAP_SHARED` costing a lookup approximately nothing is what the two earlier
-arguments claimed — and they were right, but neither had established it, and
-both were defective in the direction that flattered the conclusion:
-
-- The **213 ns against 217 ns** row further down is two different harnesses in
-  two different processes compared as medians. It is unpaired, and this host's
-  run-to-run spread (~4%) is larger than the effect.
-- **`examples/heap_vs_shared`** (51.1 ns against 51.3 ns) is paired, but it
-  queries the single stamp `1_500_000_000` against samples laid down at
-  `1_000_000 + i * 1_000_000` — an exact grid hit at `i = 1499`. That is
-  [`0013`](../decisions/0013-the-benchmark-gate-never-interpolated.md)'s defect
-  exactly: `I::eval` never runs, so it compares `bracket` plus a seqlock read. If
-  a mapping costs anything it costs it on the loads the interpolation issues, and
-  that measurement never issues them.
-
-The conclusion survives both, but it now rests on a run that interpolates.
-
-**What a C++ embedder should do about it today**, in order of leverage:
-
-1. **Use `tft_plan_at_many` on any hot path.** It is the only lever that exists
-   now, and it is worth 41 ns of the 99.5 at a batch of 256. Sort the stamps —
-   the header says so, and the cursor is what the batch path is for.
-2. **Do not switch link mode expecting a win.** Static and shared measure within
-   0.4%, so LTO across the `.so` is not where this is recovered.
-3. Note that a private (non-`shm`) arena does not pay anything like this. On
-   `abi_cost.rs`'s three-edge heap tree at `[profile.embedder]`, `0023`'s pinned
-   ladder prices the whole C ABI as **R1 = 1.025–1.038×**, which `docs/PHASE4.md`
-   §7 reads as **~6–9 ns on a ~245 ns lookup**. This item used to call §7 gate
-   1's 1.020× "the honest figure for that configuration"; that citation is
-   withdrawn with the quotient itself, per the amendment above, and the +6 ns
-   decomposition is what replaces it. Do not quote §7's 189.1 / 194.8 ladder
-   here instead: that table is retained history, a `release`-profile reading of
-   the pre-pin shape, and its own section says not to compare it against the
-   current numbers.
-
-**The structural argument that used to close this subsection is withdrawn, and
-by the record it was written for.** It read that a per-call guard on a shared
-arena is [`docs/API.md`](../API.md) §1 R2's hot tier failing its own rule — the
-tier that never allocates, locks or converts — so the fix is new public API
-letting the C tier hold a guard across calls.
-[`0022`](../decisions/0022-the-per-call-guard-and-the-unwatched-gate.md)
-*Decision* item 4 withdrew it: `Guard::new` allocates nothing, takes no lock and
-waits for nothing, because since A1 collapsed the topology seqlock into one
-packed word, pinning a generation is a **single acquire load** and the rest of
-the constructor zeroes a cursor array. The cost is real and measured, but R2
-names allocating, locking, resolving a name and converting a representation, and
-that constructor does none of them. What stands is
-the decision recorded above — batch, and the `tft_guard` handle is declined —
-and, unchanged, that the C++ arm should be read as "what a C++ embedder gets
-today", not as "what the engine costs".
+The C++ arm reads as what a C++ embedder gets today, not what the engine costs.
 
 ### Where the win comes from
 
 tf_tree compiles the topology walk **once** into a `Plan` and thereafter only
-samples ([`PROJECT.md`](../PROJECT.md) §5 D3); tf2 walks per call. Benchmarking only that would
-be self-serving, so the suite also measures tf_tree recompiling a fresh plan for
-*every single query*:
+samples ([`PROJECT.md`](../PROJECT.md) §5 D3); tf2 walks per call. Replanning
+for every query:
 
 | Load | tf_tree (plan reused) | tf_tree (replanned every query) | tf2 |
 |---|---|---|---|
 | Fixture, depth 6 | 178 ns | 361 ns | 379 ns |
 | Recorded stream | 94 ns | 243 ns | 292 ns |
 
-Plan reuse is worth about 2x — and tf_tree stays ahead of tf2 *even when
-throwing the plan away every time*, so the sample path is faster on its own
-merits, not only the bookkeeping.
+Plan reuse is worth ~2x, and tf_tree stays ahead of tf2 even without it.
 
 ### Scaling with tree size and depth
 
@@ -437,8 +247,7 @@ Deepest-pair lookup, 256 queries per iteration.
 | 117 frames, depth 13 | 1031 ns | 5948 ns | **5.8x** |
 | 375 frames, depth 15 | 1193 ns | 7337 ns | **6.2x** |
 
-Both scale primarily with **depth**, not frame count: 117 -> 375 frames (3.2x the
-tree, two more levels) costs tf_tree 16% and tf2 23%.
+Both scale primarily with depth: 117 -> 375 frames costs tf_tree 16% and tf2 23%.
 
 ### Publish
 
@@ -446,48 +255,27 @@ tree, two more levels) costs tf_tree 16% and tf2 23%.
 |---|---|---|---|
 | One sample onto one edge | **9.4 ns** | 114 ns | **12.1x** |
 
-tf_tree's publish path is allocation-free; **tf2's is not** — it calls the
-allocator exactly once per stored transform (measured below). The earlier claim
-that both were allocation-free was wrong, and the earlier 14.1x ratio included a
-second allocation that was the shim's fault, not tf2's (bias 4 above).
-
-tf_tree's `push` takes no strings; the
-tf2 row hands the shim the `std::string`s a `FrameName` already owns and assigns
-them into the message, which is what a native C++ publisher does. The earlier
-139 ns figure was measured through a path that built a NUL-terminated copy of
-each name per call — two heap allocations charged to tf2 that a C++ caller never
-pays. The `push/tf2_alloc` row keeps that naive binding as a control: **187 ns**,
-so the marshalling was worth ~15 ns and a fully naive binding ~64 ns.
-
-Both caches are bounded, differently, and that difference is part of the comparison:
-tf_tree's ring is count-bounded (fixed power-of-two slots, overwritten in place,
-never allocating — invariant 8, enforced by the zero-allocation gate); tf2's
-cache is time-bounded and prunes on insert, here at the realistic 10 s default.
+tf_tree's publish is allocation-free; tf2 calls the allocator exactly once per
+stored transform. The `push/tf2_alloc` row keeps the naive binding (which builds
+a NUL-terminated copy of each name per call) as a control: **187 ns**. tf_tree's
+ring is count-bounded (power-of-two slots, overwritten in place, never
+allocating — invariant 8, enforced by the zero-allocation gate); tf2's cache is
+time-bounded and prunes on insert at its 10 s default.
 
 ### Concurrent read scaling — 1 / 2 / 4 / 8 threads
 
-**tf_tree's readers take no lock**; every `tf2::lookupTransform` acquires
-`BufferCore`'s internal frame mutex. One shared tree and one shared buffer, as
-both engines are meant to be used — per-thread buffers would erase the
-contention being studied. 101 rounds per point, engines **interleaved within
-every round** so drift lands on both equally.
-
-The tables below were **not** taken with a bare `just tf2-scaling`: the harness
-defaults are 51 rounds and 50,000 latency samples, and both were raised for this
-run. The exact command was
+tf_tree's readers take no lock; every `tf2::lookupTransform` acquires
+`BufferCore`'s frame mutex. One shared tree and one shared buffer; 101 rounds per
+point, engines interleaved within every round. The command (overrides go
+*inside* the quoted string — `run.sh` does not forward the host environment;
+bare `just tf2-scaling` runs 51 rounds / 50,000 samples, faster and noisier):
 
 ```bash
 ./docker/tf2/run.sh 'TF2_ROUNDS=101 TF2_LATENCY_SAMPLES=100000 \
   cargo run -p tf_tree_bench --features tf2 --release --bin tf2_scaling'
 ```
 
-(the overrides go *inside* the quoted command — `run.sh` does not forward the
-host environment into the container). `just tf2-scaling` runs the same harness
-at its defaults, which is faster and noisier.
-
-Throughput, million lookups/s, recorded stream. `spread` is
-`(best - median)/best` for that cell — small means the machine was quiet, and it
-is quoted because it is what makes the 4-thread row interpretable:
+Million lookups/s, recorded stream; `spread` is `(best - median)/best`:
 
 | Threads | tf_tree | spread | tf2 | spread | Ratio | tf_tree vs 1thr | tf2 vs 1thr |
 |---|---|---|---|---|---|---|---|
@@ -496,34 +284,14 @@ is quoted because it is what makes the 4-thread row interpretable:
 | 4 | 35.44 | 24.0% | 1.31 | 49.9% | 27.0x | 2.79x | **0.36x** |
 | 8 | 68.02 | 29.1% | 1.13 | 4.5% | **60.3x** | 5.35x | **0.31x** |
 
-tf_tree scales; **tf2 anti-scales** — more threads make it slower than one
-thread, the signature of a contended global mutex.
+tf_tree scales; **tf2 anti-scales**, the signature of a contended global mutex.
+The 4-thread row is the noisiest here (every other row repeats within 1%): with 4
+physical cores, 4 threads exactly matches the core count, so which SMT sibling
+each thread lands on decides the result and nothing pins it.
 
-tf_tree's one-thread figure moved from 10.64 to 12.70 M/s against the previous
-edition of this table; that is the interpolation work in
-[`docs/design/fast-path.md`](../design/fast-path.md) §11, not a change of method.
-
-**The 4-thread row is the noisiest point in the whole suite, and now it is
-labelled as such.** A previous edition of this document carried an unexplained
-discrepancy there (1.56 vs 1.39 M/s for tf2 across two back-to-back runs) and
-flagged it as unresolved. Two fresh runs on an idle host reproduce the
-instability rather than the value — tf_tree 38.20 then 35.44 M/s, tf2 spread
-reaching 49.9% — while every other row repeats to within 1% (8 threads: 68.09
-then 68.02). The explanation is the host: with 4 physical cores, 4 threads is the
-point where the runnable set exactly matches the core count, so which SMT sibling
-each thread lands on decides the result and nothing pins it. It is not a
-measurement to be re-taken until it settles; it is a row this hardware cannot
-measure precisely.
-
-**This is tf2's behaviour, not an artifact of our binding.** The pure C++ control
-(`docker/tf2/native_scaling.sh`, no Rust, no FFI, same stream, same queries)
-reproduces it. Both were re-run back-to-back on the same host so the columns are
-directly comparable (which is why the bridge's 4-thread figure here is 1.39
-rather than the noisier 1.56 of the run tabulated above), and the control sweeps **exactly** the Rust harness's
-`common_window` (max of the per-edge first stamps to min of the per-edge last
-stamps — it previously ran to the global last stamp, so ~11% of its queries were
-past the end of the shortest edge and answered by tf2's throw path rather than
-its lookup path):
+**This is tf2's behaviour, not our binding's.** The pure C++ control
+(`docker/tf2/native_scaling.sh`, sweeping exactly the Rust harness's
+`common_window`), re-run back-to-back:
 
 | Threads | native C++ tf2 M/s | via our bridge M/s | native vs 1thr | bridge vs 1thr |
 |---|---|---|---|---|
@@ -532,11 +300,7 @@ its lookup path):
 | 4 | 1.38 | 1.39 | 0.36x | 0.38x |
 | 8 | 1.12 | 1.12 | **0.30x** | **0.31x** |
 
-The bridge is within 4% of native at one thread and within 1% at two, four and
-eight — it costs a little on an uncontended call and nothing once the mutex
-dominates. The collapse is tf2's.
-
-The tail is starker than the throughput. Per-lookup latency, recorded stream:
+Per-lookup latency, recorded stream:
 
 | Threads | Engine | p50 | p99 | p99.9 | p99.99 |
 |---|---|---|---|---|---|
@@ -545,60 +309,28 @@ The tail is starker than the throughput. Per-lookup latency, recorded stream:
 | 8 | tf_tree | 151 ns | 220 ns | **331 ns** | 7.1 us |
 | 8 | tf2 | 3.4 us | 47 us | **83 us** | 204 us |
 
-At 8 threads tf_tree's p99.9 is 331 ns against tf2's 83 us — a factor of **252**.
-For a control loop that is the difference between a bounded and an unbounded
-worst case, and it is the strongest result in this document: unlike the
-throughput ratio it does not depend on core count, and unlike the single-threaded
-ratio it is not sensitive to any FFI residue.
+At 8 threads p99.9 is 331 ns against 83 us — a factor of **252**. It does not
+depend on core count or FFI residue, and it is the strongest result here. tf_tree's
+tail stays bounded; tf2's degrades ~14x faster than its median, which is what a
+convoy looks like.
 
-Note the shape, not just the size. tf_tree's p50 rises 110 -> 151 ns from 1 to 8
-threads and its p99.9 rises 179 -> 331 ns: both grow slightly and stay bounded.
-tf2's p50 rises 291 ns -> 3.4 us and its p99.9 rises 1.2 us -> 83 us — the tail
-degrades ~14x faster than the median, which is what a convoy looks like.
-
-**Caveat on the scaling factor, and the gate.** This host has **4 physical
-cores**; tf_tree's 5.35x (recorded) / 5.62x (fixture) at 8 threads is SMT-assisted
-and is not a clean scaling number. The harness prints the physical core count for
-exactly this reason.
-
-[`PHASE1.md`](../PHASE1.md) §11.3's third gate criterion is "read throughput
-scales at least **6x** from 1 to 8 threads". **Measured 5.35x-5.62x, so the
-criterion is not met as written** — but it cannot be fairly evaluated on this
-machine, because 8 threads on 4 cores can only exceed 4x through SMT at all. The
-honest reading is that tf_tree reached 2.79x-3.09x at 4 threads on 4 cores and
-then gained a further ~1.8x from hyperthreading. Re-running on a host with >= 8
-physical cores is the only way to settle it; §11.3 asks for dedicated pinned
-hardware for precisely this reason.
-
-What the criterion was actually protecting is not in doubt. Its stated purpose is
-that "if tf_tree scales cleanly, the value proposition is your perception nodes
-stop contending". Against an engine that goes *backwards* — 0.31x at 8 threads —
-a 5.4x that is core-count-limited rather than contention-limited settles that
-question regardless of where it lands against 6.
-
-Two internal cross-checks that the harness measures what it claims: for each
-engine, p50 minus the ~20 ns timer overhead matches the figure implied by its
-independently batch-timed throughput.
+**The scaling gate.** [`PHASE1.md`](../PHASE1.md) §11.3's third criterion is
+"read throughput scales at least **6x** from 1 to 8 threads". **Measured
+5.35x-5.62x: not met as written**, but not fairly evaluable on 4 physical cores,
+where 8 threads exceed 4x only through SMT (tf_tree reached 2.79x-3.09x at 4
+threads). Only a host with >= 8 physical cores settles it. The criterion's
+purpose — that perception nodes stop contending — is answered by 0.31x for tf2.
 
 ## Memory and computation
 
-Reproduce with `just footprint`. Unlike every timing row above, **these numbers
-do not need an idle machine**: `cachegrind` and `memcheck` simulate, so the
-counts are exact and reproducible under load. They are also the only rows here
-that survive a change of CPU.
+`just footprint`. Unlike every timing row, **these need no idle machine**:
+`cachegrind` and `memcheck` simulate, so counts are exact and reproducible, and
+survive a change of CPU. Each engine runs in its **own process**, so one's freed
+chunks cannot satisfy the other's requests. Memory is `mallinfo2`'s `uordblks +
+hblkhd` (not RSS); `hblkhd` matters because tf_tree's arena is one allocation
+above glibc's 128 KiB mmap threshold.
 
-Each engine is measured in its **own process**. Building both in one would let
-the first engine's freed chunks satisfy the second's requests, making whichever
-ran second look cheaper by an amount nobody can bound.
-
-Memory is `mallinfo2`'s `uordblks + hblkhd`, not RSS. RSS is page-granular and
-includes text and stacks; `mallinfo2` is glibc's own accounting, and since C++
-`operator new` bottoms out in `malloc` it measures the C++ and the Rust engine on
-identical terms. The `hblkhd` term is not optional: tf_tree's arena is a single
-allocation above glibc's 128 KiB mmap threshold, so `uordblks` alone would report
-it as using almost nothing.
-
-### Memory — identical topology, identical 10 s of history (12,600 samples)
+### Memory — identical topology, 10 s of history (12,600 samples)
 
 | | tf_tree | tf2 |
 |---|---|---|
@@ -609,17 +341,13 @@ it as using almost nothing.
 | Allocations per published transform | **0** | 1.00 |
 | Allocations per lookup | **0** | **0** |
 
-**tf_tree is not meaningfully smaller — it is within 2.4%.** That is worth
-stating plainly, because the arena design invites the assumption that it would
-win here, and it does not.
+**tf_tree is not meaningfully smaller — within 2.4%.**
 
-#### Measured again with no binding on either side, and one row moved
+#### With no binding on either side
 
-The table above puts tf2 behind `tf_tree_tf2_sys`, so the process being weighed
-is a Rust binary linking tf2. `just tf2-native-footprint`
-(`docker/tf2/native_footprint.cpp`) removes that: a C++ program linking only
-`libtf2`, against `footprint`'s unchanged `mem-tf_tree` mode, two processes, the
-same `.tfstream` and the same two instruments.
+`just tf2-native-footprint` (`docker/tf2/native_footprint.cpp`, a C++ program
+linking only `libtf2`) against `footprint`'s `mem-tf_tree` mode, two processes,
+same `.tfstream`:
 
 | | tf_tree (Rust) | tf2 (native C++) | ratio |
 |---|---|---|---|
@@ -628,80 +356,34 @@ same `.tfstream` and the same two instruments.
 | **`pss_kib` delta** | **1 272** | 1 332 | **1.047** |
 | bytes per *declared slot* | **73.5** | n/a | — |
 
-**The binding was not inflating tf2's memory.** Native C++ measures 112.7 B per
-stored sample against the binding's 112.8 — so the tie reported above was
-honest, and this is a confirmation rather than a correction.
-
-**The two instruments used to disagree in direction, and fixing that is what
-`0021` did.** When this comparison was first built `heap_bytes` was a tie while
-Pss — the number an operator reads in `top` — was a **1.32× loss**: 1 752 KiB
-against 1 324. `mallinfo2` cannot see residency, and tf_tree's arena is *one*
-allocation that was ~100% resident because `alloc_zeroed` above 16-byte
-alignment falls back to `posix_memalign` plus an explicit zero-fill touching
-every page.
-
+The binding did not inflate tf2's memory. `mallinfo2` cannot see residency;
 [`0021`](../decisions/0021-the-idle-arena-is-resident-because-of-its-alignment.md)
-over-allocates at 16 and aligns to 64 by hand, so `calloc` returns
-demand-faulted pages. **The row is now 1 272 against 1 332 — the sign is
-reversed**, and `heap_bytes` did not move by a single byte, which is the
-cross-check that this changed residency rather than allocation. The 464 KiB
-saving was predicted at 466 KiB beforehand (6 472 declared-but-never-published
-slots × 72 B); predicting it first is the only reason to believe the mechanism
-is understood.
+over-allocates at 16 and aligns to 64 by hand so `calloc` returns
+demand-faulted pages, saving 464 KiB of Pss (predicted 466 KiB: 6 472
+never-published slots × 72 B) with `heap_bytes` unchanged. `heap_bytes` is exact
+and bit-identical across runs; `pss_kib` is page-quantised, stable to ~3%
+(1704–1752 over five runs).
 
-`heap_bytes` is exact and bit-identical across runs; `pss_kib` is a
-page-quantised whole-process delta, stable to ~3% (1704–1752 over five runs).
+tf_tree's rings are sized by *declared capacity*: `Capacity::history` rounds
+each ring up to a power of two (1 kHz over 10 s asks for 10,000 slots, reserves
+16,384). At 72.9 B/slot — a 64 B `PoseSlot` plus an 8 B stamp; the arena stores
+the atomics the seqlock requires and an `Iso3` never enters it
+([`0042`](../decisions/0042-the-cacheline-the-arena-never-asked-for.md)) —
+tf_tree is 1.56x denser per unit of capacity, and this fixture's rounding (19 072
+slots for 12 600 samples) hands almost all of that back. Right-sized it would
+hold 73.5 B/sample against tf2's 112.7 (**1.53×**).
 
-**And the achievable figure is in the last row.** tf_tree holds 111.2 B per
-stored sample but its *declared-slot* cost is 73.5 B: this fixture reserves
-19 072 slots for 12 600 samples, a factor of 1.51. Right-sized, tf_tree would
-hold **73.5 B/sample against tf2's 112.7 — 1.53×** rather than 1.01×. That is
-the same 1.56× density this document already claimed two paragraphs down; what
-is new is that it is now measured against a native tf2 in one place, with both
-figures printed side by side.
-
-The two per-sample figures differ because tf_tree's rings are sized by *declared
-capacity*, not by what is stored: `Capacity::history` rounds each ring up to a
-power of two, so a 1 kHz edge over 10 s asks for 10,000 slots and reserves
-16,384. At 72.9 B/slot (a 64 B `PoseSlot` plus an 8 B stamp — **the slot is a
-`PoseSlot`, not an `Iso3`**, and this read "a 64 B cacheline-padded `Iso3`" until
-[`0042`](../decisions/0042-the-cacheline-the-arena-never-asked-for.md), which is
-the misattribution that record exists to correct: the arena stores atomics the
-seqlock requires and an `Iso3` never enters it. The 72.9 figure is unchanged)
-tf_tree is 1.56x denser than tf2 per unit of capacity, and this fixture's
-rounding hands almost all of that back. Fixed capacity that never reallocates is
-the point of the design; the rounding is what it costs.
-
-**The real difference is on the write path, not the read path.** Both engines
-turn out to be allocation-free per lookup — that is a genuine tf2 result, and the
-naive expectation that a C++ `std::map` engine must be allocating on reads is
-simply wrong when the caller passes prebuilt string handles. But tf2 allocates
-and frees **once per published transform**, forever. A robot publishing ten
-dynamic edges at 1 kHz puts 10,000 malloc/free pairs per second through the
-allocator; tf_tree puts through zero, and its lifetime allocations all happen
-before the first lookup.
-
-**This paragraph used to say "its 96 lifetime allocations" and the table above
-says 108; the two never agreed and nothing reconciled them.** Re-measured under
-`memcheck`: they are *different modes* of `footprint`. `lookup-tf_tree` builds
-the full §11.1 fixture and compiles a plan — **108 allocations**. `push-tf_tree`
-builds a one-dynamic-edge tree — **94**. Neither figure was wrong; the prose was
-quoting the push mode's number against the lookup mode's table.
-
-What both modes actually establish is stronger than either count, and it is the
-claim worth making: the totals are **identical at N = 0 and N = 10 000** —
-108 against 108, and 94 against 94. Not "few allocations per operation":
-*none*.
-
-That figure was 2.00 before bias 4 was found and fixed — the extra one was the
-shim's, not tf2's. The remaining one is genuine: tf2 stores each transform in a
-per-frame node it must allocate, which is the direct cost of a container that
-grows to fit what it is given rather than reserving a fixed ring.
+**The real difference is the write path.** Both engines are allocation-free per
+lookup (given prebuilt string handles), but tf2 allocates and frees once per
+published transform, forever: ten dynamic edges at 1 kHz is 10,000 malloc/free
+pairs a second. tf_tree's lifetime allocations all precede the first lookup —
+totals are **identical at N = 0 and N = 10 000** (108 for `lookup-tf_tree`, 94 for
+`push-tf_tree`, which builds a one-dynamic-edge tree). tf2's one allocation per
+transform is a per-frame node in a container that grows to fit.
 
 ### Computation — per lookup, three dynamic steps, 100 ms query window
 
-Baseline-subtracted: mode `N=0` performs the full setup and no lookups, so
-subtracting it removes construction, teardown and process start exactly.
+Baseline-subtracted (mode `N=0` performs setup and no lookups).
 
 | Per lookup | tf_tree `LerpSlerp` | tf_tree `ScLerp` | tf2 |
 |---|---|---|---|
@@ -712,87 +394,37 @@ subtracting it removes construction, teardown and process start exactly.
 | — of which *indirect* | **0.00002** | 0.00002 | **6.00** |
 
 Against tf2 on the comparable policy: **1.97x fewer instructions, ~8,000x fewer
-L1-D misses, and effectively zero indirect branch mispredicts against six.**
+L1-D misses, and effectively zero indirect mispredicts against six.** The six are
+virtual dispatch through `TimeCacheInterface`; a compiled `Plan` is a flat
+`[Step; 16]` with no dynamic dispatch. Indirect targets are a structural property,
+not a predictor artifact.
 
-Re-measured 2026-07-26 after the layout-kernel work; the previous run read
-2,105 instructions, 18.5 L1-D misses and 8.16 mispredicts for tf_tree. The
-change is small and in the right direction, and it is recorded rather than
-quietly overwritten so that a later regression has something to be a regression
-*from*. These are simulated counts, so unlike every timing table here they are
-exact and reproducible under load — which is why they are the numbers to watch.
+Caveats. LL-D misses are ~0 for both because the 1.4 MB working set fits in L3;
+a tree that falls out of L3 would widen the gap (a prediction, not measured). The
+instruction ratio (1.97x) is smaller than the wall-clock ratio (2.7x); the
+remainder is likely mispredicts, caches and tf2's mutex, but attributing it
+needs cycle counters this host does not permit (`perf_event_paranoid=4`).
+Cachegrind's predictor is a simple two-level model, not a Zen 3 TAGE: compare
+engines under it, do not read "7.70" as a real CPU's count.
 
-The six indirect mispredicts are virtual dispatch — tf2 reaches its per-frame
-caches through `TimeCacheInterface`, and the target is unpredictable because a
-walk visits a different frame each step. tf_tree's compiled `Plan` is a flat
-`[Step; 16]` with no dynamic dispatch anywhere on the path, so the indirect
-predictor is never consulted.
-
-**Two caveats that cut against the headline.** First, LL-D misses are ~0 for
-*both* engines: this fixture's whole working set is 1.4 MB and fits in L3, so
-tf2's 15.3 L1 misses per lookup are being served by L2/L3, not DRAM. On a tree
-large enough to fall out of L3 those become memory accesses and the gap widens —
-but that is a prediction, and it is not measured here. Second, the instruction
-ratio (1.97x) is *smaller* than the measured wall-clock ratio (2.7x), so roughly
-a third of the observed speed advantage is not explained by executing fewer
-instructions. The mispredict and cache columns are the likely remainder, along
-with tf2's per-lookup mutex, but attributing it precisely needs cycle counters
-this host does not permit (`perf_event_paranoid=4`).
-
-A third caveat applies to the mispredict column specifically: **cachegrind's
-branch predictor is a simple two-level model, not a Zen 3 TAGE.** Comparing two
-engines under the same model is sound, and that is all this table does; reading
-"7.70" as the count a real CPU incurs is not. Acting on that distinction matters
-— that figure was first read as the bracket search's data-dependent branch,
-and an early branchless rewrite recovered only 0.46 of it, which was written up
-here as "LLVM had already emitted a `cmov`". **That explanation was wrong**, and
-per-line profiling (`just profile-lookup`, once it worked) shows why: 99.97% of
-`sample.rs`'s mispredicts really are in the bracket loop —
-
-    248,173  base += half * cmp;
-    131,112  while len > 1 {
-
-— so the search was the right suspect all along. `half * cmp` reads as
-branchless and is not; the backend emits a branch for it. Replacing the
-multiply with a mask (`half & (0 - cmp)`) moves simulated mispredicts
-7.70 -> 7.32 per lookup and wall-clock by **-2.8% at depth 3 / sclerp, -1.5% at
-depth 3 / lerpslerp, -1.2% at depth 6**, with no change at depth 1 and no change
-in instruction count. Confirmed over two runs; the first run's apparent +3.3% at
-depth 1 did not reproduce (p = 0.09).
-
-**CORRECTION (2026-09-06).** That parenthesis used to read *"an AND the backend
-cannot turn back into control flow"*, and it is the **second** wrong mechanism
-this paragraph has carried for the same residual. The backend can and does:
-LLVM folds `x & sext(cmp)` back into a `select`, and because the select sits on
-the loop-carried dependency chain the x86 cmov-conversion pass expands it into
-a conditional branch — in every inlined copy in the shipped `--release` rlib.
-So the 0.38 mispredicts per lookup the mask bought is a cheaper loop body, not
-an erased branch, and **the 7.32 that remained is the branch still being
-there**. [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) carries the disassembly, a
-cachegrind table over four spellings of the line, and why none of the three
-alternatives has landed.
-
-The lesson stands, just not the one originally drawn: the simple predictor
-model was not the problem, the *absence of line-level data* was
-
-The corresponding tf2 number, 6.00 *indirect* mispredicts, is on firmer ground:
-indirect targets are a structural property of virtual dispatch, not an artifact
-of predictor modelling, and a compiled `Plan` has no indirect branches at all.
+99.97% of `sample.rs`'s mispredicts are in the bracket loop (`base += half * cmp`
+and `while len > 1`, per-line via `just profile-lookup`). Replacing the multiply
+with a mask (`half & (0 - cmp)`) moves simulated mispredicts 7.70 -> 7.32 and
+wall-clock by -2.8% (depth 3 / sclerp), -1.5% (depth 3 / lerpslerp), -1.2%
+(depth 6). It is a cheaper loop body, not an erased branch: LLVM folds the mask
+back into a `select` and cmov-conversion expands it to a branch in every inlined
+copy. [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) carries
+the disassembly and the four spellings.
 
 ## Multi-process: the comparison tf2 cannot enter
 
-Reproduce with `just shm-scaling` (Linux, `--features shm`). Two back-to-back
-runs on an idle host; every row below repeated to within 1% except where noted.
+`just shm-scaling` (Linux, `--features shm`); two back-to-back idle runs, rows
+repeat within 1%. Robot software deploys as separate executables, so this is the
+deployment shape, not the thread table.
 
-Robot software is deployed as *separate executables* — perception, planning,
-control — not as threads in one process. So the thread-scaling table above,
-where tf_tree already wins, is not actually the deployment shape. This is.
-
-**`tf2::BufferCore` has no shared-memory mode.** Every process needing
-transforms runs its own `tf2_ros::TransformListener`, which subscribes to `/tf`,
-deserializes every message, and maintains a private, complete copy of the
-history. N consumers therefore cost N buffers, N deserialization pipelines and
-N-way DDS fan-out — and the copies drift apart in time, because each is updated
-by its own callback thread. tf_tree maps one arena N times.
+**`tf2::BufferCore` has no shared-memory mode.** Each process runs its own
+`tf2_ros::TransformListener`: N buffers, N deserialization pipelines, N-way DDS
+fan-out, and copies that drift apart. tf_tree maps one arena N times.
 
 | Processes | Aggregate M/s | ns/lookup | vs 1 proc | Unique resident | tf2 history would be *(arithmetic)* |
 |---|---|---|---|---|---|
@@ -801,127 +433,57 @@ by its own callback thread. tf_tree maps one arena N times.
 | 4 | 15.43 | 257 | 3.31x | 9.9 MiB | 5.4 MiB |
 | 8 | 18.17 | 431 | 3.90x | 18.7 MiB | 10.8 MiB |
 
-**Scaling is bounded by cores, not by the design.** This host has 4 physical
-cores, and 4 processes x 213 ns/lookup is a 18.8 M/s roofline; the 8-process row
-measures 18.2, i.e. **the readers saturate the machine**. The 8-process row
-oversubscribes 2:1, which is why its per-lookup latency doubles while aggregate
-throughput stays flat — the correct and expected shape, not contention. There is
-no lock for the processes to contend on.
+**Scaling is bounded by cores, not by design.** 4 processes × 213 ns is an
+18.8 M/s roofline and the 8-process row measures 18.2. Eight processes on four
+cores each get 50% of a core, so 213 ns should become 426 ns; **measured 431 ns**
+— ~1% left for any cross-process cost. There is no lock to contend on. Multi-
+process scaling at 4 (3.31x) beats multi-thread (2.79-3.09x): separate address
+spaces share no allocator, TLS or false-shared lines.
 
-That last claim is checkable rather than rhetorical. Eight processes sharing four
-cores each get 50% of a core, so a lookup that takes 213 ns at full speed should
-take 426 ns. **Measured: 431 ns.** The 8-process row is pure oversubscription,
-with ~1% left over for anything else — there is no hidden cross-process cost to
-go looking for.
+The `tf2 history would be` column is **arithmetic**, `n × 1 421 392 B` (the
+`footprint` figure multiplied out); no tf2 process ran behind it, and timing a
+real `tf2_ros` listener would drag DDS in. **`Unique resident` is Pss-derived,
+not RSS**, despite the `rss` metric ids in `scale_sweep.rs` and `soak.rs`, which
+are frozen join keys for `bench_ab` and the baseline differ. Summed RSS
+double-counts the arena; the remaining ~2.2 MiB per-process growth is
+executable, stack and libc.
 
-One inference, flagged as such because this host's `perf_event_paranoid` forbids
-the counters that would confirm it: because the arena is *shared*, N processes
-touch the **same cache lines**, so the cache footprint of transform data is
-**The `tf2 history would be` column is arithmetic and no tf2 process has ever
-run behind it** — it is `n x 1 421 392 B`, the `footprint` figure multiplied out
-(`shm_scaling.rs:189`). It is kept because the extrapolation is the honest shape
-of the argument, but `just tf2-native-footprint` now measures a native C++ tf2
-in its own process, so the multiplicand is at least a measured one. Replacing
-the column with per-N measurements is straightforward and unbuilt.
-
-Also: **`Unique resident` is Pss-derived, not RSS**, despite the metric ids in
-`scale_sweep.rs` and `soak.rs` saying `rss`. Those ids are the join keys
-`bench_ab` and the baseline differ compare on, so they are frozen — renaming one
-un-compares every run file written before the rename and reads as a vanished row
-to the gate. The instrument was always Pss; only the labels were wrong, and the
-labels are fixed.
-
-independent of consumer count. tf2's N private buffers would be N x 1.4 MB of
-distinct lines — 5.6 MB at four consumers, past many L3s. This is consistent with
-the 4-process row costing only 21% more per lookup than one process, but it is
-not measured.
-
-Two things worth noting against the thread table above. Multi-**process** scaling
-at 4 (3.31x) is slightly *better* than multi-thread scaling at 4 (2.79-3.09x):
-separate address spaces share no allocator, no TLS and no false-shared cache
-lines. And per-lookup cost at one process is 213 ns against the 217 ns
-`cost_model` measures in-process for the same three-dynamic-step chain, which
-points at there being no penalty for the arena being shared.
-
-**On its own that comparison does not carry the claim**, and it used to be
-asserted here as though it did. It is two harnesses in two processes compared as
-medians — unpaired, against a run-to-run spread (~4%) larger than the effect. The
-claim is true and is now measured properly by `just abi-split`, which runs both
-backings paired in one process on an off-grid sweep: the shared mapping costs
-**≤ 9.6 ns** across nine runs, and ~1.8 ns typically. See "The 52% is the boundary, not the mapping" above.
-
-The memory columns need care, and getting them wrong would have flattered the
-design in the wrong place. Summing each process's RSS **double-counts** the
-arena, because every mapper's `/proc/self/statm` includes pages that are
-physically resident once. "Unique resident" subtracts the `(n-1)` redundant
-copies. The remaining per-process growth (~2.2 MiB) is executable, stack and
-libc — not transform data.
-
-The last column is **arithmetic, not a measurement**, and is labelled as such
-here and in the tool's own output: `n` x the 1,421,392 B `just footprint`
-measured for one `BufferCore` on this fixture. Timing a real `tf2_ros` listener
-would drag DDS into the comparison, which every other row in this document is
-careful to exclude — so the structural cost is stated as arithmetic rather than
-measured badly.
+One unmeasured inference (`perf_event_paranoid` forbids the counters): N
+processes touch the same cache lines, so the transform data's cache footprint is
+independent of consumer count, where tf2's N private buffers are N × 1.4 MB
+(5.6 MB at four, past many L3s); the 4-process row costing only 21% more per
+lookup is consistent with it. The 213 ns figure against `cost_model`'s 217 ns is
+unpaired; the paired shared-mapping measurement is `just abi-split` (above).
 
 ### The multi-process *node* evaluation — methodology
 
-`just shm-scaling` above answers a roofline question: *how many lookups can N
-processes extract from one arena in total?* That is a property of the machine.
-The question an integrator actually has is different — **N nodes each need
-transforms at their own rate; what does each experience, and what does it
-cost?** — and `just mp-bench` is the harness for it. Five things had to change,
-and each was a defect in the old one:
+`just shm-scaling` is a roofline question. `just mp-bench` asks what N nodes,
+each needing transforms at its own rate, experience and cost:
 
-1. **Open loop, not a tight loop.** A tight loop is a *closed-loop* generator:
-   the next request starts when the last finishes, so a slow response reduces
-   the offered load and every recorded sample still looks fast. That is
-   **coordinated omission**, and it is why a saturating loop reports a beautiful
-   p99.9 for a system that is visibly stuttering. The new harness fixes the
-   schedule in advance — tick `i` is due at `t0 + i/rate` — and measures from the
-   *intended* time, so a node that falls behind reports the backlog.
-2. **A publisher runs throughout.** The old harness read a quiescent tree:
-   nothing exercised the seqlock retry path, nothing invalidated the readers'
-   cache lines, and — decisively for the comparison — nothing ever held
-   `tf2::BufferCore`'s mutex.
-3. **Two clocks, reported separately.** `service` is work-start to done: what
-   the engine costs. `cycle` is intended-tick to done: what the node
-   experiences. At 100 Hz the second is ~95% OS wakeup latency, so reporting
-   only it would make every engine look identical and excellent; reporting only
-   the first would hide that a node's real latency is mostly not up to the
-   engine at all.
-4. **CPU per consumer.** §12.4's industrial claim is that tf_tree is *O(1) in
-   the number of consumers* where `/tf` is O(consumers × edges × rate). Nothing
-   measured it. A flat CPU column is that claim holding.
-5. **PSS, not summed RSS.** Summed RSS counts a shared page once per mapper.
-   The earlier table corrected for it by subtracting a known arena size, which
-   only works because we know it; PSS is the kernel's own answer and is equally
-   correct for tf2's private per-process buffers.
+1. **Open loop, not a tight loop.** Tick `i` is due at `t0 + i/rate` and latency
+   is measured from the *intended* time, so a stalled node reports the backlog
+   instead of hiding it (coordinated omission).
+2. **A publisher runs throughout**, so the seqlock retry path and
+   `tf2::BufferCore`'s mutex are actually exercised.
+3. **Two clocks.** `service` is work-start to done (engine cost); `cycle` is
+   intended-tick to done (node experience). At 100 Hz `cycle` is ~95% OS wakeup.
+4. **CPU per consumer**, testing §12.4's claim that tf_tree is O(1) in consumers
+   where `/tf` is O(consumers × edges × rate).
+5. **PSS, not summed RSS.**
 
-**The tf2 column will be a floor, and must be labelled as one.** Every other row
-in this document excludes middleware, because for a single-process
-library-vs-library comparison DDS would measure the transport rather than the
-engine. That reasoning does not survive this question: across processes the
-transport **is** tf2's mechanism — there is no other way for a second process to
-obtain the tree. So `mp-bench-tf2` measures N private `BufferCore`s fed the
-identical stream, which shows the duplication that having no shared arena forces
-and nothing else. A deployed consumer additionally pays a `TransformListener`
-and its DDS fan-out, and the write-up must say so rather than let the floor be
-read as the cost.
+**The tf2 column is a floor and must be labelled one.** Across processes the
+transport *is* tf2's mechanism, so `mp-bench-tf2` measures N private
+`BufferCore`s fed the identical stream, showing only the duplication; a deployed
+consumer also pays a `TransformListener` and DDS fan-out. The harness refuses to
+run on a busy machine, naming the top CPU consumers; each row carries its
+foreign-load percentage and is `NOISY` above 10%.
 
-**The harness refuses to run on a busy machine**, naming the top CPU consumers.
-That guard exists because the first run of it was taken on a host carrying an
-unrelated 600%-CPU job and nothing in the output said so. Every row also carries
-its own measured foreign-load percentage and is flagged `NOISY` above 10%, so a
-contaminated row cannot be published by accident.
+### Results
 
-### The multi-process node evaluation — results
-
-`just mp-bench-tf2`, 2026-07-26. Both engines in the same container on the same
-host, back to back: AMD EPYC-Milan, **4 physical cores / 8 SMT threads**,
-`taskset -c 0-7`, 100 Hz × 6 s per point, 8 lookups per tick, depth-3 chain, a
-publisher running throughout. Foreign load 1–7% on every row; none flagged
-`NOISY`.
+`just mp-bench-tf2`, 2026-07-26. Same container and host: AMD EPYC-Milan, 4
+physical cores / 8 SMT threads, `taskset -c 0-7`, 100 Hz × 6 s per point, 8
+lookups per tick, depth-3 chain, publisher running throughout. Foreign load
+1–7%; none `NOISY`. Times in microseconds.
 
 **tf_tree**
 
@@ -933,7 +495,7 @@ publisher running throughout. Foreign load 1–7% on every row; none flagged
 | 8 | 2.11 | 4.86 | 16.64 | 64.8 | 88.1 | 2801.7 | 0.112 | 11.83 |
 | 16 | 1.93 | 4.19 | 15.68 | 64.5 | 79.4 | 630.8 | 0.108 | 16.96 |
 
-**tf2** (floor — see above)
+**tf2** (floor)
 
 | nodes | svc p50 | svc p99 | svc p99.9 | cyc p50 | cyc p99 | cyc p99.9 | CPU %/node | PSS MiB |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -943,49 +505,33 @@ publisher running throughout. Foreign load 1–7% on every row; none flagged
 | 8 | 14.91 | 29.70 | 53.25 | 76.3 | 102.9 | 1097.7 | 0.226 | 18.57 |
 | 16 | 14.72 | 29.18 | 64.26 | 76.8 | 101.9 | 704.5 | 0.229 | 41.12 |
 
-Times are microseconds. What the two tables say:
+- **Service latency: 5.0× at one node, 7.6× at sixteen** (15.94 -> 3.22 µs;
+  14.72 -> 1.93 µs), 7.0× at p99. tf_tree's median falls with consumers while
+  tf2's is flat; consumers do not make tf_tree slower, which is the deployment
+  question.
+- **CPU per node: 2.1×** at sixteen (0.229% vs 0.108%). tf_tree's *falls* from
+  0.139% to 0.108% across 16× the consumers (`PHASE2.md` §12.4); tf2's is flat
+  at ~0.23% because the floor has no `TransformListener` deserializing `/tf`.
+- **Memory: 2.4× at sixteen** (41.12 vs 16.96 MiB PSS); per marginal node 2.39 vs
+  0.86 MiB, **2.8×**. tf_tree's marginal megabyte is process overhead, not tree
+  data.
+- **Cycle latency is not an engine measurement**: both sit near the 100 Hz OS
+  wakeup (65 vs 77 µs p50), and p99.9 is the scheduler running up to 16 processes
+  on 4 cores.
 
-- **Service latency: 5.0× at one node, 7.6× at sixteen** (15.94 → 3.22 µs;
-  14.72 → 1.93 µs), and 7.0× at p99. The gap *widens* with node count because
-  tf_tree's median falls as consumers are added while tf2's is flat — the shared
-  arena stays warm across readers, whereas each `BufferCore` must warm its own.
-  This is not a claim that consumers make tf_tree faster; it is a claim that they
-  do not make it slower, which is the deployment question.
-- **CPU per node: 2.1× (0.229% vs 0.108% at sixteen nodes)**, and — the actual
-  `PHASE2.md` §12.4 claim — tf_tree's *falls* from 0.139% to 0.108% across a 16×
-  increase in consumers while tf2's stays flat at ~0.23%. Both are O(1) in
-  consumers here; only tf_tree is O(1) *and* cheap. tf2 being flat is a property
-  of the floor: with a real `TransformListener` each consumer would deserialize
-  the full `/tf` stream itself, which is where the O(consumers) term enters.
-- **Memory: 2.4× at sixteen nodes (41.12 vs 16.96 MiB PSS)**, or per *marginal*
-  node, 2.39 MiB against 0.86 MiB — **2.8×**. tf_tree's marginal megabyte is
-  process overhead (binary, stacks, allocator), not tree data; the arena is
-  counted once no matter how many map it, which is the point of PSS here.
-- **Cycle latency is not an engine measurement** and is reported to show that.
-  Both sit near the 100 Hz OS wakeup (65 µs vs 77 µs p50, the ~12 µs gap tracking
-  the service difference), and the p99.9 column is the scheduler on a 4-core host
-  running up to 16 processes. Rows at 8 and 16 nodes oversubscribe the physical
-  cores 2:1 and 4:1; read their tails as a property of this host, not of either
-  library.
-
-**Caveats that belong with these numbers.** One run per point, no repeats, so
-treat single-row differences under ~10% as noise — the trends across five rows
-are what carry weight, not any one cell. The tf2 column is a floor with no
-transport, as set out above. And this is a 4-core cloud instance: the absolute
-microseconds will differ on the pinned hardware in the runbook below, though the
-ratios should not.
-
-**The CPU column was unresolvable before 2026-07-26.** It read `0.0` for every
-row of both engines, which looks exactly like the O(1) claim holding. `ProcStats`
-took CPU time from `/proc/self/stat`'s `utime + stime`, in 10 ms clock ticks —
-and a consumer here spends about 4 ms of CPU per 6-second window, less than one
-tick, so the counter read zero. It now reads `/proc/<pid>/schedstat`, which is
-nanoseconds. Any CPU-per-node figure quoted from an earlier run is meaningless.
+One run per point: treat single-row differences under ~10% as noise; the trends
+carry the weight. Ratios, not absolutes, should transfer to pinned hardware.
+CPU is read from `/proc/<pid>/schedstat` (nanoseconds); 10 ms `utime + stime`
+ticks read zero for a consumer spending ~4 ms of CPU per window.
 
 ### Where the lookup actually spends itself
 
-`just profile-lookup`, 2026-07-26. Cachegrind over 60 000 depth-3 lookups,
-attributed by file.
+`just profile-lookup`, cachegrind over 60 000 depth-3 lookups, by file. The
+`profiling` profile (release codegen, debuginfo kept) makes this possible;
+`[profile.release]` strips debuginfo and `fold_at` inlines the whole chain. The
+containerised `just profile-lookup` and `just footprint` work per-line; host-side
+`just profile-cachegrind` needs `valgrind` installed. `cg_annotate --auto=yes` is
+deprecated for `--annotate` but identical.
 
 | file | instructions | branch mispredicts |
 |---|---:|---:|
@@ -995,97 +541,32 @@ attributed by file.
 | `tf_tree_core/src/buffer.rs` | ~13% | ~0% |
 | `tf_tree_core/src/plan.rs` | ~9% | ~0% |
 
-Two things follow, and they point at different optimisations:
-
-- **Essentially every mispredict is in the sampling path**, not in the maths.
-  **CORRECTION (2026-09-06):** this bullet used to continue *"the bracket search
-  is already branchless (a `cmp` folded into the index), so what remains is the
-  bounds and seqlock structure around it"*, and it is the sentence that sent the
-  next reader away from the line that carries most of the column. The search is
-  not branchless; its index select compiles to a conditional branch, and on
-  `soak --workload robot` that one line plus the loop back-edge are the great
-  majority of the process's mispredicts.
-  [`0053`](../decisions/0053-the-branchless-bracket-that-branches.md) measures both. Read it before spending
-  effort on the bounds and seqlock structure around the search.
-- **The maths is ~35% of instructions and mispredicts nothing.** That is the
-  shape that rewards SIMD and does not reward branch work — the opposite of
-  where intuition sends you after reading the mispredict column.
-
-**This profile was not obtainable before.** `[profile.release]` sets
-`strip = "debuginfo"`, so cachegrind, perf and callgrind all fall back to
-function-level attribution — and `fold_at` inlines the entire sampling chain
-into itself, so the answer was "96.6% of mispredicts are in `fold_at`". True,
-and useless, because `fold_at` *is* the hot path. The `profiling` profile
-(release codegen, debuginfo kept) is what makes the table above possible.
-
-**Per-*line* attribution works, and the paragraph that used to stand here saying
-it did not was wrong.** It read: *"`cg_annotate --auto=yes` in this image emits
-no annotated source even with the debuginfo present. That is the next thing to
-fix before any of the optimisations above should be attempted."* Re-run
-2026-08-04 in the same image, `just profile-lookup`'s exact command at
-`n = 20000`: 2547 lines of output, of which 2318 are annotated source, covering
-`plan.rs`, `sample.rs`, `buffer.rs`, `arena_view.rs`, `interp.rs`, `iso3.rs` and
-`quat.rs` with per-line `Ir` / `Bcm` / `D1mr`. `cg_annotate` is 3.26.0 here and
-reports `Annotation: on` in its own metadata block.
-
-**The document already contradicted the claim two paragraphs later** — *"Optimisations
-tried and rejected"* below opens by citing per-line evidence (*"per-line profiling
-puts two lines of `interp.rs` at ~9% of all instructions"*), which is not a
-sentence anybody could write without the annotation working. That contradiction
-is what makes this a stale line rather than a disputed measurement; whichever run
-produced the original observation, it does not describe this image now.
-
-One caveat that is not stale: `--auto=yes` is **deprecated** in `cg_annotate`
-3.26 (`--annotate` is the current spelling, and the two are documented as
-identical). It still works, and it is not what the original paragraph was about.
-
-The genuinely broken recipe is the *other* one. `just profile-cachegrind` runs on
-the **host**, and the host has no `valgrind` — the recipe's own
-`command -v valgrind` guard catches it and says so. `just profile-lookup` and
-`just footprint` go through `docker/tf2/run.sh`, and the image installs
-`valgrind` for exactly this reason (`docker/tf2/Dockerfile:15-24`). So the
-per-line path that works is the containerised one, and a host-side
-`profile-cachegrind` needs `valgrind` installed before it can be run at all.
+- Essentially every mispredict is in the sampling path, and the bracket search
+  is **not** branchless: its index select compiles to a conditional branch
+  ([`0053`](../decisions/0053-the-branchless-bracket-that-branches.md)).
+- The maths is ~35% of instructions and mispredicts nothing: the shape that
+  rewards SIMD and not branch work.
 
 ### Optimisations tried and rejected
 
-Kept because a negative result nobody records gets retried.
+**Constant divisions in `slerp_weight` -> reciprocal multiplies. No effect.**
+Four non-power-of-two divisions per call (LLVM may not rewrite them without
+fast-math) is 24 `divsd` per depth-3 lookup. Moving the reciprocals to `const`
+measured `p = 0.74` (depth 3 / sclerp), `0.91` (depth 3 / lerpslerp), `0.67`
+(depth 6): the divisions are independent of each other and of the Horner chain,
+so they issue in parallel; the critical path is the dependent multiply-add
+chain. `slerp_series_matches_exact_below_threshold` held at 1e-15 with the
+reciprocals in place.
 
-**Constant divisions in `slerp_weight` → reciprocal multiplies. No effect.**
-Per-line profiling puts two lines of `interp.rs` at ~9% of all instructions,
-and `slerp_weight` contains four divisions by non-power-of-two constants —
-which LLVM may *not* rewrite as reciprocal multiplies, because that changes
-rounding and Rust grants no fast-math permission. Four per call, two calls per
-slerp, three slerps in a depth-3 lookup: **24 real `divsd` per lookup**, on the
-one arithmetic instruction that is not pipelined at one per cycle. It looks
-like an obvious win.
-
-It is not one. Moving the reciprocals to `const` and multiplying measured
-`p = 0.74` at depth 3 / sclerp, `p = 0.91` at depth 3 / lerpslerp and
-`p = 0.67` at depth 6 — no change at any depth. The divisions are *independent
-of each other and of the Horner chain*, so they issue in parallel with work
-that has to happen anyway; the critical path is the dependent chain of
-multiply-adds, not division throughput. Instruction counts mislead here
-precisely because they do not model that.
-
-The numerics were checked before the timing, and passed:
-`slerp_series_matches_exact_below_threshold` holds at 1e-15 across the whole
-threshold range with the reciprocals in place. So the change was safe, and
-still not worth making.
-
-**A note on `depth1/sclerp` on this host.** It has now twice shown a ~3%
-"regression" (p < 0.05) that did not reproduce on a second run. Treat
-single-run depth-1 results here as layout noise unless they repeat; the depth 3
-and 6 rows have been stable across every comparison in this document.
+`depth1/sclerp` has twice shown a ~3% "regression" (p < 0.05) that did not
+reproduce; treat single-run depth-1 results here as layout noise.
 
 ### Python: `tf_tree` against `tf2_ros`
 
-`just py-vs-tf2`, 2026-07-26, in the same container. One dynamic edge, 2000
-samples at 1 ms, queried inside the retained window so neither engine is
-extrapolating. **tf2 is given every advantage available in-process**:
-`tf2_ros.Buffer` wraps the same `BufferCore` a real node uses, fed directly —
-no DDS, no serialisation, no `TransformListener`. A deployed consumer pays more
-than this; nothing here pays less.
+`just py-vs-tf2`, 2026-07-26, same container. One dynamic edge, 2000 samples at
+1 ms, queried inside the retained window. tf2 gets every in-process advantage:
+`tf2_ros.Buffer` wraps the same `BufferCore` a real node uses, fed directly, no
+DDS or `TransformListener`.
 
 | | tf_tree | `tf2_ros` | ratio |
 |---|---:|---:|---:|
@@ -1093,25 +574,14 @@ than this; nothing here pays less.
 | batch, n = 64 (per sample) | **42.7 ns** | 12 477.5 ns | **292.0×** |
 | batch, n = 4096 (per sample) | **34.9 ns** | 12 607.5 ns | **361.7×** |
 
-Re-measured after Phase 2 completed. The earlier run read 178.6 ns scalar
-against 11 708.8 ns for tf2; **both** columns moved by about the same 4%, which
-is the container, not the code. What is *not* noise is recorded below.
+tf2 has no batch API, so its per-sample figure is its scalar figure; the scalar
+row is the like-for-like number. Both are release builds with LTO
+(`tf_tree_py` is excluded from the workspace and carries its own
+`[profile.release]`; without it the same runs read 253.9 ns scalar, 51.7
+ns/sample at n = 4096).
 
-The batch rows deserve a word, because they are the easiest to misread. **tf2
-has no batch API**, so its per-sample figure is simply its scalar figure — the
-comparison is a vectorised call against the Python loop a user would otherwise
-write. That is the honest framing: the absence of a vectorised path *is* the
-cost, and reporting only the scalar row would understate what a user
-experiences. The scalar row, 65.6×, is the like-for-like number.
-
-Both figures are release builds with LTO. Before `tf_tree_py` gained a
-`[profile.release]` — it is excluded from the workspace, so it inherited none —
-the same measurements read 253.9 ns scalar and 51.7 ns/sample at n = 4096. The
-hot path is a call from the extension into `tf_tree_core`'s batch kernel, which
-only inlines across the crate boundary with LTO on.
-
-Against `docs/PHASE3.md` §12.2's gate, measured on the *identical* fixture with
-`benches/py_parity.rs` (native: 36.3 ns/sample at n = 4096):
+Against `docs/PHASE3.md` §12.2's gate, on the identical fixture with
+`benches/py_parity.rs` (native 36.3 ns/sample at n = 4096):
 
 | gate | result | |
 |---|---|---|
@@ -1119,14 +589,14 @@ Against `docs/PHASE3.md` §12.2's gate, measured on the *identical* fixture with
 | 2. `at_many` at n = 4096 within 1.3× of native | 0.93× | **pass** |
 | 3. `at_into` eliminates the allocation | 8.1 µs/call saved at n = 4096 | **pass** |
 
-Criterion 2's parity bench exists because `benches/at_many.rs` uses the deep
-mobile-robot fixture; dividing a Python figure by *its* ns/sample would have
-produced a meaningless ratio in either direction.
+`benches/py_parity.rs` exists because `benches/at_many.rs` uses the deep
+mobile-robot fixture.
 
-#### A 32-byte struct field cost 4%, and the benchmark is how it was found
+#### A 32-byte struct field cost 4%
 
-Phase 2's fork poisoning needed a `Guard` that refuses every evaluation without
-reading the arena. The first version carried an `Option<LookupError>`:
+Fork poisoning needs a `Guard` that refuses every evaluation without reading the
+arena. An `Option<LookupError>` field (32 B, niche-packed) grew `Guard` from 48 to
+80 B, on a struct built once per `at()` on the Python path:
 
 | | `Guard` | Python scalar | native depth-3 |
 |---|---:|---:|---:|
@@ -1134,40 +604,15 @@ reading the arena. The first version carried an `Option<LookupError>`:
 | `Option<LookupError>` field | **80 B** | 196.3 ns | 64.6 ns |
 | generation sentinel | 48 B | **188.7 ns** | **62.0 ns** |
 
-`LookupError` is 32 bytes, and `Option` of it is niche-packed to the same 32 —
-so the field grew `Guard` by two thirds, on a struct built **once per `at()`
-call** on the Python path. Encoding "detached" as a `generation` of `u64::MAX`
-instead costs nothing at all: `check_generation` already loads `generation`, and
-the poison check folds into the comparison it was already making, on the cold
-side of it.
-
-The native row barely moved either way, which is why this needed the Python
-benchmark to see: the extension's per-call overhead is where a fatter `Guard`
-shows up. Sentinels earn their keep by being unreachable, so
-`a_generation_mismatch_is_never_mistaken_for_a_detached_guard` builds the exact
-collision — a plan from one arena's generation evaluated against another arena
-at generation 0 — and fails against `DETACHED = 0` or `1`.
+Encoding "detached" as `generation == u64::MAX` costs nothing: `check_generation`
+already loads `generation`. `a_generation_mismatch_is_never_mistaken_for_a_detached_guard`
+builds the exact collision and fails against `DETACHED = 0` or `1`.
 
 ### Python, multi-process: N nodes on one arena against N private buffers
 
-`just py-mp-bench`, 2026-07-26, 8 cpus, in the same container. Two corrections
-landed after the first publication of these numbers, both found in review: the
-publisher was running at **50 Hz where `PUB_HZ` says 100** (its tick index was
-both derived from elapsed time *and* incremented, so it slept two periods per
-push) while the tf2 consumer filled its buffer at the full 100 Hz — so the two
-engines were not seeing "the same stream" as claimed; and CPU was sampled by the
-coordinator over a window that overlapped tf2's startup. Both are fixed and the
-table is re-measured. Eight Python
-consumer nodes at 100 Hz over a depth-3 chain, open-loop, with a live publisher
-for tf_tree. **This is where the shared arena earns its keep, and it is the row
-the single-process comparison cannot show**: a Python `tf2_ros` node
-materialises the whole history privately, and every node pays for it again.
-
-The methodology is `crates/tf_tree_bench/src/mp.rs`'s — open loop against
-*intended* tick times so a stall shows up as latency rather than as fewer
-samples, per-consumer tails rather than one mean, and PSS rather than summed
-RSS, which would count the shared arena once per consumer and flatter tf_tree
-by exactly the amount being claimed.
+`just py-mp-bench`, 2026-07-26, 8 cpus, same container. Eight Python consumer
+nodes at 100 Hz over a depth-3 chain, open loop, live publisher for tf_tree, PSS
+not summed RSS (methodology: `crates/tf_tree_bench/src/mp.rs`).
 
 | nodes | tf_tree svc p50 | `tf2_ros` svc p50 | ratio | tf_tree PSS | `tf2_ros` PSS |
 |---:|---:|---:|---:|---:|---:|
@@ -1176,15 +621,9 @@ by exactly the amount being claimed.
 | 4 | **2.6–3.0 µs** | 188–233 µs | 74–77× | 70.4 MiB | 170.5 MiB |
 | 8 | **3.1–3.4 µs** | 233–374 µs | **75–110×** | 128.3 MiB | 320.9 MiB |
 
-Latency is given as the range across two runs because **this machine was not
-idle** — it had been running benchmarks for hours — and the absolute figures
-moved by up to 1.5× between them. The *ratios* and the memory columns did not,
-and those are what the claims rest on. On a dedicated machine, report point
-values; here, reporting one would be picking a number.
-
-**The slope is the claim, not the totals.** Both engines pay identically for the
-Python interpreter and numpy, which dominate the absolute figures. What the
-shared arena changes is what each *additional* node costs:
+Latency is a range across two runs because the machine was not idle; the ratios
+and memory columns did not move, and those carry the claims. Both engines pay
+identically for the interpreter and numpy; the claim is the slope:
 
 | marginal, per node | tf_tree | `tf2_ros` | ratio |
 |---|---:|---:|---:|
@@ -1192,42 +631,19 @@ shared arena changes is what each *additional* node costs:
 | CPU | **0.16–0.17 %** | 2.9–3.8 % | **18–22×** |
 | time to first usable lookup | **0–1 ms** | 64–121 ms | ~70× |
 
-**The CPU row previously read 64×, and that was an artifact.** The coordinator
-sampled `schedstat` between two of its own sleeps, a window that for tf2
-overlapped the consumer's import and fill rather than only its measured loop.
-Each consumer now measures its own CPU across its own loop and reports it —
-nothing else knows when that loop starts and ends. The corrected 18–22× is
-still the O(1)-versus-O(consumers × edges × rate) shape, and it is still the
-right column to look at; it is simply not 64×.
-
 The CPU row is `docs/PHASE2.md` §12.4's "O(1) in the number of consumers"
-measured rather than asserted: tf_tree's per-node CPU is flat across the sweep
-and tf2's rises, which is the shape the claim predicts. The gap grows with the
-fleet.
+measured: tf_tree's per-node CPU is flat and tf2's rises. Each consumer measures
+its own CPU across its own loop. Time to first lookup is structural: tf_tree
+joins an arena already being published into (handshake, mapping, the pages §7.1
+populates), while each tf2 node fills its own buffer first. tf2 is fed directly
+with no transport, and a compiled `Plan` resolves the chain once where tf2
+re-walks it per lookup — the difference §12.1 exists to report. At 8 cpus the
+8-node row is where scheduling starts to dominate; `cycle p99.9` is reported and
+not compared.
 
-"time to first usable lookup" is the startup cost, and it is structural rather
-than incidental. tf_tree joins an arena somebody else is already publishing
-into: a handshake, a mapping, and the pages §7.1 populates. tf2 has nothing to
-join, so each node fills its own buffer before it can answer anything — which
-is also why its p50 rises with node count while tf_tree's does not.
+#### The consumer loop: `at_into` and the DLPack probe
 
-**tf2 is given every advantage again.** Its consumers are fed directly, with no
-DDS, no serialisation and no `TransformListener`; a deployed node pays more than
-this and nothing pays less. The one asymmetry that favours tf_tree is
-architectural rather than a harness choice: a compiled `Plan` resolves the chain
-once, and tf2 re-walks it per lookup because it has no equivalent concept. That
-*is* the difference §12.1 exists to report.
-
-Two honest caveats. The machine has 8 cpus, so the 8-node row is at the edge of
-where scheduling starts to dominate — `cycle p99.9` is mostly OS wakeup at
-100 Hz and is reported but not compared. And tf_tree's service p50 is flat
-across the sweep to within noise, which is the expected shape but is measured on
-one machine, not proven.
-
-#### The consumer loop was 1.5x slower than it needed to be, and the profile said why
-
-The first run of this benchmark used `plan.at(t)` and reported **1 923 ns** at
-eight nodes. Attributing that, on a depth-3 chain, release build, in-process:
+Depth-3 chain, release, in-process:
 
 | | ns |
 |---|---:|
@@ -1238,121 +654,53 @@ eight nodes. Attributing that, on a depth-3 chain, release build, in-process:
 | `plan.at(t)` | 211 |
 | `plan.at_into(t, buf)`, as first written | **265** |
 
-Three things fell out, two of which killed a hypothesis:
+`Tree::guard()` costs 1.1 ns (`examples/guard_cost.rs`); the output allocation is
+not the cost (an uninitialized `new` measured no change). `at_into` was slower
+than `at` because `reject_device_memory` did `getattr("__dlpack_device__")` and
+**called** it, ~120 ns per invocation. A successful cast to `numpy.ndarray`
+proves the buffer is host memory (CuPy and torch arrays are not numpy
+subclasses), so skipping the probe on that path leaves §5.5's guarantee intact
+and takes `at_into` to **173 ns**, 1.3x faster than `at` and allocation-free.
+The consumer loop moved from 1 923 to **1 321 ns** p50 at eight nodes (p99.9
+29.3 -> 15.3 us): a **1.46x improvement**, same harness both sides.
 
-* **`Tree::guard()` costs 1.1 ns**, measured directly in Rust
-  (`examples/guard_cost.rs`) after suspecting it. Building a guard per call is
-  free; hoisting it out of a loop buys nothing.
-* **The output allocation is not the cost.** `np.empty((4,4))` is ~90 ns *from
-  Python*, but from Rust it is ~25 ns — the 90 is mostly the Python call.
-  Replacing `zeros` with an uninitialized `new` measured **no change** and was
-  reverted rather than kept for the story.
-* **`at_into` was slower than `at`**, which is the result that pointed at the
-  real cost. It called `reject_device_memory` first, which does
-  `getattr("__dlpack_device__")` and then **calls** it — a full Python method
-  call, ~120 ns, on every invocation. NumPy has had `__dlpack_device__` since
-  1.22, so an ordinary `np.empty((4,4))` paid all of it.
-
-A successful cast to `numpy.ndarray` proves the buffer is host memory, because
-CuPy and torch arrays are not numpy subclasses. Skipping the probe on that path
-leaves §5.5's guarantee intact — the objects that can actually trip it still pay
-— and takes `at_into` from 265 ns to **173 ns**, which is now 1.3x faster than
-`at` *and* allocates nothing.
-
-Switching the consumer loop to it took the multi-process p50 from 1 923 ns to
-**1 321 ns** at eight nodes, and p99.9 from 29.3 us to 15.3 us — both measured
-with the same harness on both sides, so the **1.46x improvement stands** even
-though the absolute figures above were re-measured afterwards on a busier
-machine and against a corrected publisher rate. A node does one lookup per tick
-and cannot batch, so this is the path a real deployment takes.
-
-### What is implemented, and what is not
+### What is implemented
 
 `just shm-test` is the gate: a **separate process**, after `exec`, maps the same
-sealed `memfd` and answers **bit-identically** over 512 queries, plus a
-read-only (`PROT_READ`) attachment and a check that samples published *after* a
-peer attached are visible to it. The reader in that child is the unmodified
-Phase 1 reader — [`PHASE2.md`](../PHASE2.md) §4's "zero lines in the read path",
-tested rather than asserted.
+sealed `memfd` and answers **bit-identically** over 512 queries, plus a read-only
+(`PROT_READ`) attachment and a check that samples published after a peer attached
+are visible. The reader in that child is the unmodified Phase 1 reader
+([`PHASE2.md`](../PHASE2.md) §4's "zero lines in the read path").
 
-**Crash consistency: amendments A1–A8 are applied** (`FORMAT_VERSION = 2`). The
-arena has a participant table (A6), claims name a participant *slot* rather than
-a PID so a writer killed mid-claim leaves no unreclaimable edge (A3), `push`
-re-checks the claim epoch so a revoked writer cannot resurrect (A4), the
-topology generation and active block publish in a single atomic word (A1) under
-an in-arena reapable lock (A2), the sample writer forces slot parity rather than
-incrementing it (A5), the header carries a full 16-byte boot id (A7), and the
-interning spin is bounded with takeover of a provably-dead claimant (A8).
+**Crash consistency: amendments A1–A8 are applied** (`FORMAT_VERSION = 2`): a
+participant table (A6); claims name a participant *slot* not a PID (A3); `push`
+re-checks the claim epoch (A4); topology generation and active block publish in
+one atomic word (A1) under an in-arena reapable lock (A2); the sample writer
+forces slot parity (A5); a full 16-byte boot id in the header (A7); bounded
+interning spin with takeover of a provably-dead claimant (A8).
 
-**The three lifecycle gaps this section used to list have all been closed, and
-the list is replaced rather than annotated** — it described a state of the code
-that has not been true since decision
-[`0005`](../decisions/0005-the-shared-memory-seam.md) landed, and a "still
-missing" list that is wrong on every row is worse than no list. For the record,
-it read:
-
-> - Segments are handed over by **fd inheritance**; the §3.7 `SOCK_SEQPACKET` +
->   `SCM_RIGHTS` handshake is not implemented, so a process that is not a child
->   cannot attach at all and `tf_tree::open()` does not exist yet.
-> - **Liveness** comes from a `/proc` heuristic that fails safe (unknown ⇒ alive),
->   not from `F_OFD_GETLK` (§5.1).
-> - **Nothing reaps** (§6.3): `edge::reap` exists and is called only by tests, so a
->   participant that dies holding a claim leaks that edge until the arena does.
-
-Each of the three, checked against the code:
-
-- **§3.7's handshake is implemented.** `crates/tf_tree_ipc/src/lib.rs:55` marks
-  the `SOCK_SEQPACKET` + `SCM_RIGHTS` transport implemented, and `client.rs`'s
-  header describes receiving the segment fd as ancillary data and keeping the
-  socket open. A process that is not a child attaches.
-- **`tf_tree::open()` exists**, at `crates/tf_tree/src/open.rs:227`, with the
-  builder form at `:369` and `Tree::open_frozen` at `frozen.rs:119`.
-- **Liveness is the kernel's answer about a file lock**, not a `/proc`
-  heuristic — OFD locks via `fcntl`, which `tf_tree_ipc`'s module docs record as
-  a deliberate, documented deviation from §2's "no `libc` crate" because
-  `rustix` 1.1 has no OFD locking. This is what lets a `SIGSTOP`ped publisher
-  keep its claims while a dead one is reclaimed.
-- **Reaping is wired.** `Tree::reap_dead` and `Tree::reap_participant`
-  (`crates/tf_tree/src/tree.rs`) are public, and `edge::reap`
-  (`tf_tree_core/src/edge.rs:399`) is reached through them rather than from
-  tests alone.
-
-`PHASE2.md` §0.0 remains the authoritative status table; what is still open
-there is `tf_tree serve`
-([`0019`](../decisions/0019-one-binary-and-topology-you-can-wait-for.md) steps
-6–7, deliberately unscheduled), not the lifecycle. **This sentence also named
-`tf_tree_record` and the long-running fault harness as open, until 2026-09-05,
-and neither is**: the recorder is declined by
-[`0047`](../decisions/0047-the-recording-this-reader-would-refuse.md), and the
-fault harness is `shm_torture`, which §0.0 records as done and nightly — with
-the qualifier that row asks a quoter to carry, that one of §11.4's four
-continuous invariants is not implemented. None of the numbers
-above depended on any of it either way.
+The lifecycle is complete: the `SOCK_SEQPACKET` + `SCM_RIGHTS` transport
+(`crates/tf_tree_ipc/src/lib.rs:55`), `tf_tree::open()`
+(`crates/tf_tree/src/open.rs:227`), liveness by OFD file lock via `fcntl` (a
+`SIGSTOP`ped publisher keeps its claims, a dead one is reclaimed; `rustix` 1.1
+has no OFD locking), and `Tree::reap_dead` / `Tree::reap_participant`.
+`PHASE2.md` §0.0 is the authoritative status table.
 
 ## The performance suite: contention, scale, duration, and the transport
 
-Everything above this line is measured on one 24-frame fixture, in windows of a
-few seconds, against a **quiescent** tree, with `tf2::BufferCore` fed
-in-process. Four sections follow, each closing one of those.
-
-Every number here is **indicative**: this host has 4 physical cores with SMT and
-an unreadable frequency governor, so it fails `tf_tree_bench`'s own
-`Fitness::probe` and every harness in the suite says so in its output. What is
-*not* host-dependent is the shape of each curve and the ratios between rows
-taken minutes apart on the same machine, and that is what these sections are
-for.
+Everything above uses one 24-frame fixture, windows of a few seconds, a
+quiescent tree and in-process `tf2::BufferCore`. Every number below is
+**indicative**: this host fails `tf_tree_bench`'s `Fitness::probe` and every
+harness says so. Curve shapes and ratios between rows taken minutes apart are
+what these sections are for.
 
 ### Read scaling with concurrent writers — `just contended-scaling`
 
 [`PHASE1.md`](../PHASE1.md) §11.2 specifies "1/2/4/8/16 reader threads, **4
-concurrent writers**, cores pinned". Until now the writers and the pinning were
-both in this document's own "not measured" list. `contended_scaling` runs N
-reader *processes* and M writer *processes* on one shared arena, each placed on
-its own core by `taskset` — processes rather than threads because per-thread
-placement needs `sched_setaffinity`, and `CLAUDE.md`'s unsafe budget routes a
-new kind of `unsafe` to a decision record.
-
-24 frames, 3 dynamic steps, 3 s per point, 8 logical CPUs:
+concurrent writers**, cores pinned". `contended_scaling` runs N reader and M
+writer *processes* on one shared arena, each placed on its own core by `taskset`
+(per-thread placement needs `sched_setaffinity`, which the unsafe budget routes
+to a decision record). 24 frames, 3 dynamic steps, 3 s per point, 8 logical CPUs:
 
 | readers | writers | Mlookup/s | scale | svc p50 | svc p99 | svc p99.9 |
 |---|---|---|---|---|---|---|
@@ -1365,58 +713,29 @@ new kind of `unsafe` to a decision record.
 | 4 | 4 | 12.33 | 2.66x | 360 ns | 420 ns | 470 ns |
 | 8 | 4 | 24.09 | **5.20x** | 360 ns | 430 ns | 480 ns |
 
-**Four concurrent writers cost about 9%** — of aggregate throughput at 8 readers
-(26.55 → 24.09 Mlookup/s) and of p50 (330 → 360 ns). The tail is *flat*: p99.9
-does not move, and at 8 readers it is marginally lower under load than without.
+**Four concurrent writers cost about 9%** of aggregate throughput at 8 readers
+and of p50 (330 -> 360 ns); the tail is flat. `err_slot_recycled +
+err_slot_contended` was **0** on every row — those count reads that *failed*, not
+retried; a successful seqlock retry is invisible to the arena and shows up in
+the ~9%. The §11.3 scaling gate still fails here because 8 threads over 4
+physical cores exceed 4x only via SMT; it now fails by a measured margin (5.20x)
+under the load the gate specifies.
 
-`err_slot_recycled + err_slot_contended` was **0** on every row. That is worth
-stating precisely, because it is easy to over-read: those counters record reads
-that **failed**, not reads that retried. A successful seqlock retry is invisible
-to the arena by design, and what it costs shows up in the ~9% above.
-
-The scaling column is the §11.3 gate's, and it still fails on this host for the
-reason it always has — 8 threads over 4 physical cores can only exceed 4x via
-SMT. What is new is that it now fails by a *measured* margin **under the load the
-gate actually specifies** (5.20x) rather than only on an empty road (5.73x).
-
-`svc` is the per-lookup service distribution, taken in a dense loop with one
-clock pair per lookup and the clock's own cost measured and reported alongside
-(28–31 ns on this host). The first revision of this harness reported latency
-only from an open-loop schedule and printed a p50 of **61 µs** for an operation
-costing ~300 ns, because at any achievable tick rate the dominant term is the OS
-deciding to run you. Both distributions are now reported, separately.
-
-Two cross-checks, because a new harness that disagrees with the old ones is
-measuring something else:
-
-* The 1-reader/0-writer row (250 ns p50) lands on `scale_sweep`'s independent
-  `robot` measurement (251 ns p50) — different binary, different loop, same
-  workload.
-* `benches/read_scaling` grew a `read_scaling_writers` group so the portable
-  criterion path also stops measuring an empty road. Its writers publish at the
-  fixture's **nominal** rates, and at 8 threads it reports 925.9 µs against the
-  quiescent group's 933.4 µs — no difference. That is the expected answer and it
-  is why `contended_scaling` exists: at 50–1000 Hz a writer is invisible against
-  millions of lookups a second, so the pressure has to be applied by a writer per
-  core. An earlier revision of that group ran its writers flat out and starved
-  the readers so badly the bench could not complete a row in ten minutes; the
-  file records it.
+`svc` is a dense loop with one clock pair per lookup (clock cost 28–31 ns, reported
+alongside); an open-loop schedule reported 61 µs p50 for a ~300 ns operation
+because the OS scheduling term dominates. Cross-checks: the 1-reader/0-writer row
+(250 ns) matches `scale_sweep`'s independent `robot` p50 (251 ns); and
+`benches/read_scaling`'s `read_scaling_writers` group at nominal writer rates
+shows no difference (925.9 vs 933.4 µs at 8 threads), because at 50–1000 Hz a
+writer is invisible — hence a writer per core here.
 
 ### What a writer costs a reader — `TF2_WRITERS=N just tf2-scaling`
 
-The section above is tf_tree alone, because a second process cannot reach a
-`tf2::BufferCore` at all. This is the in-process head-to-head, and it is the row
-that separates the two designs most sharply.
-
-The writers publish to dynamic edges the query path does **not** traverse. That
-is the measurement rather than a courtesy:
-
-* `tf2::BufferCore` takes **one mutex for the whole buffer**, so a write to any
-  edge excludes every reader of every other edge.
-* tf_tree's rings are per edge with a seqlock per slot, so a write to an edge a
-  reader is not reading costs that reader nothing.
-
-Two writers, `fixture_depth6`, 15 rounds, engines interleaved within every round:
+The in-process head-to-head (a second process cannot reach a `BufferCore`).
+Writers publish to edges the query path does **not** traverse: `tf2::BufferCore`
+takes one mutex for the whole buffer, so a write to any edge excludes every
+reader; tf_tree's rings are per edge with a seqlock per slot. Two writers,
+`fixture_depth6`, 15 rounds, engines interleaved:
 
 | | tf_tree M/s | tf2 M/s | ratio |
 |---|---|---|---|
@@ -1431,32 +750,17 @@ Two writers, `fixture_depth6`, 15 rounds, engines interleaved within every round
 | tf2, 1 thread | 431 ns / 741 ns | **2554 ns / 23 044 ns** |
 
 **Two writers cost tf_tree's readers 0.5% of throughput and nothing at p50. They
-cost tf2's readers 79% of throughput, 5.9x at p50 and 31x at p99.9** — for
-writes to edges those readers never touch.
-
-The recorded stream says the same, more so: 16.6x at one thread and 43.0x at
-four.
-
-Two honest notes. tf2's `worst` round ratio falls to 0.54 at one thread, so its
-contended single-thread row is soft — the mutex makes it bursty, which is itself
-the finding, but the median is what to quote and not the best. And tf2's
-throughput *rises* from 1 to 4 threads under writers (0.62 → 0.81 M/s), which is
-not scaling: at one thread its single reader loses the mutex to the writers more
-often than four readers collectively do.
-
-An earlier revision of this harness gave each writer thread its own stamp counter
-starting from the same base. Both engines' state outlives a pass while the
-threads do not, so the second pass republished stamps the first had already
-written — tf_tree rejected them silently, and tf2 rejected them *with a
-`TF_OLD_DATA` warning per sample*, filling the measured window with stderr I/O
-and reporting tf2 at 0.36 M/s with a 50% spread. That number would have been
-published as tf2's cost under contention. The counter is now shared across every
-writer and every pass.
+cost tf2's readers 79% of throughput, 5.9x at p50 and 31x at p99.9.** The
+recorded stream gives 16.6x at one thread and 43.0x at four. tf2's `worst` round
+ratio falls to 0.54 at one thread (bursty; quote the median), and its throughput
+*rising* from 1 to 4 threads under writers is not scaling: a lone reader loses
+the mutex to writers more often than four collectively. The writers share one
+stamp counter across passes; per-writer counters republished old stamps and
+filled the window with `TF_OLD_DATA` stderr I/O.
 
 ### Scale — `just scale-sweep`
 
-Lookup cost against tree **width**, at a fixed dynamic-step count, which is the
-only way to separate size from depth.
+Lookup cost against tree **width** at fixed dynamic-step count:
 
 | workload | frames | edges | dyn steps | at p50 | latest_common p50 | plan compile | build |
 |---|---|---|---|---|---|---|---|
@@ -1468,22 +772,13 @@ only way to separate size from depth.
 | `fleet_64` | 1537 | 1536 | 4 | 330 ns | 120 ns | 245 ns | 120 ms |
 | `extreme_wide` | 12289 | 12288 | 4 | 320 ns | 111 ns | 244 ns | 364 ms |
 
-**Width is free.** The last three rows hold the dynamic-step count at 4 while the
-tree grows 32x, from 385 to 12 289 frames, and `at p50` does not move — it goes
-*down* by 10 ns, which is noise. The earlier four-point row above topped out at
-375 frames and could only say "primarily depth"; this says it at two orders more.
+**Width is free**: 32x the tree at 4 dynamic steps does not move `at p50`.
+**Depth is what costs**: `humanoid` to `av` is 880 -> 1012 ns, ~66 ns per
+additional dynamic step ([`PHASE1.md`](../PHASE1.md) §11.3). Plan compilation
+walks to the root, so it scales with depth (116 -> 244 ns). `build` scales
+linearly in samples; 364 ms for 12 289 frames is a startup cost.
 
-**Depth is what costs**: `humanoid` (12 steps) to `av` (14 steps) is
-880 → 1012 ns, about 66 ns per additional dynamic step, which is the
-interpolation cost [`PHASE1.md`](../PHASE1.md) §11.3 predicts.
-
-**Plan compilation is nearly flat too** — 116 ns at 10 frames, 244 ns at 12 289,
-and the last three rows (32x the tree) are within 3% of each other. It walks to
-the root, so it scales with depth rather than with the tree. `build` does scale,
-linearly in samples, and 364 ms for a 12 289-frame arena is a startup cost worth
-knowing rather than a surprise.
-
-Ring depth, one edge, stamps swept across the whole ring:
+Ring depth, one edge, stamps swept across the ring:
 
 | slots | retained | MiB | at p50 | at p99.9 |
 |---|---|---|---|---|
@@ -1493,29 +788,22 @@ Ring depth, one edge, stamps swept across the whole ring:
 | 262 144 | 262 143 | 18.0 | 119 ns | 450 ns |
 | 1 048 576 | 1 048 575 | 72.0 | 120 ns | 700 ns |
 
-The binary search behaves: a 131 072x deeper ring costs 30 ns at p50, and 20 of
-those 30 arrive in one step — between 16 K and 256 K slots, i.e. between a ring
-that fits in cache and one that does not. The **tail** is where that shows
-plainly: p99.9 goes 101 → 700 ns. It is a property of the machine as much as of
-the engine, and no previous benchmark varied this axis at all.
+A 131 072x deeper ring costs 30 ns at p50, 20 of them between 16 K and 256 K
+slots (cache-resident to not); the tail p99.9 goes 101 -> 700 ns.
 
 Publish, one thread round-robin over N edges: 6.84 ns/push at 1 edge, 7.01 at 16,
-7.41 at 64, 10.33 at 256. Per-edge isolation holds through 64; the step at 256 is
-the working set (256 rings is 18 MiB of first-touched pages), not false sharing —
-`EdgeCounters` is padded to 128 bytes precisely so two edges never share a line.
+7.41 at 64, 10.33 at 256. The step at 256 is the working set (18 MiB of
+first-touched pages), not false sharing: `EdgeCounters` is padded to 128 bytes.
 
-**The limits, printed by the engine rather than copied from a header:**
-
-* **59 651 678 sample slots (~4.00 GiB) in one arena**, past which
-  `LayoutError::ArenaTooLarge` — every region offset in the header is a `u32`.
-  This was undocumented, and it is the one that binds first on any populated
-  tree; `TooManyFrames`/`TooManyEdges` are `u32` counts nothing reaches.
-* 32 compiled plan steps (`MAX_DEPTH`) and 64 raw path edges (`MAX_PATH_EDGES`), as the section below already records.
+**Limits:** **59 651 678 sample slots (~4.00 GiB) in one arena**, past which
+`LayoutError::ArenaTooLarge` (every region offset is a `u32`); it binds first on
+any populated tree. 32 compiled plan steps (`MAX_DEPTH`) and 64 raw path edges
+(`MAX_PATH_EDGES`), below.
 
 ### Duration — `just soak`
 
-40 s, 24-frame fixture (10 s of retained history), 2 reader threads, 4 writer
-threads, snapshots every 10 s:
+40 s, 24-frame fixture (10 s retained), 2 reader and 4 writer threads, snapshots
+every 10 s:
 
 | interval | Mlookup/s | p50 | p99.9 | publish→visible p50 | ring laps | Pss | declined |
 |---|---|---|---|---|---|---|---|
@@ -1524,36 +812,25 @@ threads, snapshots every 10 s:
 | 2 | 5.04 | 280 ns | 470 ns | 200 ns | 1.0 | 2656 KiB | 137 ppm |
 | 3 | 5.24 | 280 ns | 470 ns | 191 ns | 1.0 | 2656 KiB | 130 ppm |
 
-No drift: p99.9 ends at 1.00x its first interval, Pss grows 20 KiB, and the rings
-lapped 3.9 times — which the harness *asserts*, because a soak that never lapped
-a ring did not exercise the path it exists for and must fail rather than print a
-clean table. Laps are `interval / retained`, both read from the arena, so the
-assertion holds for a workload with a different history too.
+No drift: p99.9 ends at 1.00x its first interval and Pss grows 20 KiB. The
+harness **asserts** the rings lapped (laps are `interval / retained`, both read
+from the arena), because a soak that never lapped a ring must fail rather than
+print a clean table. `declined` is the harness's own rate (queries aimed at the
+oldest end land just below the sliding window); stable ~130 ppm is the expected
+shape.
 
-The `declined` column is the harness's own, not the engine's, and it is reported
-as a rate precisely so that is checkable: the readers re-probe the retained
-window every few thousand lookups while the writers slide it, so queries aimed at
-the oldest end occasionally land just below it. **Stable at ~130 ppm across every
-interval** is the expected shape; a rate that *grew* would mean the window was
-sliding faster than the readers could follow.
-
-**Publish-to-visible is ~190 ns at p50** and this is the first time it has been
-measured. It is [`PHASE5.md`](../PHASE5.md) §9.2's required row: not lookup
-latency, but how long after a writer's `push` returns that a *different thread*
-can read the sample. A probe writer records when `push` returned and a probe
-reader spins until the arena reports that stamp. Its p99.9 is milliseconds and is
-not a claim about the engine — the probe reader is one of six runnable threads on
-four cores, and what that tail measures is the scheduler descheduling it.
+**Publish-to-visible is ~190 ns at p50** ([`PHASE5.md`](../PHASE5.md) §9.2's
+required row): how long after a writer's `push` returns a different thread can
+read the sample. Its p99.9 (milliseconds) is the scheduler descheduling the probe
+reader, one of six runnable threads on four cores, not a claim about the engine.
 
 ### The transport — `just dds-bench`
 
-Every tf2 comparison above this section feeds `tf2::BufferCore` in-process.
-That is deliberately generous to tf2 and is **not** what a deployed node pays:
-`mp_bench` says so in its own output ("this tf2 column is a FLOOR ... but no
-transport"). This is the run that pays it — one publisher, real DDS, the
-container's RMW, [`PHASE4.md`](../PHASE4.md) §5.2's QoS, 4 consumers, 100 Hz,
-100 ms query lag, 3 s warm-up discarded, **15 s measured** (`SECONDS_MEASURED`;
-every `.out` in the run records `measured_s 15.0`), both arms on stock defaults.
+Every comparison above feeds `tf2::BufferCore` in-process, generous to tf2. This
+run pays the transport: one publisher, real DDS, the container's RMW,
+[`PHASE4.md`](../PHASE4.md) §5.2's QoS, 4 consumers, 100 Hz, 100 ms query lag,
+3 s warm-up discarded, **15 s measured** (`SECONDS_MEASURED`), both arms on stock
+defaults.
 
 | arm | procs | consumers | svc p50 | svc p99 | svc p99.9 | CPU %/consumer | PSS |
 |---|---|---|---|---|---|---|---|
@@ -1562,181 +839,72 @@ every `.out` in the run records `measured_s 15.0`), both arms on stock defaults.
 | `tf_tree.composed` | 1 | 4 | **0.77 µs** | **3.62 µs** | **6.18 µs** | 0.656% | 24.76 MiB |
 | `tf_tree.processes` | 5 | 4 | 0.90 µs | 8.96 µs | 16.90 µs | **0.725%** | 69.51 MiB |
 
-`procs` is the count the tool prints, so `tf_tree.processes` reads **5** and not
-`4+1`: the bridge is a process an operator supervises and it is counted like
-one.
+`procs` counts the bridge (an operator supervises it), so `tf_tree.processes`
+reads 5. All arms are the same executable with a different `--mode`; the publisher
+plan, bridge topology config and query set are *generated* from one workload
+entry, so §9.3's "identical data" is structural.
 
-Against the ordinary ROS deployment (`tf2.processes`, one listener per node):
-**3.4x on p50** for the composed arm (2.59 / 0.77) and **4.1x on CPU** for the
-multi-process one (2.968 / 0.725). The multi-process arm's own p50 ratio is
-2.9x (2.59 / 0.90), and it is the weaker number for the reason two sections
-below: on this unpinned host that arm's p50 is wake-from-idle-dominated.
+Against the ordinary deployment (`tf2.processes`): **3.4x on p50** for the
+composed arm (2.59 / 0.77) and **4.1x on CPU** for the multi-process one
+(2.968 / 0.725). **The 4.1x is the conservative pairing**: it divides the
+*lowest* of four `tf2.processes` CPU samples (2.968 / 3.064 / 5.163 / 3.703, a
+74% spread) by the tf_tree row (0.725 / 0.724 / 0.728 / 0.710, a 2.5% spread);
+the medians give 4.7x. Take 4.1x as the floor of a one-host, four-run estimate.
+The multi-process arm's own p50 ratio is 2.9x (2.59 / 0.90), the weaker number
+for the wake-from-idle reason below.
 
-**The 4.1x is the conservative pairing and is quoted deliberately.** It divides
-the *lowest* of the four `tf2.processes` CPU samples by the tf_tree row, so the
-arm being argued against gets its best run. The medians of the same four samples
-give 4.7x (3.384 / 0.7245). Take 4.1x as the floor of a one-host, four-run
-estimate rather than as the measurement.
+`tf2.composed` is tf2's *best* case (one listener shared by four threads) and is
+there so the comparison is not a strawman. Against it `tf_tree.composed` leads at
+every percentile: **1.9x at p50** (1.43 / 0.77), **1.7x at p99** (6.21 / 3.62),
+**1.7x at p99.9** (10.50 / 6.18), at comparable memory.
 
-One run of four, all on this host within the hour; the row-to-row spread is in
-the CPU column and it is one-sided. `tf2.processes` measured
-2.968 / 3.064 / 5.163 / 3.703 %/consumer across the four — a 74 % spread;
-`tf_tree.processes` measured 0.725 / 0.724 / 0.728 / 0.710, a 2.5 % one. The tf2
-arm's variance is its four listener threads competing for four cores with the
-publisher; the tf_tree arm has one thread doing that work and it shows.
-
-**Two corrections to the previous version of this table, both mine and both
-changing what it says.**
-
-*The CPU column was measuring a sleeping thread.* `measure.hpp` read
-`/proc/self/schedstat`, which is the **main thread's** file — `mp.rs`'s
-`self_cpu_ns` says so in its own doc comment and sums `/proc/self/task/*`
-instead, and this header, which describes itself as a mirror of `mp.rs`, did
-not. Every arm here does its work on other threads. Measured on this host, two
-threads burning 4.004 s of CPU over a 2.003 s window moved
-`/proc/self/schedstat` by 0.000336 s. That is where "CPU per consumer is at the
-resolution floor for all three arms — 0.003–0.012%" came from: not a floor, an
-instrument pointed at the wrong thread. The withdrawal of the old "4.7x on CPU"
-reading is itself withdrawn; the column now reads 0.64–2.97% and 4.1x is
-measured.
-
-The replacement is `CLOCK_PROCESS_CPUTIME_ID`, not `mp.rs`'s task sum, because
-the task sum is a sum over **live** tasks and every consumer here reads its
-second sample after joining its query threads — so their CPU is subtracted and
-the `uint64_t` difference underflows. That was found in the field, in an attach
-process that printed `cpu_ns 18446744073701835266`. The two agree to 0.2 ms
-while the threads are alive (1.9481 s against 1.9479 s) and diverge completely
-once one exits (8.4117 s against 0.0004 s). **`mp.rs` carried the same latent
-hazard**, and whether it was reachable there was left as a question for that
-harness. It is now answered: **no, and it is fixed anyway.**
-
-Not reachable, because nothing that reads `ProcStats::cpu_ns` spawns a thread —
-`load_child` and `mp_consumer` are single-threaded, and `soak` reads only
-`pss_kib`, from inside a live `thread::scope`. And `ProcStats::since` saturates,
-so the failure mode here was never the absurd `18446744073701835266`; it was a
-plausible **zero**, which is the worse of the two to read past.
-
-Fixed anyway, because the trap should not be left for the next harness. Measured
-on this host, two threads burning 1 s each:
-
-| instrument | threads alive | after `join()` |
-|---|---|---|
-| `/proc/self/schedstat` (process-level) | 0.001 s | 0.001 s |
-| sum over `task/*` — what `mp.rs` read | 0.999 s | **0.001 s** |
-| `/proc/self/stat` `utime + stime` | 0.990 s | **2.000 s** |
-
-The process-level `schedstat` really is main-thread-only, as `mp.rs` always
-said; the task sum is exact while every thread lives and collapses afterwards;
-and `stat` is the only always-correct reading available here, at 10 ms
-quantisation. `measure.hpp`'s fix — `CLOCK_PROCESS_CPUTIME_ID` — is **not
-available to `mp.rs`**: `tf_tree_bench` is `#![forbid(unsafe_code)]` and
-`clock_gettime` needs `unsafe`.
-
-So the two are cross-checked rather than one being chosen. `stat` is read
-alongside the task sum, and when it exceeds the sum by more than two clock ticks
-the sum has provably lost a thread, so the coarse-but-correct number is returned
-instead. The 10 ms floor this workload cannot afford — ~4 ms of CPU per
-6-second window — is paid only when the alternative is a number that is false.
-`mp::tests::cpu_time_survives_a_thread_exiting` pins it, and its mutant
-(returning the task sum unconditionally) reports 0.34 ms for 400 ms burned.
-
-*The fourth row exists.* See below.
-
-`tf2.composed` is in the table because without it the comparison is a strawman:
-it is tf2's *best* case, one listener shared by four threads in one process.
-Against it `tf_tree.composed` leads at every percentile in the table:
-**1.9x at p50** (1.43 / 0.77), **1.7x at p99** (6.21 / 3.62) and **1.7x at
-p99.9** (10.50 / 6.18), at comparable memory.
-
-> **This paragraph used to say tf_tree "trails it at p99, 8.70 µs against 7.90"
-> and led "1.5x at p99.9", and neither number is in the table above it.** They
-> were the previous revision's row, kept when the row was replaced — a
-> comparison stated against measurements the document had already deleted. All
-> three ratios above are recomputed from the two rows as printed. Where
-> `tf_tree.processes` does lose is stated below; it is not this.
-
-Both arms are the same executable with a different `--mode`, so the schedule, the
-query set, the warm-up window and the measurement code are literally the same
-code. The publisher plan, the bridge's topology config and the query set are all
-*generated* from one workload entry, so §9.3's "identical data" is structural
-rather than promised.
+CPU is `CLOCK_PROCESS_CPUTIME_ID` in `measure.hpp`. `/proc/self/schedstat` is the
+**main thread's** file and reads a sleeping thread when work runs elsewhere;
+`mp.rs`'s sum over `/proc/self/task/*` is exact only while every thread lives,
+and collapses after `join()`; `/proc/self/stat` (`utime + stime`) is always
+correct at 10 ms quantisation. `clock_gettime` needs `unsafe`, which
+`tf_tree_bench` forbids, so `mp.rs` reads `stat` alongside the task sum and
+returns `stat` when it exceeds the sum by more than two ticks.
+`mp::tests::cpu_time_survives_a_thread_exiting` pins it.
 
 #### The fourth arm — `tf_tree.processes`
 
-Every version of this document before this one said there was no multi-process
-tf_tree arm, because `tft_bridge_create` built a **heap** arena no second process
-could attach to, and `dds_report` printed that gap above its own table on every
-run. [`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md) closed it:
-one `bench_consumer --mode tf_tree_bridge` process publishes its arena under
+[`0015`](../decisions/0015-the-bridge-fills-a-shared-arena.md): one
+`bench_consumer --mode tf_tree_bridge` process publishes its arena under
 `$TF_TREE_NAME`, four `--mode tf_tree_attach` processes join it read-only with
-`tft_tree_open()`, and none of them subscribes to `/tf`. It is §9.1's actual
-sentence — *"one bridge plus N `tf_tree` consumers"* — and it is the arm this
-project's central claim is about.
-
-**The bridge's cost is inside the row, not beside it.** The bridge process emits
-the same stats block as every other process in the arm with `consumers 0`, and
-the aggregator sums CPU and PSS across an arm and divides by the summed consumer
-count. So the 0.725% above is the whole arm, bridge included, amortized over the
-four consumers it serves. The breakdown over a 15 s window:
+`tft_tree_open()`, and none subscribes to `/tf` — §9.1's "one bridge plus N
+`tf_tree` consumers". **The bridge's cost is inside the row**: it emits the same
+stats block with `consumers 0`, and the aggregator sums CPU and PSS across an arm
+and divides by the summed consumer count. Over a 15 s window:
 
 | | fixed | per consumer | 4 consumers | 16 consumers (extrapolated) |
 |---|---|---|---|---|
 | `tf2.processes` CPU | — | 0.445 s | 1.78 s | 7.12 s |
 | `tf_tree.processes` CPU | 0.362 s (bridge) | 0.0186 s | 0.436 s | 0.66 s |
 
-**A marginal tf_tree consumer costs about 24x less CPU than a marginal tf2 one**
-(0.0186 s against 0.445 s), and the bridge's 0.362 s is paid once whatever N is.
-That is `PROJECT.md`'s O(1)-in-consumers argument, measured end to end over a
-real DDS for the first time. Break-even against tf2 is at roughly one consumer:
-the bridge costs less than a single tf2 listener does.
+**A marginal tf_tree consumer costs about 24x less CPU than a marginal tf2 one**,
+and the bridge's 0.362 s is paid once whatever N is; break-even against tf2 is
+roughly one consumer. This is `PROJECT.md`'s O(1)-in-consumers argument measured
+end to end over a real DDS. All figures are one run of four processes on one
+host: two significant figures.
 
-**Every figure in this section is one run of four processes on one host**, and
-both means above are means of four. Two significant figures is what that
-supports; the ratio is "about 24x", not 23.9x, and the break-even is "about one
-consumer", not a number with a decimal point in it. The spread that justifies
-the caution is in the CPU column above.
+**Where it is worse, at N = 4.**
 
-**Where it is worse, at N = 4.** Two places. The previous revision of this
-section named only the first, while its own table showed both:
+*Memory.* 69.51 MiB against 63.15: the arena is 1.3 MiB and shared; what
+dominates is that each of five processes carries an rclcpp node and a DDS
+participant. A per-consumer PSS quotient does not compare across these arms,
+because PSS divides a shared page by the number of mapping processes (4 vs 5),
+crediting tf_tree before any architectural difference exists. Totals are fair.
 
-*Memory.* 69.51 MiB against 63.15. The arena is 1.3 MiB and shared; what
-dominates is that each of the five processes carries an rclcpp node and a DDS
-participant.
+*Tail latency.* `tf_tree.processes` loses to `tf2.processes` at **p99 (8.96 µs
+against 8.64)** and **p99.9 (16.90 against 12.16)**
+([`PHASE5.md`](../PHASE5.md) §9.3 requires this in the table); the section below
+argues both are unpinned-host idle behaviour, which is why they need pinned
+hardware before anyone quotes them in either direction.
 
-> **A per-consumer PSS figure does not compare across these two arms, and this
-> paragraph used to be built out of one.** It divided each arm's total by its
-> consumer count and subtracted — "13.66 MiB against tf2's 15.79, a 2.13 MiB
-> saving" — which is confounded in the flattering direction by construction.
-> PSS divides each shared page by the number of processes mapping it, and these
-> arms map from a different number of processes: 4 for `tf2.processes`, 5 for
-> `tf_tree.processes`. The identical rclcpp text is therefore charged at S/4 to
-> a tf2 consumer and S/5 to a tf_tree one **before any architectural difference
-> exists**, and the quotient credits tf_tree with the difference. The totals are
-> exact and fair — PSS sums correctly across processes, which is the whole
-> reason this suite reports it — so the extrapolation has to come from them.
+### The memory curve
 
-Fit `total(P) = P·private + shared` to each stack's two arms, `P` being the
-process count, and read the marginal consumer off `private`:
-
-| | composed, P = 1 | processes | `private` | `shared` |
-|---|---|---|---|---|
-| `tf2` | 24.04 MiB | 63.15 MiB, P = 4 | (63.15 − 24.04)/3 = **13.04 MiB** | 24.04 − 13.04 = 11.00 MiB |
-| `tf_tree` | 24.76 MiB | 69.51 MiB, P = 5 | (69.51 − 24.76)/4 = **11.19 MiB** | 24.76 − 11.19 = 13.57 MiB |
-
-A marginal consumer therefore saves **≈1.85 MiB**, not 2.13, and the crossover —
-where `N·13.04 + 11.00` meets `(N+1)·11.19 + 13.57` — is at
-`(24.76 − 11.00)/1.85` ≈ **7.4 consumers**, not 7. This row is on the wrong side
-of it either way. **Treat both as approximate and single-run**: the fit has two
-points per stack and its `private` term is not purely per-process, because a
-composed process hosts four query threads where a `.processes` one hosts a
-single consumer, so per-consumer thread cost leaks into it. What the fit is good
-for is the direction and the order of magnitude, and both say the same thing the
-quotient did — this workload does not reach the crossover — with the thumb taken
-off the scale.
-
-### The curve, measured — the fit was right about the crossover and wrong about what it is worth
-
-`CONSUMERS=8`, `12` and `16`, one run each, same container and same recipe:
+`CONSUMERS=8`, `12`, `16`, one run each:
 
 | N | `tf2.processes` | `tf_tree.processes` | delta | tf2 per consumer | tf_tree per consumer |
 |---|---|---|---|---|---|
@@ -1745,119 +913,61 @@ off the scale.
 | 12 | 167.41 MiB | 168.39 MiB | +0.97 | 13.95 | 14.03 |
 | 16 | 226.59 MiB | **219.06 MiB** | **−7.54** | 14.16 | 13.69 |
 
-**The crossover is real and the fit located it correctly.** The sign flips
-between N = 4 and N = 8, against a fitted 7.4 — which is a better showing than
-two points per stack had any right to give.
-
-**The magnitude is the part the fit oversold, and it is oversold in the
-direction that flatters us.** "tf_tree wins above 7.4 consumers" reads as a
-threshold beyond which there is a win. What the curve actually shows is that
-**the two stacks are indistinguishable from N = 8 to N = 12** — −0.16 and +0.97
-MiB on totals of 114 and 168, well inside the run-to-run spread that a
-single-run measurement cannot resolve — and that the first difference clearly
-outside that spread is N = 16's 7.54 MiB, **3.3%**. Note also that the delta is
-not monotonic: it goes −0.16, +0.97, −7.54. One run per point cannot say whether
-that is noise around a slowly-widening gap or something structural, and the
-honest reading is the per-consumer columns rather than the deltas.
-
-Those columns are where the mechanism shows. **tf_tree's marginal consumer gets
-cheaper with N (17.38 → 14.23 → 14.03 → 13.69 MiB) while tf2's is flat (15.79 →
-14.25 → 13.95 → 14.16).** That is the shape the fit predicted for the right
-reason: tf_tree pays one *fixed* extra process — the bridge, with its own rclcpp
-node and DDS participant — and amortises it, while its marginal consumer is
-genuinely cheaper because it holds no per-node history. At N = 4 the fixed cost
-dominates and tf_tree loses by 10%; by N = 16 it is spread thin enough that the
-cheaper margin shows through.
+The sign flips between N = 4 and N = 8. The stacks are **indistinguishable from
+N = 8 to 12**, and the first difference clearly outside single-run spread is N =
+16's 7.54 MiB (**3.3%**); the delta is not monotonic, so read the per-consumer
+columns. tf_tree's marginal consumer falls (17.38 -> 13.69 MiB) while tf2's stays
+~14.2: one fixed extra process (the bridge, with its own rclcpp node and DDS
+participant) amortised, against a marginal consumer that holds no per-node
+history. A fit `total(P) = P·private + shared` predicted a crossover at ~7.4
+consumers; the location held, its implied magnitude did not. Repeat each N
+before quoting the number.
 
 **None of this is an arena difference.** The `composed` arms put both stacks in
 one process, and there tf_tree is worse by **+1.04, +0.80, +0.75 MiB** at N = 8,
-12, 16 — small, stable, and shrinking as N grows. That ~1 MiB is the arena. Every
-other megabyte in the table is rclcpp and DDS, which both stacks pay identically
-per process, which is why the whole comparison is dominated by *process count*
-and not by transform storage. Reporting this row as an arena result would be the
-error the `bridge_supervision` entry exists to name.
-
-The saving per consumer is small here because `robot` has 23 edges, so the tf2
-`Buffer` this replaces is itself small; a tree with thousands of edges of history
-moves that number and this one does not measure it.
-
-*Tail latency, on this host.* `tf_tree.processes` also loses to `tf2.processes`
-at **p99 (8.96 µs against 8.64)** and at **p99.9 (16.90 against 12.16)** in the
-table above. [`PHASE5.md`](../PHASE5.md) §9.3 requires that to be in the same
-table and not a footnote, so it is stated here rather than left for a reader to
-derive: memory is not the only column this arm is behind in. The section below
-argues those two numbers are the unpinned host's idle behaviour rather than the
-engine — and that argument is *why they need pinned hardware before anyone
-quotes them*, in either direction.
-
-The attach consumers also hold a full rclcpp node **on purpose**, subscribed to
-nothing. Dropping it would take ~14 MiB per process out of the row and measure
-"no rclcpp" rather than "no `/tf`", which is not the claim.
+12, 16: that ~1 MiB is the arena. Everything else is rclcpp and DDS, paid
+identically per process; the comparison is dominated by process count, and
+reporting it as an arena result is the error `bridge_supervision` names. `robot`
+has 23 edges, so the tf2 `Buffer` replaced is small; a tree with thousands of
+edges of history is not measured. The attach consumers hold an rclcpp node on
+purpose, subscribed to nothing: dropping it would remove ~14 MiB per process and
+measure "no rclcpp", not "no `/tf`".
 
 #### The `svc` column of both `.processes` arms is wake-from-idle-dominated
 
 `tf_tree.processes` p50 measured **5.89 µs** on the first run of the day and
-**0.90, 0.95, 1.02 µs** on three consecutive ones. That is not the engine. The
-slow run's distribution is bimodal — p10 0.79 µs, 18.1% of samples under 1 µs,
-p50 5.89, p75 10.05 — which is the shape of a thread waking a cold core, not of
-a slower lookup.
+**0.90, 0.95, 1.02 µs** on three consecutive ones; the slow run is bimodal (p10
+0.79 µs, 18.1% under 1 µs, p75 10.05), a thread waking a cold core. Same bridge,
+same shared arena, same rate, but four query threads in **one** attach process
+(never idle) measured **1.00 µs** against `tf_tree.composed`'s 0.78 on a private
+heap arena, ruling out the memfd mapping, page size and attach path. The arm is
+penalised for the consumer doing so little that its core sleeps; `tf2.processes`
+swings less (2.59 -> 11.07 µs) because a listener is always deserializing `/tf`.
 
-It was isolated rather than assumed. Same bridge, same **shared** arena, same
-rate, same queries, but the four query threads in **one** attach process instead
-of four — so the process is never idle — measured **1.00 µs p50** against
-`tf_tree.composed`'s 0.78 on a private heap arena. That rules out the memfd
-mapping, the page size and the attach path, and leaves the host's idle
-behaviour. The irony is exact: **the arm is penalised for the consumer doing so
-little that its core has time to go to sleep.** `tf2.processes` swings the same
-way and less far (2.59 → 11.07 µs across these runs) because a tf2 listener
-process is never idle — it is deserializing `/tf` the whole time.
-
-Both `.processes` rows' latency percentiles therefore need the pinned-hardware
-runbook below before they are quoted. **The `tf_tree.processes` CPU and PSS
-columns are steady across all four runs — 0.710–0.728 %/consumer, a 2.5 %
-spread — and are what this arm is for.** The `tf2.processes` CPU column is
-*not*: 2.968–5.163 across the same four, a 74 % spread, which is why the 4.1x
-above is quoted from the pairing that flatters tf2 and labelled conservative.
-This sentence used to say both columns were steady across all four runs, and
-the table two sections up refutes it.
+Both `.processes` latency percentiles need the pinned-hardware runbook before
+quoting. **The `tf_tree.processes` CPU and PSS columns are steady** (0.710–0.728
+%/consumer); the `tf2.processes` CPU column is not (2.968–5.163), which is why
+4.1x is quoted from the pairing that flatters tf2.
 
 #### A bridge defect this harness found — and fixed
 
-The first run of the tf_tree arm reported **10 070 transforms received, 187
-applied, 9 864 dropped as authority conflicts, and 100% of lookups failing** —
-against a single publisher and a correctly declared topology.
-
-`tf_tree_bridge::Publisher` was keyed on the **resolved node name**, not on the
-GID. `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an endpoint discovered
-before its participant's node information arrives and corrects it on a later
-graph walk, so the same publisher was attributed twice under two names. Under the
-default `first_writer_wins` the placeholder became the edge's owner and the
-corrected name was a *different* publisher, rejected permanently — that policy
-never re-inserts.
-
-**Fixed.** [`PHASE4.md`](../PHASE4.md) §5.3 already says the GID is the identity
-("match one against the other"); the implementation used the name. `Publisher`
-now carries the GID as its identity with the node name as presentation, and
-`PartialEq`/`Ord`/`Hash` read the identity alone — hand-written rather than
-derived, precisely so a later field cannot silently rejoin the key.
-
-The same change closes the *opposite* defect, which §5.3's own amendment had
-already named without fixing: `Publisher::UnknownGid` was a **unit** variant, so
-on an RMW that reports GIDs but resolves no names every publisher compared equal
-and §5.4's conflict detection was silently off — in exactly the deployment least
-able to diagnose it. A GID with no name is now a distinct publisher, and prints
-its GID so a diagnostic can tell two of them apart. A publisher with **no GID at
-all** stays the unit `Unattributed`, because `0012`'s ladder requires that less
-attribution mean less detection and never more stopping.
-
-Two regression tests gate it (`crates/tf_tree_c/tests/bridge.rs`), and both were
-checked against mutants: putting the name back in the identity fails the rename
-test, and collapsing uncached GIDs to a sentinel fails the two-publishers test.
-This same arm now runs at **0 dropped of 16 373 transforms under the default
-policy**, which is the end-to-end evidence.
-
-It was found only because the aggregator flags a row whose lookups mostly failed
-instead of printing its (excellent) latencies as a result.
+The first tf_tree run reported 10 070 transforms received, 187 applied, 9 864
+dropped as authority conflicts and 100% of lookups failing, against one
+publisher and a correct topology. `tf_tree_bridge::Publisher` was keyed on the
+resolved *node name*, and `rmw_fastrtps` reports `_NODE_NAME_UNKNOWN_` for an
+endpoint discovered before its node information arrives, so one publisher was
+attributed under two names and `first_writer_wins` rejected the real one
+permanently. [`PHASE4.md`](../PHASE4.md) §5.3 already makes the GID the identity:
+`Publisher` now carries the GID as identity with the node name as presentation,
+and `PartialEq`/`Ord`/`Hash` are hand-written to read the identity alone.
+`Publisher::UnknownGid` is no longer a unit variant (on an RMW that reports GIDs
+but resolves no names every publisher compared equal and §5.4's conflict
+detection was off); a publisher with **no GID at all** stays the unit
+`Unattributed`, because `0012`'s ladder requires that less attribution mean less
+detection and never more stopping. Two tests in
+`crates/tf_tree_c/tests/bridge.rs` gate it (mutant-checked), and the arm now runs
+**0 dropped of 16 373 transforms** under the default policy. The aggregator
+flags a row whose lookups mostly failed instead of printing its latencies.
 
 ## A real difference: maximum chain depth
 
@@ -1868,85 +978,48 @@ tf_tree bounds a path twice; **tf2 bounds it not at all.**
 * `tf_tree_core::MAX_DEPTH` (**32**) caps the *compiled plan*, counted **after**
   adjacent rigid links fold into one step. A 40-link fixed chain is one step.
 
-Either overrun is `LookupError::TreeTooDeep`, and its `depth` says which:
-`MAX_PATH_EDGES + 1` is the walk, anything at or below `MAX_PATH_EDGES` is the
-exact folded step count.
-
-This is a deliberate design choice — the fixed `[Step; MAX_DEPTH]` array is what
-makes `Plan` `Copy`, heap-free and allocation-free. It was hit while building the
-scaling row above (a 24-deep spine was refused outright when **one** number did
-both jobs), so it is recorded here rather than discovered by a user.
+Either overrun is `LookupError::TreeTooDeep`; its `depth` is `MAX_PATH_EDGES + 1`
+for the walk, else the exact folded step count. The fixed `[Step; MAX_DEPTH]`
+array is what makes `Plan` `Copy`, heap-free and allocation-free.
 [`0034`](../decisions/0034-the-depth-bound-priced-two-slots-the-same.md) split
 the two and re-sized both; the survey behind the sizes is in
 [`PHASE1.md` §7.1](../PHASE1.md#71-step-representation).
 
 **If you are migrating from tf2, the number to compare is your worst frame
 pair's diameter — up to the common ancestor and back down — not your tree's
-root-to-leaf depth.** Past 64 edges, or past 32 steps once your fixed joints are
-declared static, tf_tree refuses the lookup. Check before adopting.
+root-to-leaf depth.** Past 64 edges, or past 32 steps once fixed joints are
+declared static, tf_tree refuses the lookup.
 
 ## Data provenance
 
-The recorded stream is derived from an indoor/outdoor mobile-robot dataset
-released under **CC BY 4.0** (DOI [10.5281/zenodo.19894190](https://doi.org/10.5281/zenodo.19894190)).
-See [`testdata/tfstream/ATTRIBUTION.md`](../../testdata/tfstream/ATTRIBUTION.md)
-for the full attribution and the list of changes made.
-
-Licensing was the binding constraint on dataset choice. Several widely-used
-robotics datasets (KITTI, nuScenes, Newer College, Boreas) are CC BY-**NC**-SA,
-whose non-commercial clause makes them unusable in a permissively-licensed
-repository; Autoware's datasets and TUM RGB-D state no clear license at all.
+The recorded stream is derived from an indoor/outdoor mobile-robot dataset under
+**CC BY 4.0** (DOI [10.5281/zenodo.19894190](https://doi.org/10.5281/zenodo.19894190));
+see [`testdata/tfstream/ATTRIBUTION.md`](../../testdata/tfstream/ATTRIBUTION.md).
+Licensing bound the choice: KITTI, nuScenes, Newer College and Boreas are CC
+BY-**NC**-SA, and Autoware's and TUM RGB-D state no clear license.
 
 ## What is still not measured
 
 * **The go/no-go latency gate** (depth-3 p50 < 150 ns ScLerp / < 100 ns
-  LerpSlerp). Needs dedicated, core-pinned hardware. The indicative numbers above
-  are in the right territory, but a mean over a loop on a shared VM is not a p50
-  on isolated cores, and must not be reported as one.
-* ~~**Concurrent read scaling on an idle machine.**~~ **Done** — the scaling
-  tables above are from two runs on an idle host (load < 1.0, nothing but the
-  harness), 101 rounds and 100,000 latency samples per point, engines interleaved
-  within each round. Every row except the 4-thread one repeats to within 1%
-  across the two runs; the 4-thread row is discussed above and this hardware
-  cannot measure it precisely.
-* **The 6x scaling gate, on >= 8 physical cores.** Measured 5.35x-5.62x on a
-  4-core host, where 8 threads can only exceed 4x via SMT. Not a fair test of the
-  criterion either way.
-* ~~**Read scaling under concurrent writers.**~~ **Done** — `just
-  contended-scaling`, above. Four concurrent writers cost ~9% of aggregate
-  throughput and nothing at p99.9, with zero slot-failure counters.
-* ~~**Per-thread core pinning.**~~ **Done for the multi-process harness** —
-  `contended_scaling` places each reader and each writer on its own core with
-  `taskset`, one process per core. The criterion benches still pin nothing and
-  say so; per-*thread* placement needs `sched_setaffinity`, which `CLAUDE.md`'s
-  unsafe budget routes to a decision record.
-* **A non-SMT machine.** 4 physical cores cap what an 8-thread row can show.
-* ~~**tf2 under concurrent writers.**~~ **Done** — `TF2_WRITERS=N just
-  tf2-scaling`, in the section above. It separates the engines more sharply than
-  any other row here.
-* **tf2 under writers on the *queried* edges.** The sweep above writes edges the
-  query path does not traverse, which is the architectural comparison. Writing on
-  path additionally slides the queried window under a fixed stamp sweep, so it
+  LerpSlerp) needs dedicated, core-pinned hardware; a mean over a loop on a
+  shared VM is not a p50 on isolated cores.
+* **The 6x scaling gate on >= 8 physical cores.** Measured 5.35x-5.62x on 4.
+* **A non-SMT machine.**
+* **Per-thread core pinning.** `contended_scaling` pins one process per core; the
+  criterion benches pin nothing, and per-thread placement needs
+  `sched_setaffinity`, routed by the unsafe budget to a decision record.
+* **tf2 under writers on the *queried* edges.** The sweep writes edges the query
+  path does not traverse; writing on path also slides the queried window and
   needs the moving-window handling `contended_scaling` has and `tf2_scaling` does
-  not. Expect it to hurt both engines; the question is by how much each.
-* ~~**tf_tree across processes over DDS.**~~ **Done** — `just dds-bench`'s
-  fourth arm, above: one bridge process publishing a shared arena and four
-  processes attached to it, 0% failures, with the bridge's CPU and PSS inside
-  the row. What is *not* done is its latency on pinned cores; both
-  `.processes` arms' `svc` percentiles are wake-from-idle-dominated on this
-  host, and the section above measures why rather than asserting it.
-* ~~**The memory crossover, measured rather than extrapolated.**~~ **Done** —
-  the curve is above, at N = 8, 12 and 16. The fit's crossover near 7.4 was
-  right; its implied *magnitude* was not, and the correction is in that section.
-  What remains open is **spread**: every point is one run, the delta is not
-  monotonic across them, and nothing here can say whether N = 16's 7.54 MiB is a
-  widening gap or a lucky run. Repeat each N before quoting the number.
-* **A second RMW.** `docker/tf2` carries one, so the DDS numbers' sensitivity to
-  the middleware vendor is unmeasured. [`PHASE4.md`](../PHASE4.md) §0.0 already
-  records the missing second RMW.
-* **An ingest-throughput benchmark.** [`PHASE5.md`](../PHASE5.md) §12 gate 5 is
-  still held by nobody. It is an offline path, so this suite deliberately did
-  not fold it in.
+  not.
+* **tf_tree over DDS on pinned cores.** Both `.processes` arms' `svc`
+  percentiles are wake-from-idle-dominated on this host.
+* **The memory curve's spread.** Every point is one run and the delta is not
+  monotonic; repeat each N before quoting N = 16's 7.54 MiB.
+* **A second RMW.** `docker/tf2` carries one; [`PHASE4.md`](../PHASE4.md) §0.0
+  records the gap.
+* **An ingest-throughput benchmark.** [`PHASE5.md`](../PHASE5.md) §12 gate 5; an
+  offline path, deliberately not folded into this suite.
 
 ## Runbook for pinned hardware
 
@@ -1961,12 +1034,9 @@ taskset -c 2 ./docker/tf2/run.sh \
   'cargo bench -p tf_tree_bench --features tf2 --bench tf2_compare'
 ```
 
-Report p50/p99/p99.9, not means — [`PHASE1.md`](../PHASE1.md) §11.2 is explicit that the tail is
-what a control loop cares about.
-
-The performance suite above is run the same way, and its harnesses **refuse** on
-a busy machine rather than producing a number that describes somebody else's
-workload:
+Report p50/p99/p99.9, not means ([`PHASE1.md`](../PHASE1.md) §11.2). The
+performance suite runs the same way, and its harnesses **refuse** on a busy
+machine:
 
 ```bash
 just contended-scaling --workload robot --seconds 8   # §11.2's row, pinned
@@ -1985,7 +1055,6 @@ just bench-ab target/bench-runs/<a>/contended_scaling.json \
                target/bench-runs/<b>/contended_scaling.json
 ```
 
-`bench_ab` reads the direction and the tolerance from the file rather than
-inferring either from a key name, and exits non-zero on a regression, so it drops
-into a bisect script unwrapped. Two runs of the same build must report every row
-as `noise` — that property is the reason to trust it, and it is checked.
+`bench_ab` reads direction and tolerance from the file, and exits non-zero on a
+regression. Two runs of the same build must report every row as `noise`; that
+property is checked.

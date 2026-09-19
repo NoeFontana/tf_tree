@@ -1,40 +1,17 @@
 #!/usr/bin/env bash
 # Run a gate recipe and read its exit code against a declared policy.
 #
-# `crates/tf_tree_bench/src/gate.rs` fixes the contract a gate binary leaves
-# with: 0 PASS, 1 FAIL, 2 REFUSED (not evaluated). This script is the only place
-# that *interprets* those, so a workflow cannot re-spell the reading and drift
-# from it — which is the failure `CLAUDE.md` records for `just lint`'s
-# `tf_tree_c --features test-hooks` clippy row, one layer down.
-#
-# The three policies exist because "this host cannot evaluate the gate" is a
-# different fact from "the gate passed", and both are different from "the gate
-# failed". Which of those is *acceptable* is a property of the caller, not of
-# the binary, so the caller states it:
+# `crates/tf_tree_bench/src/gate.rs` fixes the exit codes: 0 PASS, 1 FAIL,
+# 2 REFUSED (not evaluated). This script is the only place that interprets them.
+# The caller states which reading is acceptable:
 #
 #   must-pass    0 -> pass.  1 -> fail.  2 -> FAIL.
-#                A host that could evaluate a gate and now cannot is a finding,
-#                not a free pass. Use where the gate is known to run here.
+#   may-refuse   0 -> pass.  1 -> fail.  2 -> pass, and emit a ::warning::
+#                (a refusal is a host fact, kept visible rather than silently green).
+#   must-refuse  2 -> pass.  0 -> FAIL, naming the doc row to update.  1 -> fail.
+#                (stops a permanent refusal going vacuous.)
 #
-#   may-refuse   0 -> pass.  1 -> fail.  2 -> pass, and emit a ::warning::.
-#                Use where a PASS is expected but a refusal is a *host* fact
-#                rather than a regression — a binary whose exit 2 can be caused
-#                by the runner being loaded. The ::warning:: is what keeps a
-#                persistent refusal visible instead of silently green.
-#                The 0-arm deliberately emits no ::notice::: for a gate that is
-#                expected to pass, an annotation on every green run is noise.
-#
-#   must-refuse  2 -> pass.
-#                0 -> FAIL, naming the doc row to update.
-#                1 -> fail.
-#                This is the one that stops a permanent refusal going vacuous.
-#                The day someone re-cuts a criterion or the fixture grows past
-#                the arithmetic, the job goes red pointing at the document that
-#                still says it cannot be measured.
-#
-# Unknown policies and unknown recipes are refused rather than defaulted: a
-# typo'd policy that silently became `may-refuse` would make every gate
-# unfailable at once.
+# Unknown policies and recipes are refused, never defaulted.
 set -uo pipefail
 
 usage() {
@@ -42,18 +19,11 @@ usage() {
     exit 64
 }
 
-# `--self-test` drives all nine (policy x code) cells against a stub, because a
-# policy runner that mis-reads one cell is invisible: every gate keeps printing
-# its own verdict and only the job colour is wrong. `grep -c` exiting 1 on zero
-# matches has inverted an answer in this repository before.
+# `--self-test` drives all nine (policy x code) cells against a stub; a mis-read cell would only colour the job wrong.
 if [ "${1:-}" = "--self-test" ]; then
     stub=$(mktemp -d)
     trap 'rm -rf "$stub"' EXIT
-    # The stub must model `just` faithfully: `--show` is this script's
-    # recipe-existence probe and always succeeds for a recipe that exists, while
-    # running the recipe returns the code under test. Conflating the two made
-    # six of nine cells report 64 (usage) on the first run of this self-test —
-    # which is the self-test earning its place before it ever gated anything.
+    # The stub models `just`: `--show` (recipe-existence probe) succeeds; running returns the code under test.
     printf '#!/usr/bin/env bash\ncase "${1:-}" in --show) exit 0 ;; esac\nexit ${STUB_CODE:-0}\n' >"$stub/just"
     chmod +x "$stub/just"
     fails=0

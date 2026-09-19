@@ -1,48 +1,20 @@
 //! CDR decoding of `tf2_msgs/msg/TFMessage` — `docs/PHASE5.md` §3.3.
 //!
-//! # Why this is hand-written and not a dependency
+//! Hand-written so the `mcap` crate needs no ROS (§0.0): the grammar is four
+//! primitives and two strings.
 //!
-//! MCAP is self-describing about *framing* — schema name, message encoding —
-//! but the bytes of a `cdr`-encoded message are only decodable by something that
-//! knows OMG CDR. §0.0 records that the `mcap` crate needs no ROS; that is only
-//! true if the one message type this phase cares about is decoded here. The
-//! whole grammar below is four primitives and two strings, and it is entirely
-//! specified by the alignment rules restated in `Reader`.
+//! ROS transmits quaternions **w-last**; the canonical `[f64; 7]` order is
+//! w-first (`docs/PHASE1.md` §3.1). A transposition yields a valid but wrong
+//! rotation, so it happens once, in `Reader::transform`, and is tested against
+//! wire-order bytes (`wire_bytes_decode_w_last`).
 //!
-//! # The one place a mistake would be silent
-//!
-//! ROS transmits quaternions **w-last** (`x y z w`); `tf_tree_math::Quat` is
-//! w-first, and so is the `[f64; 7]` canonical order this crate passes around
-//! (`docs/PHASE1.md` §3.1). A transposition here does not fail — it produces a
-//! valid unit quaternion describing a *different* rotation, which then flows all
-//! the way into a `.tft` and out into somebody's training set. It is
-//! transposed once, in `Reader::transform`, and tested against bytes captured
-//! from the wire order rather than against this module's own encoder.
-//!
-//! # It allocates per transform, and that is a known, measured, accepted cost
-//!
-//! [`TransformStamped`] owns two `String`s and `NameNormalizer::normalize`
-//! returns two more, so a transform costs four heap allocations plus one `Vec`
-//! per message — and the whole decode runs `1 + G` times, once for the survey
-//! and once per `--max-memory` group. `Reader::string` could yield a `&'a str`
-//! borrowed from the payload, with owning deferred to `Frames::intern`, which
-//! already deduplicates; that is worth an estimated 2–5× on this path.
-//!
-//! It is **not** done, and the reason is a number rather than an opinion.
-//! Measured on this host, release build, a 90 000-transform synthetic recording:
-//! **54.8 ms, 609 µs per 1 000 transforms**, against a §12 gate 5 that asks for
-//! 10× real time. This is an offline batch path that runs once per recording,
-//! not an engine hot path — **nothing in this crate touches a lookup or a push**
-//! — and the borrow refactor would change `TransformStamped`'s shape, which the
-//! fixture encoder also uses. Recorded here so the next person to open this file
-//! finds the measurement instead of rediscovering the allocations.
+//! Decoding allocates per transform (owned `String`s); this is an offline batch
+//! path measured well inside §12 gate 5, so borrowing was not done.
 
 /// Why a `TFMessage` payload could not be decoded.
 ///
-/// `Copy` and `String`-free (`docs/PROJECT.md` §5). Each variant carries the
-/// byte offset at which the decode gave up, because "this bag has one bad
-/// message in 400 000" is a different problem from "this bag is not CDR" and the
-/// offset is what tells them apart.
+/// `Copy` and `String`-free (`docs/PROJECT.md` §5); variants carry the byte offset
+/// at which decoding gave up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CdrError {
@@ -54,21 +26,16 @@ pub enum CdrError {
         /// How many bytes the field needed.
         want: usize,
     },
-    /// The 4-byte encapsulation header was missing or names a representation
-    /// this decoder does not implement.
-    ///
-    /// XCDR2 (`0x0006`..`0x0009`) lands here deliberately rather than being
-    /// decoded as XCDR1: for a flat, final-extensibility struct like
-    /// `TFMessage` the two encodings agree, but nothing in the payload proves
-    /// the struct is flat, and guessing would corrupt a nested one silently.
+    /// The encapsulation header was missing or names an unimplemented
+    /// representation. XCDR2 (`0x0006`..`0x0009`) lands here deliberately, not
+    /// decoded as XCDR1.
     #[error("unsupported CDR encapsulation 0x{id:04x}")]
     BadEncapsulation {
         /// The representation identifier that was found.
         id: u16,
     },
-    /// A string field's length prefix was zero, or ran past the payload. CDR
-    /// strings include their NUL terminator, so a length of zero is malformed
-    /// rather than empty.
+    /// A string length prefix was zero (CDR strings include their NUL) or ran
+    /// past the payload.
     #[error("bad CDR string length {len} at byte {at}")]
     BadString {
         /// Offset of the length prefix.
@@ -76,19 +43,14 @@ pub enum CdrError {
         /// The length that was read.
         len: u32,
     },
-    /// A frame name was not UTF-8. ROS frame ids are unconstrained bytes on the
-    /// wire, so this is a real recording defect and not an impossibility.
+    /// A frame name was not UTF-8.
     #[error("frame name at byte {at} is not UTF-8")]
     NotUtf8 {
         /// Offset of the string body.
         at: usize,
     },
-    /// The transform array's length prefix exceeds what the remaining payload
-    /// could hold even at the minimum encoded size of one element.
-    ///
-    /// Checked before allocating: a corrupt `u32` would otherwise ask for a
-    /// 4-billion-element `Vec` and take the process out on a recording that is
-    /// merely damaged.
+    /// The array length prefix exceeds what the remaining payload could hold at
+    /// the minimum element size; checked before allocating.
     #[error("TFMessage claims {count} transforms, which cannot fit in {bytes} bytes")]
     ImplausibleCount {
         /// The declared element count.
@@ -112,25 +74,14 @@ pub struct TransformStamped {
     pub pose: [f64; 7],
 }
 
-/// The smallest number of bytes one `TransformStamped` can occupy: 4 (`sec`)
-/// + 4 (`nanosec`) + 5 (a one-character `frame_id` with its length and NUL)
-/// + 5 (`child_frame_id`) + 56 (seven `f64`), before any alignment padding.
-///
-/// Used only as the denominator of the plausibility check in
-/// [`decode_tf_message`]; being an *under*-estimate is what makes that check
-/// safe to reject on.
+/// A lower bound on one encoded `TransformStamped` (no padding), the
+/// denominator of `decode_tf_message`'s plausibility check.
 const MIN_TRANSFORM_BYTES: usize = 4 + 4 + 5 + 5 + 56;
 
 /// A cursor over one CDR-encapsulated body.
 ///
-/// # Alignment, which is the whole of CDR
-///
-/// Every primitive of size `n` starts at an offset that is a multiple of `n`,
-/// **counted from the start of the encapsulated body** — that is, from just
-/// after the 4-byte encapsulation header, not from the start of the buffer the
-/// transport handed over. `buf` here is the body alone, so `pos` is already the
-/// right origin; slicing the header off in [`decode_tf_message`] rather than
-/// tracking an offset is what makes that impossible to get wrong.
+/// Every primitive of size `n` starts at a multiple of `n` counted from the
+/// start of the body (after the 4-byte header); `buf` is the body alone.
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -183,11 +134,8 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// A CDR `string`: a `u32` length **including** the NUL terminator, then
-    /// that many bytes. The terminator is dropped here rather than trusted —
-    /// some serializers emit a length that does not count it, and a name with a
-    /// trailing NUL interns as a *different* frame from the same name without
-    /// one, which is a bug that only shows up as a missing transform.
+    /// A CDR `string`: a `u32` length including the NUL, then the bytes. The NUL
+    /// is dropped if present, since some serializers do not count it.
     fn string(&mut self) -> Result<String, CdrError> {
         let at = self.pos;
         let len = self.u32()?;
@@ -207,15 +155,12 @@ impl<'a> Reader<'a> {
 
     /// One `geometry_msgs/msg/TransformStamped`.
     fn transform(&mut self) -> Result<TransformStamped, CdrError> {
-        // std_msgs/Header: builtin_interfaces/Time { int32 sec, uint32 nanosec }
-        // then string frame_id. `sec` is signed and pre-1970 stamps are a real
-        // (broken) thing to find in a bag, so the widening is signed too.
+        // Header: Time { int32 sec, uint32 nanosec }, then frame_id. `sec` is signed.
         let sec = i64::from(self.i32()?);
         let nanosec = i64::from(self.u32()?);
         let frame_id = self.string()?;
         let child_frame_id = self.string()?;
-        // geometry_msgs/Transform: Vector3 translation, then Quaternion
-        // rotation — and the quaternion is **x y z w** on the wire.
+        // Vector3 translation, then the quaternion as x y z w.
         let tx = self.f64()?;
         let ty = self.f64()?;
         let tz = self.f64()?;
@@ -224,9 +169,7 @@ impl<'a> Reader<'a> {
         let qz = self.f64()?;
         let qw = self.f64()?;
         Ok(TransformStamped {
-            // `saturating` rather than wrapping: a `sec` near `i64::MAX/1e9` is
-            // corrupt data, and the anomaly counters downstream would rather see
-            // an absurdly large stamp than a wrapped, plausible-looking one.
+            // Saturating: corrupt data should look absurd, not plausible.
             stamp_ns: sec.saturating_mul(1_000_000_000).saturating_add(nanosec),
             frame_id,
             child_frame_id,
@@ -239,8 +182,7 @@ impl<'a> Reader<'a> {
 ///
 /// # Errors
 ///
-/// [`CdrError`] — see its variants. Nothing here is a panic path: every length
-/// read off the wire is bounds-checked before it is used.
+/// [`CdrError`]; every wire length is bounds-checked, so nothing panics.
 pub fn decode_tf_message(payload: &[u8]) -> Result<Vec<TransformStamped>, CdrError> {
     if payload.len() < 4 {
         return Err(CdrError::Truncated {
@@ -248,8 +190,7 @@ pub fn decode_tf_message(payload: &[u8]) -> Result<Vec<TransformStamped>, CdrErr
             want: 4 - payload.len(),
         });
     }
-    // The encapsulation header is big-endian by definition, whatever the body
-    // that follows it is.
+    // The header is big-endian whatever the body is.
     let id = u16::from_be_bytes([payload[0], payload[1]]);
     let little_endian = match id {
         0x0000 | 0x0002 => false,
@@ -275,11 +216,7 @@ pub fn decode_tf_message(payload: &[u8]) -> Result<Vec<TransformStamped>, CdrErr
 
 /// Encode a `TFMessage` payload the way ROS 2 does (XCDR1, little-endian).
 ///
-/// Present so the synthetic fixture in [`crate::fixture`] can produce real
-/// message bytes. It is deliberately **not** used as the oracle for
-/// [`decode_tf_message`]'s tests: a decoder tested only against its own encoder
-/// agrees with itself about a transposed quaternion. See
-/// `wire_bytes_decode_w_last`.
+/// For [`crate::fixture`]. Not the decoder's oracle: see `wire_bytes_decode_w_last`.
 #[cfg(any(test, feature = "fixture"))]
 #[must_use]
 pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
@@ -327,14 +264,8 @@ pub fn encode_tf_message(transforms: &[TransformStamped]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// A hand-assembled little-endian `TFMessage` carrying one transform, with
-    /// the quaternion in ROS's **w-last** wire order and every component
-    /// distinct.
-    ///
-    /// The distinctness is the fixture's whole job: with `q = (1,0,0,0)` — which
-    /// is what a lazily-built fixture uses — a w-last/w-first transposition is
-    /// invisible, and this repository has shipped that class of vacuous test
-    /// before.
+    /// A hand-assembled little-endian one-transform `TFMessage`, w-last, with
+    /// every quaternion component distinct so a transposition is visible.
     fn wire_one() -> Vec<u8> {
         let mut b: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
         b.extend_from_slice(&1u32.to_le_bytes()); // 1 transform
@@ -342,9 +273,7 @@ mod tests {
         b.extend_from_slice(&250_000_000u32.to_le_bytes()); // nanosec
         b.extend_from_slice(&5u32.to_le_bytes()); // "odom\0"
         b.extend_from_slice(b"odom\0");
-        // CDR aligns every primitive, so the next length prefix starts on a
-        // 4-byte boundary counted from the body. Omitting this pad is exactly
-        // the mistake the decoder must not mirror.
+        // Pad to a 4-byte boundary counted from the body.
         while !(b.len() - 4).is_multiple_of(4) {
             b.push(0);
         }
@@ -362,13 +291,7 @@ mod tests {
         b
     }
 
-    /// Wire bytes decode with the quaternion transposed to w-first and the
-    /// stamp flattened to nanoseconds.
-    ///
-    /// Mutant: swap the two `for v in [...]` loops in `Reader::transform` so
-    /// `pose` is filled `[qx, qy, qz, qw, ...]` — applied, and this test failed
-    /// on the `pose` assertion. A second mutant, dropping the `saturating_mul`
-    /// factor to `1_000_000`, also failed on `stamp_ns`.
+    /// Wire bytes decode with the quaternion w-first and the stamp in nanoseconds.
     #[test]
     fn wire_bytes_decode_w_last() {
         let got = decode_tf_message(&wire_one()).unwrap();
@@ -382,13 +305,7 @@ mod tests {
         );
     }
 
-    /// The encoder used by the fixture round-trips through the decoder, for a
-    /// stamp that is not a whole second and for several transforms in one
-    /// message.
-    ///
-    /// Mutant: change `put_str` to write `s.len()` instead of `s.len() + 1` —
-    /// applied, and the round trip failed (the decoder consumed one byte too
-    /// few and read the next length prefix out of the name's NUL).
+    /// The fixture encoder round-trips, with a fractional and a negative stamp.
     #[test]
     fn encoder_round_trips() {
         let src = vec![
@@ -408,10 +325,7 @@ mod tests {
         assert_eq!(decode_tf_message(&encode_tf_message(&src)).unwrap(), src);
     }
 
-    /// A big-endian encapsulation is decoded, not guessed at.
-    ///
-    /// Mutant: map `0x0000` to `little_endian = true` — applied, and the stamp
-    /// came back as `0x0700_0000` seconds instead of 7.
+    /// A big-endian encapsulation is decoded.
     #[test]
     fn big_endian_encapsulation() {
         let mut b: Vec<u8> = vec![0x00, 0x00, 0x00, 0x00];
@@ -439,11 +353,7 @@ mod tests {
         assert_eq!(got[0].pose[0], 1.0);
     }
 
-    /// A truncated payload is an error at a named offset, never a panic.
-    ///
-    /// Mutant: replace `take`'s bounds check with `&self.buf[at..end]` — applied,
-    /// and the test aborted with an index-out-of-bounds panic instead of
-    /// returning `Truncated`.
+    /// A truncated payload is an error, never a panic.
     #[test]
     fn truncation_is_an_error_not_a_panic() {
         let full = wire_one();
@@ -455,10 +365,7 @@ mod tests {
         }
     }
 
-    /// A corrupt element count is rejected before anything is allocated.
-    ///
-    /// Mutant: delete the `ImplausibleCount` check — applied, and the test
-    /// aborted with a capacity-overflow abort from `Vec::with_capacity`.
+    /// A corrupt element count is rejected before allocating.
     #[test]
     fn absurd_count_is_rejected_before_allocating() {
         let mut b: Vec<u8> = vec![0x00, 0x01, 0x00, 0x00];
@@ -473,9 +380,6 @@ mod tests {
     }
 
     /// XCDR2 is refused rather than decoded as XCDR1.
-    ///
-    /// Mutant: add `0x0006 | 0x0007` to the little-endian arm — applied, and
-    /// this test failed with `Ok(..)` where it expects `BadEncapsulation`.
     #[test]
     fn xcdr2_is_refused() {
         let mut b: Vec<u8> = vec![0x00, 0x07, 0x00, 0x00];
@@ -486,26 +390,9 @@ mod tests {
         );
     }
 
-    /// **A malformed frame name is a named error at a named offset**, never a
-    /// panic and never a frame silently called `"\u{fffd}"`.
-    ///
-    /// The three ways a string prefix off a damaged sector can be wrong, two of
-    /// which had no test at all. `wire_one`'s first length prefix sits at payload
-    /// byte 16 — 4 encapsulation, 4 count, 4 `sec`, 4 `nanosec` — so body offset
-    /// 12, which is the `at` the first variant reports.
-    ///
-    /// * **Zero.** CDR strings include their NUL, so a length of `0` is malformed
-    ///   rather than empty; reading it as empty would intern a nameless frame.
-    /// * **Not UTF-8.** ROS frame ids are unconstrained bytes on the wire, which
-    ///   is why the variant exists; a lossy conversion here would put a frame in
-    ///   the arena that no launch file can name.
-    /// * **Past the payload**, which is the bound that keeps the two above from
-    ///   being reachable only through a slice panic.
-    ///
-    /// Mutant: drop the `if len == 0` arm in `Reader::string` — the first row
-    /// fails with `Ok`, holding a transform whose `frame_id` is `""`. Mutant 2:
-    /// `String::from_utf8_lossy` in place of `from_utf8` — the second row fails
-    /// the same way.
+    /// A malformed frame name is a named error at a named offset, never a panic
+    /// or a lossy guess: zero length, non-UTF-8, and a length past the payload.
+    /// `wire_one`'s first length prefix is at payload byte 16, body offset 12.
     #[test]
     fn a_malformed_frame_name_is_a_named_error_not_a_guess() {
         let mut b = wire_one();
@@ -521,9 +408,7 @@ mod tests {
 
         let mut b = wire_one();
         b[16..20].copy_from_slice(&4096u32.to_le_bytes());
-        // `ImplausibleCount` does not catch this: it bounds the *element* count,
-        // not a string length inside an element. `take`'s bounds check is what
-        // refuses it, and it reports the offset the read started from.
+        // `take`'s bounds check refuses this; `ImplausibleCount` bounds elements only.
         assert_eq!(
             decode_tf_message(&b),
             Err(CdrError::Truncated { at: 16, want: 4096 }),

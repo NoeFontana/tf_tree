@@ -1,26 +1,10 @@
 //! Is the plan fold's adjoint worth restructuring? — a tuning probe.
 //!
-//! `deriv_cost` measures `at_with_derivatives` at **+21 ns per plan step** over
-//! `at`, flat across depth 1/3/8, while ξ-recovery costs only **1.6 ns**. So the
-//! per-step cost is almost entirely the adjoint, and that is where any tuning has
-//! to happen.
-//!
-//! `Iso3::adjoint_inv` is two [`tf_tree::Quat::rotate`] calls and a cross product
-//! — about 40 flops. At 21 ns that is ~2 flops/ns, far off this core's
-//! throughput, which says the chain is **latency**-bound rather than
-//! throughput-bound. `Quat::rotate` is already the optimized Rodrigues form, but
-//! its dependency chain is deep: `cross → scale → scale → add → cross → add`,
-//! roughly five dependent steps, and the second rotation's input depends on a
-//! cross product of its own.
-//!
-//! The candidate is a **matrix form**: build `R` from the quaternion once (12
-//! independent flops), then two mat-vecs whose nine products are mutually
-//! independent. Same arithmetic count, far more instruction-level parallelism.
-//!
-//! This measures both, plus a "sequential" variant that threads each result into
-//! the next input, because the plan fold *is* sequential — a throughput number
-//! measured on independent inputs would flatter both forms and answer the wrong
-//! question.
+//! `deriv_cost` puts `at_with_derivatives` at +21 ns per plan step over `at`, almost all adjoint.
+//! `Iso3::adjoint_inv` (~40 flops) is latency-bound, not throughput-bound. The candidate is a
+//! **matrix form**: build `R` once, then two mat-vecs of independent products. This measures both,
+//! including a "sequential" variant that threads each result into the next input, because the plan
+//! fold is sequential and independent inputs would flatter both forms.
 //!
 //! Run pinned:
 //! `taskset -c 2 cargo run --release -p tf_tree_bench --example adjoint_cost`

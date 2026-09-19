@@ -1,23 +1,9 @@
-// `docs/PHASE4.md` §5.8's amendment — the property the amendment exists to
-// establish, exercised the way §5.8 describes form 3 being used.
-//
-// The amendment's whole argument is one flag:
-//
-//     create_callback_group(MutuallyExclusive,
-//                           /*automatically_add_to_executor_with_node=*/false)
-//
-// `tft_bridge` is `Send + !Sync` and its affinity is checked, so every callback
-// that offers a transform must run on the thread that created the bridge. Left
-// at the default, the node's own executor claims the group and a caller who
-// spins the node gets `TFT_ERR_WRONG_THREAD` on every transform — or, in the
-// ordering a real deployment uses, a `std::runtime_error` out of
-// `add_callback_group` on the ingest thread, which is uncaught there and takes
-// the process with it.
-//
-// **No other test in this package spins the node it hands to `BridgeHandle`**,
-// so before this file the flag could be flipped and all fourteen results stayed
-// green. That is the gap: form 3's headline property — "attach to an existing
-// node you already own and spin" — was asserted nowhere.
+// `docs/PHASE4.md` §5.8's amendment: form 3 attaches to a node the caller already
+// owns and spins. The flag `create_callback_group(MutuallyExclusive,
+// /*automatically_add_to_executor_with_node=*/false)` keeps every offer on the
+// bridge's own thread (else `TFT_ERR_WRONG_THREAD`, or an uncaught
+// `std::runtime_error` from `add_callback_group`). No other test spins the
+// node it hands to `BridgeHandle`, so this is the only gate on that flag.
 
 #include <chrono>
 #include <memory>
@@ -58,33 +44,17 @@ tf2_msgs::msg::TFMessage message_at(int64_t stamp_ns)
   return msg;
 }
 
-/// **A node already in the caller's executor and already spinning, with the
-/// bridge attached afterwards.** This is §5.8 form 3's advertised usage — "a
-/// team that already has a node they can edit" — and the ordering matters:
+/// A node already in the caller's executor and spinning, with the bridge
+/// attached afterwards (§5.8 form 3's usage). The order matters: attaching first
+/// survives the mutation, since `add_node` skips a group another executor owns.
 ///
-/// * Attaching the bridge *first* and calling `add_node` after **survives** the
-///   mutation below, because rclcpp's `add_node` silently skips a callback
-///   group another executor already owns. A test written that way asserts
-///   nothing.
-/// * Attaching to a node the caller's executor has already taken is the
-///   ordering a real integration produces, and it is the one that fails.
-///
-/// **Mutant:** in `BridgeHandle`'s constructor, change
-/// `create_callback_group(MutuallyExclusive, false)` to `true`. The caller's
-/// executor claims the group when `add_node` runs, `exec_->add_callback_group`
-/// on the ingest thread then throws `std::runtime_error`, and nothing catches it
-/// on that thread — the process dies with `terminate called after throwing an
-/// instance of 'std::runtime_error'` and this binary reports a crash rather than
-/// a failure. Applied; it dies. (A crash is a harsher death than an assertion,
-/// and it is the honest one: that is what the flag being wrong actually does to
-/// a node built this way.)
+/// Mutant: make `create_callback_group(MutuallyExclusive, false)` `true`; the
+/// ingest thread's `add_callback_group` throws uncaught and the binary crashes.
 TEST(ExecutorTest, a_bridge_attaches_to_a_node_the_caller_is_already_spinning)
 {
   auto node = std::make_shared<rclcpp::Node>("already_spinning_host");
 
-  // The caller's executor, holding the node and running, *before* the bridge
-  // exists. Nothing about this is unusual — it is what a node with its own
-  // timers and subscriptions looks like at the moment somebody adds ingest.
+  // The caller's executor holds the node and runs *before* the bridge exists.
   rclcpp::executors::SingleThreadedExecutor caller_exec;
   caller_exec.add_node(node);
   std::atomic<bool> stop{false};
@@ -94,8 +64,7 @@ TEST(ExecutorTest, a_bridge_attaches_to_a_node_the_caller_is_already_spinning)
       }
     });
 
-  // Give the caller's executor a moment to actually be spinning rather than
-  // merely constructed, so this is the ordering it claims to be.
+  // Let it actually be spinning.
   std::this_thread::sleep_for(200ms);
 
   uint64_t applied = 0;

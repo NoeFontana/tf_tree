@@ -1,31 +1,17 @@
-//! Where does tf_tree bend, and where does it break?
+//! Where does tf_tree bend, and where does it break? Four questions:
 //!
-//! Every existing measurement in this repository is taken on one 24-frame tree,
-//! or — in `benches/tf2_compare.rs`'s scaling row — on four synthetic ones
-//! topping out at 375 frames. That leaves four questions unanswered, and this
-//! binary is each of them:
-//!
-//! 1. **Does lookup cost depend on tree *size*, or only on depth?** The claim in
-//!    `docs/benchmarks/tf2.md` is "primarily depth", from four points. This
-//!    sweeps the width axis to 12 000 frames with the **dynamic-step count held
-//!    fixed**, which is the only way to separate the two — `docs/PHASE1.md` §11.3
-//!    is normative that a row labelled by depth alone is not interpretable.
+//! 1. **Does lookup cost depend on tree *size* or only depth?** Sweeps width to
+//!    12 000 frames with the dynamic-step count fixed (`docs/PHASE1.md` §11.3: a
+//!    row labelled by depth alone is not interpretable).
 //! 2. **What does the *tree* cost, as opposed to the lookup?** Plan compilation
-//!    and `Tree::build` walk the topology, so they are where a size dependency
-//!    would legitimately live. Neither has ever been measured at any scale.
-//! 3. **Does the arena cost what the layout arithmetic says it costs?**
-//!    `report::worse_entries` states tf_tree's memory floor as arithmetic over
-//!    `ArenaLayout`. That is a claim about the implementation, and it is checked
-//!    here against a measured RSS delta rather than asserted.
+//!    and `Tree::build` walk the topology.
+//! 3. **Does the arena cost what `ArenaLayout` arithmetic says?** Checked against a
+//!    measured RSS delta (`report::worse_entries`).
 //! 4. **Where are the walls?** `BuildError::TooManyFrames`, `TooManyEdges`, and
-//!    — the one that actually binds — `LayoutError::ArenaTooLarge`, because every
-//!    region offset in the header is a `u32` and so the whole arena must fit in
-//!    4 GiB. A limit found by a user is a limit nobody documented.
+//!    `LayoutError::ArenaTooLarge` (region offsets are `u32`, so 4 GiB).
 //!
-//! Wall-clock rows here are **indicative on any host**, this one included, and
-//! the binary says so. The ratios and the counts are not: a shape that costs
-//! 3× another costs 3× on a quiet machine too, and the byte and slot figures are
-//! arithmetic.
+//! Wall-clock rows are **indicative on any host**; ratios, counts and byte/slot
+//! figures are not.
 //!
 //! Usage: `just scale-sweep`, or `scale_sweep --json out.json`.
 // This binary's output IS its result.
@@ -47,14 +33,11 @@ use tf_tree_bench::report::Metric;
 use tf_tree_bench::runstore::{Run, RunRow};
 use tf_tree_bench::workload::{self, Backing, Built};
 
-/// Lookups per timed sample set. Large enough that the loop dominates the
-/// clock pair around it, small enough to keep each row under a second.
+/// Lookups per timed sample set: loop dominates the clock pair, row under 1 s.
 const LOOKUPS: usize = 200_000;
-/// Distinct stamps swept, so the bracket search does real work rather than
-/// returning the same cached pair — `benches/read_scaling.rs`'s finding.
+/// Distinct stamps swept, so the bracket search does real work.
 const STAMP_STEPS: usize = 1024;
-/// Slack the A/B differ allows on a wall-clock row here. Wide, because these
-/// rows are explicitly indicative; the value is in the shape of the curve.
+/// A/B differ slack on wall-clock rows: wide, rows are indicative.
 const TIME_SLACK: f64 = 0.35;
 
 fn main() {
@@ -138,13 +121,13 @@ fn catalogue_sweep(run: &mut Run) {
     );
 
     for w in workload::CATALOGUE {
-        // Build is timed, so the estimate is what decides whether to try at all.
+        // Build is timed, so the estimate decides whether to try at all.
         let Ok(estimate) = w.estimate() else {
             println!("{:<14} (estimate refused this workload)", w.name);
             continue;
         };
 
-        // Pss, despite the local names — see the `rss_over_arena` note below.
+        // Pss, despite the local names (see `rss_over_arena` below).
         let rss_before = ProcStats::read().pss_kib;
         let t0 = Instant::now();
         let built = match w.build(InterpPolicy::LerpSlerp, Backing::Heap) {
@@ -164,11 +147,8 @@ fn catalogue_sweep(run: &mut Run) {
         let common = time_latest_common(&built, &plans);
         let compile_ns = time_compile(&built);
 
-        // Measured against arithmetic. A ratio far above 1 means the arena is
-        // not the dominant allocation (true for the small workloads, where the
-        // name tables and the harness itself outweigh it); far below 1 means
-        // pages the layout counts were never touched, which is the honest
-        // reading for a sparsely populated arena.
+        // Measured against arithmetic: far above 1 means the arena is not the dominant
+        // allocation; far below, untouched pages.
         let rss_delta_kib = rss_after.saturating_sub(rss_before);
         let rss_ratio = if built.shape.arena_bytes == 0 {
             f64::NAN
@@ -204,23 +184,14 @@ fn catalogue_sweep(run: &mut Run) {
                     Metric::new("plan_compile_ns", compile_ns, "ns").lower_is_better(TIME_SLACK),
                 )
                 .metric(Metric::new("build_ms", build_ms, "ms").lower_is_better(TIME_SLACK))
-                // Arithmetic, not a measurement, and therefore gated tightly:
-                // this number may only change when the layout changes, which is
-                // a `layout_hash` bump and a deliberate act.
+                // Arithmetic, gated tightly: changes only with a `layout_hash` bump.
                 .metric(
                     Metric::new("arena_bytes", built.shape.arena_bytes as f64, "B")
                         .lower_is_better(0.01),
                 )
-                // **The id says `rss` and the instrument is Pss.** It is not a
-                // typo and it is not fixed here: `Metric` ids are the join keys
-                // `bench_ab` and the baseline differ compare on
-                // (`runstore::Run::key`, and duplicates are refused), so
-                // renaming one silently un-compares every run file written
-                // before the rename and reads as a *vanished row* to the
-                // baseline gate — a hard failure by design. The column header
-                // and the docs say Pss; the id is frozen. Pss is the right
-                // instrument either way: it divides shared pages by their
-                // mapper count, which summed RSS does not.
+                // **The id says `rss` and the instrument is Pss**: `Metric` ids are join keys
+                // for `bench_ab` and the baseline differ (`runstore::Run::key`), so renaming one
+                // reads as a vanished row. The id is frozen.
                 .metric(Metric::new("rss_over_arena", rss_ratio, "x"))
                 .metric(Metric::new("dyn_steps", steps as f64, "steps")),
         );
@@ -241,7 +212,7 @@ fn time_at(built: &Built, plans: &[Plan]) -> (f64, f64) {
     let mut hist = Histogram::new();
     let mut acc = 0.0f64;
 
-    // Warm: first touch is a separate measurement, not part of steady state.
+    // Warm: first touch is a separate measurement.
     for p in plans {
         let warm: Stamp = Stamp::from_nanos(stamps[0]);
         let _ = p.at(&guard, warm);
@@ -260,11 +231,8 @@ fn time_at(built: &Built, plans: &[Plan]) -> (f64, f64) {
     (hist.quantile(0.50) as f64, hist.quantile(0.999) as f64)
 }
 
-/// p50 of `Plan::latest_common`, in nanoseconds.
-///
-/// A separate row because it is the query whose cost *should* grow with the
-/// tree: it has to find the newest stamp every edge on the path can answer,
-/// where `at` is handed one.
+/// p50 of `Plan::latest_common`, the query whose cost should grow with the tree
+/// (it finds the newest stamp every edge on the path can answer).
 fn time_latest_common(built: &Built, plans: &[Plan]) -> f64 {
     let guard = built.tree.guard();
     let mut hist = Histogram::new();
@@ -281,10 +249,7 @@ fn time_latest_common(built: &Built, plans: &[Plan]) -> f64 {
     hist.quantile(0.50) as f64
 }
 
-/// Mean nanoseconds to compile one plan.
-///
-/// This is the row that should scale with the *tree*: compilation walks from
-/// each frame to the root. A lookup does not, because the walk already happened.
+/// Mean nanoseconds to compile one plan: the row that should scale with the tree.
 fn time_compile(built: &Built) -> f64 {
     let (target, source) = &built.pairs[0];
     let t = built.tree.frame(target).expect("target frame");
@@ -309,16 +274,11 @@ fn sweep(built: &Built) -> Vec<i64> {
 // Ring capacity: the bracket search's own axis
 // ---------------------------------------------------------------------------
 
-/// Ring sizes to sweep, in slots. Powers of two because `Capacity` rounds up.
+/// Ring sizes to sweep, in slots (powers of two: `Capacity` rounds up).
 const RING_SLOTS: &[u32] = &[8, 64, 1024, 16_384, 262_144, 1_048_576];
 
-/// How lookup cost moves with the *depth* of one ring.
-///
-/// The bracket search is a binary search over retained samples, so this should
-/// be logarithmic — and the interesting part is not the asymptotics but the
-/// cache: a 1 M-slot ring is 72 MiB of stamps and poses, and a binary search
-/// over it misses on nearly every step. No existing benchmark varies this axis
-/// at all; the fixture's rings are all sized to 10 s of one rate.
+/// How lookup cost moves with the *depth* of one ring: logarithmic in theory, but
+/// a 1 M-slot ring is 72 MiB and the search misses cache on nearly every step.
 fn ring_sweep(run: &mut Run) {
     println!("Ring depth: one dynamic edge, query stamps swept across the whole ring");
     println!(
@@ -338,9 +298,7 @@ fn ring_sweep(run: &mut Run) {
         let b = tree.frame("b").expect("b");
         let w = tree.claim(b, a).expect("claim");
 
-        // Fill the ring completely: a ring only partly full has a shorter
-        // search, which would make the small rows and the large rows measure
-        // different things under the same label.
+        // Fill the ring completely: a partly full ring has a shorter search.
         let retained = slots - 1;
         let step_ns = 1_000_000i64;
         for k in 0..u64::from(retained) {
@@ -378,8 +336,7 @@ fn ring_sweep(run: &mut Run) {
         black_box(acc);
 
         let p50 = hist.quantile(0.50) as f64;
-        // Cost per doubling of the ring: the shape a binary search predicts is a
-        // constant here. A rising one is the cache, not the algorithm.
+        // Cost per doubling: a binary search predicts a constant; rising is the cache.
         let per_doubling = prev.map_or(f64::NAN, |(pslots, pp50)| {
             let doublings = (f64::from(slots) / f64::from(pslots)).log2();
             (p50 - pp50) / doublings
@@ -416,11 +373,8 @@ fn ring_sweep(run: &mut Run) {
 /// Concurrent writer-edge counts to sweep.
 const WRITER_EDGES: &[usize] = &[1, 16, 64, 256];
 
-/// Whether publishing cost depends on how many edges are being published to.
-///
-/// It should not — each edge owns its own ring and its own cache lines, and
-/// `EdgeCounters` is padded to 128 bytes precisely so two edges never share a
-/// line. This is the row that would catch that padding being lost.
+/// Whether publishing cost depends on how many edges are published to: it should
+/// not (`EdgeCounters` is padded to 128 bytes); this row catches lost padding.
 fn publish_sweep(run: &mut Run) {
     println!("Publish: one thread, round-robin over N edges");
     println!("{:>10} | {:>12} {:>12}", "edges", "ns/push", "Mpush/s");
@@ -445,8 +399,7 @@ fn publish_sweep(run: &mut Run) {
 
         let pose = tf_tree_bench::fixture::dynamic_pose(1.0, 0);
         const PUSHES: usize = 500_000;
-        // Warm every ring, so first-touch page faults are not charged to the
-        // measured loop — with 256 rings that is 18 MiB of first touches.
+        // Warm every ring, so first-touch faults are not charged (18 MiB at 256 rings).
         for (i, w) in writers.iter().enumerate() {
             w.push(i as i64, &pose).expect("warm push");
         }
@@ -454,8 +407,7 @@ fn publish_sweep(run: &mut Run) {
         let start = Instant::now();
         for k in 0..PUSHES {
             let w = &writers[k % n];
-            // Stamps must be monotone per edge; `k` is monotone globally and
-            // therefore per edge as well.
+            // Stamps must be monotone per edge; global `k` is.
             let _ = w.push(k as i64 + 1_000_000, &pose);
         }
         let elapsed = start.elapsed();
@@ -481,18 +433,13 @@ fn publish_sweep(run: &mut Run) {
 // The walls
 // ---------------------------------------------------------------------------
 
-/// Find and print the limits, by asking for something too big and reporting the
-/// refusal.
-///
-/// Deliberately not `assert`ions. These are documentation of where the engine
-/// stops, produced by the engine rather than copied from a header file, so they
-/// cannot go stale silently. Nothing here allocates the arena it asks about —
-/// `ArenaLayout` decides before a byte is committed, which is what makes asking
-/// cheap enough to do every run.
+/// Find and print the limits by asking for something too big and reporting the
+/// refusal. Not assertions: documentation produced by the engine. Nothing allocates
+/// the arena asked about (`ArenaLayout` decides first).
 fn limits() {
     println!("Limits, as reported by the engine itself");
 
-    // The `u32` offset model. This is the one that binds in practice.
+    // The `u32` offset model: the one that binds.
     let mut lo = 1u32;
     let mut hi = u32::MAX / 64;
     while lo < hi {
@@ -511,11 +458,8 @@ fn limits() {
         "",
     );
 
-    // Depth, which is a compile-time constant and the one a migrating user
-    // actually trips over. **Two constants since `0034`**, and printing only the
-    // compiled one told a migrating user their 24-link chain was refused when a
-    // rigid one of that length is not — the raw walk is what a tf2 tree's own
-    // depth is measured against.
+    // Depth, a compile-time constant. **Two constants since `0034`**: print both,
+    // since a rigid chain that is not refused by the raw walk is by the compiled one.
     println!(
         "  path edges walked:           {} — LookupError::TreeTooDeep beyond it.\n\
          {:31}This is what a tf2 tree's own depth is measured against.\n\
@@ -529,8 +473,7 @@ fn limits() {
         "",
     );
 
-    // Frames and edges are `u32` counts, checked by `TreeBuilder`. Stated rather
-    // than searched: building 4 billion frames to prove it is not a benchmark.
+    // Frames and edges are `u32` counts checked by `TreeBuilder`; stated, not searched.
     println!(
         "  frames / edges:              u32 each (BuildError::TooManyFrames / TooManyEdges),\n\
          {:31}but the slot ceiling above is reached first on any populated tree",

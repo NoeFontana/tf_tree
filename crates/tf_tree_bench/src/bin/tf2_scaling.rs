@@ -1,36 +1,14 @@
 //! Concurrent read scaling: tf_tree (lock-free readers) vs `tf2::BufferCore`
-//! (one internal mutex per lookup), at 1 / 2 / 4 / 8 threads.
+//! (one mutex per lookup), at 1 / 2 / 4 / 8 threads (`docs/PHASE1.md` §11.2).
 //!
-//! This is the measurement `docs/PHASE1.md` §11.2 calls for and the one most likely to
-//! separate the two engines: tf_tree's readers take no lock at all, while every
-//! `tf2::lookupTransform` acquires `BufferCore`'s frame mutex. If that matters,
-//! it shows up here and nowhere else.
+//! Run with `just tf2-scaling`, on an otherwise idle machine. A standalone
+//! binary rather than criterion, because §11.2 wants p99.9 and criterion
+//! reports the distribution of batch times; this records per-lookup latencies.
 //!
-//! Run it with `just tf2-scaling`. **Run it on an otherwise idle machine** — the
-//! numbers are worthless under competing load, and the harness says so in its
-//! own output.
-//!
-//! # Why a standalone binary rather than criterion
-//!
-//! `docs/PHASE1.md` §11.2 is explicit that "p99.9 is the number that matters, not the
-//! mean. A control loop cares about the tail." Criterion reports the
-//! distribution of *batch* times, which is the wrong distribution — it hides
-//! exactly the per-lookup outliers a lock introduces. This harness records
-//! per-lookup latencies and reports the tail directly.
-//!
-//! # Method
-//!
-//! * **One** shared tree and **one** shared `BufferCore`, as both engines are
-//!   meant to be used. Per-thread buffers would erase the contention.
-//! * Threads are spawned once and parked on a barrier; the timed region contains
-//!   no thread creation. The driver takes a share of the work itself, so `N`
-//!   threads means `N` runnable threads, not `N + 1` competing for `N` cores.
-//! * Stamps sweep the whole retained window, so the bracket search does real
-//!   work instead of hitting one cached pair.
-//! * Throughput and latency are measured in **separate passes**: reading a clock
-//!   around every lookup costs ~20 ns, which would visibly distort a ~100 ns
-//!   operation. The throughput pass therefore times whole batches, and only the
-//!   latency pass pays for per-op timestamps.
+//! Method: one shared tree and one shared `BufferCore`; threads spawned once and
+//! parked on a barrier, the driver taking a share of the work; stamps sweep the
+//! whole retained window; throughput (whole batches) and latency (per-op clock,
+//! ~20 ns) are separate passes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::hint::black_box;
@@ -47,12 +25,8 @@ use tf_tree_tf2_sys::{FrameName, Tf2Buffer};
 /// The sweep used when `TF2_THREADS` is unset or unusable.
 const DEFAULT_THREADS: [usize; 4] = [1, 2, 4, 8];
 
-/// Thread counts to sweep. Override with `TF2_THREADS=1,2,4,8`.
-///
-/// An override that yields no usable count — `TF2_THREADS=foo`, `TF2_THREADS=0`,
-/// `TF2_THREADS=` — falls back to the default sweep. Returning the empty vector
-/// instead would print the table headers with no rows under them, which reads as
-/// "the engines produced nothing" rather than "the override was a typo".
+/// Thread counts to sweep. Override with `TF2_THREADS=1,2,4,8`; an override with
+/// no usable count falls back to the default sweep.
 fn thread_counts() -> Vec<usize> {
     let parsed: Vec<usize> = std::env::var("TF2_THREADS")
         .ok()
@@ -70,13 +44,8 @@ fn thread_counts() -> Vec<usize> {
     }
 }
 
-/// A count read from the environment, clamped to at least 1.
-///
-/// Zero is never a meaningful setting here and is not silently honoured: every
-/// caller sizes a vector by this value and then indexes it. `TF2_ROUNDS=0` would
-/// leave `v[0]` reading past the end of an empty round vector, and
-/// `TF2_LATENCY_SAMPLES=0` would underflow `v.len() - 1` in
-/// `Percentiles::from_sorted`.
+/// A count read from the environment, clamped to at least 1 (callers index a
+/// vector sized by it, and `Percentiles::from_sorted` computes `len() - 1`).
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -92,28 +61,18 @@ struct Load {
     tf2: Tf2Buffer,
     target: String,
     source: String,
-    /// The same names pre-converted for the FFI boundary. Converting per call
-    /// would heap-allocate twice per lookup and charge it to tf2, while
-    /// `Plan::at` takes no strings at all.
+    /// The same names pre-converted for the FFI boundary, so tf2 is not charged
+    /// two allocations per lookup.
     target_c: FrameName,
     source_c: FrameName,
     stamps: Vec<i64>,
-    /// Dynamic edges of this load that the query path does **not** traverse,
-    /// as `(parent, child)`. See [`writable_edges`] for why the writers use
-    /// these and not the queried ones.
+    /// Dynamic edges the query path does not traverse, as `(parent, child)`; see
+    /// [`writable_edges`].
     writable: Vec<(String, String)>,
-    /// The next stamp any writer may publish, shared by **every** writer thread
-    /// across **every** pass and thread count.
-    ///
-    /// It has to be shared, and the first revision learned that the hard way.
-    /// Both engines' state lives in this `Load` and outlives a pass, while the
-    /// writer threads do not — so a per-writer counter starting from the same
-    /// base meant the second pass republished stamps the first had already
-    /// written. tf_tree rejects those silently as out-of-order; **tf2 rejects
-    /// them and prints a `TF_OLD_DATA` warning per sample**, so the measured
-    /// window filled with stderr I/O and tf2's throughput row came out at 0.36
-    /// M/s with a 50 % spread. That is an artefact of the harness, and it would
-    /// have been published as tf2's cost under contention.
+    /// The next stamp any writer may publish, shared by every writer thread
+    /// across every pass and thread count. A per-writer counter republishes
+    /// stamps a previous pass wrote, and tf2 prints a `TF_OLD_DATA` warning per
+    /// rejected sample, which would be charged to its throughput.
     next_stamp: std::sync::atomic::AtomicI64,
 }
 
@@ -183,11 +142,8 @@ fn replay_load() -> Load {
     }
 }
 
-/// Writer threads per engine. `TF2_WRITERS`, default **0**.
-///
-/// Zero by default so every committed number in `docs/benchmarks/tf2.md` keeps
-/// meaning what it meant: the quiescent rows are the continuity anchor, and the
-/// writer rows are a second experiment run beside them, not a replacement.
+/// Writer threads per engine. `TF2_WRITERS`, default **0**, so the quiescent
+/// rows in `docs/benchmarks/tf2.md` keep their meaning.
 fn writer_count() -> usize {
     std::env::var("TF2_WRITERS")
         .ok()
@@ -198,28 +154,12 @@ fn writer_count() -> usize {
 /// The dynamic edges of `tree` that the `target <- source` plan does **not**
 /// traverse.
 ///
-/// # Why the writers avoid the queried edges, and why that is the fair test
-///
-/// This is the measurement, not a way of being gentle. A robot's normal state is
-/// many publishers writing many edges while a node reads a few, and the two
-/// engines answer that case completely differently:
-///
-/// * `tf2::BufferCore` takes **one mutex for the whole buffer**. A write to any
-///   edge excludes every reader of every other edge.
-/// * tf_tree's rings are per edge, with a seqlock per slot. A write to an edge a
-///   reader is not reading costs that reader nothing at all.
-///
-/// So writing off-path is precisely the configuration in which the architectural
-/// difference is the only difference. Writing *on* path would additionally slide
-/// the queried window out from under a fixed stamp sweep, which turns a latency
-/// measurement into a measurement of the error path — the trap
-/// `src/bin/contended_scaling.rs` documents hitting, and the reason it re-probes
-/// the retained window before every point. That case is not measured here and
-/// the report says so.
-///
-/// Edges are compared by `EdgeId`, obtained by compiling a one-step plan for the
-/// candidate, rather than by name — a name comparison would miss an edge the
-/// query reaches inverted.
+/// Off-path writing is the fair test: `tf2::BufferCore` has one mutex for the
+/// whole buffer, while tf_tree's rings are per edge, so it isolates the
+/// architectural difference. Writing on path would slide the queried window and
+/// measure the error path instead (`src/bin/contended_scaling.rs`). Edges are
+/// compared by `EdgeId` from a one-step plan, since a name comparison misses an
+/// edge the query reaches inverted.
 fn writable_edges(
     tree: &Tree,
     target: &str,
@@ -259,16 +199,10 @@ fn writable_edges(
 
 /// One writer thread: publish to `edge` on whichever engine the round selected.
 ///
-/// `which` says which engine the reader is on right now:
-///
-/// * `Some(a)` — the **throughput** pass, which measures one engine per round.
-///   The writer follows it, so exactly `writers` threads are busy and always
-///   against the engine under test. Writing to both continuously would instead
-///   double the runnable thread count and put each engine's writer into the
-///   other's measurement as background load.
-/// * `None` — the **latency** pass, where each reader alternates engines sample
-///   by sample and there is no round to follow. The writer alternates too, so
-///   both engines are contended throughout and symmetrically.
+/// `which` is the engine the reader is on: `Some(a)` in the throughput pass
+/// (the writer follows it, so exactly `writers` threads are busy against the
+/// engine under test); `None` in the latency pass, where the writer alternates
+/// engines as the readers do.
 fn writer_loop(
     load: &Load,
     edge: &(String, String),
@@ -285,12 +219,8 @@ fn writer_loop(
         return;
     };
 
-    // Stamps come from the load's shared counter, which starts above every
-    // populated stamp so tf_tree's monotonicity rule holds from the first push,
-    // and which never goes backwards across passes — see `Load::next_stamp` for
-    // what a per-writer counter cost. Both engines get the identical sequence,
-    // because handing them different stamps would be a difference in the
-    // workload rather than in the engine.
+    // Stamps come from the load's shared counter (see `Load::next_stamp`); both
+    // engines get the identical sequence.
     let pose = fixture::dynamic_pose(seed as f64, 0);
     let mut alternating = 0usize;
 
@@ -363,14 +293,8 @@ fn pass(engine: Engine, load: &Load, plan: &Plan) -> f64 {
     acc
 }
 
-/// Throughput of **both** engines at `threads`, measured interleaved.
-///
-/// The two engines alternate within every round rather than being measured in
-/// separate blocks. Anything that drifts over the run — a background task
-/// waking, the host migrating a vCPU, a thermal or steal-time excursion — then
-/// lands on both engines equally instead of on whichever was measured while it
-/// happened. Measuring A fully, then B fully, silently attributes drift to the
-/// engine unlucky enough to be second.
+/// Throughput of both engines at `threads`, interleaved within every round so
+/// drift lands on both rather than on whichever was measured second.
 fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 2] {
     let rounds = env_usize("TF2_ROUNDS", 51);
     let per_round = load.stamps.len();
@@ -384,9 +308,8 @@ fn measure_throughput_pair(load: &Load, plan: &Plan, threads: usize) -> [Stats; 
 
     let mut ns: [Vec<u128>; 2] = [Vec::with_capacity(rounds), Vec::with_capacity(rounds)];
 
-    // Separate from `stop`, which is the readers' barrier protocol: the writers
-    // must keep running across the barrier waits *between* rounds too, or the
-    // tree is quiescent for part of every measured window.
+    // Separate from `stop`: the writers must keep running across the barrier
+    // waits between rounds too.
     let stop_writers = AtomicBool::new(false);
     let stop_writers = &stop_writers;
     let writers = writer_count().min(load.writable.len());
@@ -465,23 +388,16 @@ impl Stats {
         (self.best - self.median) / self.best * 100.0
     }
 
-    /// Slowest round, as a fraction of the fastest. A tail far below 1.0 means
-    /// at least one round was badly disturbed; kept so a quiet-machine claim can
-    /// be checked rather than asserted.
+    /// Slowest round as a fraction of the fastest; far below 1.0 means a
+    /// disturbed round.
     fn worst_ratio(self) -> f64 {
         self.worst / self.best
     }
 }
 
-/// Per-lookup latency percentiles for **both** engines at `threads`.
-///
-/// Interleaved for the same reason as throughput: each thread alternates
-/// engines sample by sample, so any disturbance is shared rather than charged to
-/// one engine.
-///
-/// The figures include two `Instant::now()` calls per lookup (~20 ns here).
-/// That overhead is identical for both engines, so comparisons hold, but the
-/// absolute values are inflated by roughly that much.
+/// Per-lookup latency percentiles for both engines at `threads`, alternating
+/// engines sample by sample. Figures include two `Instant::now()` calls per
+/// lookup (~20 ns), identical for both engines.
 fn measure_latency_pair(load: &Load, plan: &Plan, threads: usize) -> [Percentiles; 2] {
     let samples = env_usize("TF2_LATENCY_SAMPLES", 50_000);
     let start = Barrier::new(threads);
@@ -568,13 +484,8 @@ impl Percentiles {
     }
 }
 
-/// Physical cores, distinguished from logical CPUs.
-///
-/// This matters more than anything else for reading the scaling table: on an
-/// SMT machine, thread counts past the physical core count share execution
-/// units, so the ceiling is the *core* count, not the CPU count. Reporting 8
-/// logical CPUs and then wondering why scaling stops near 4x would be a
-/// self-inflicted mystery.
+/// Physical cores, distinguished from logical CPUs: past the physical count,
+/// threads share execution units, so the scaling ceiling is the core count.
 fn physical_cores() -> Option<usize> {
     let txt = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     let mut ids = std::collections::BTreeSet::new();

@@ -18,72 +18,18 @@ use crate::twist::Twist;
 /// normalized LERP to avoid dividing by `sin(angle) → 0`.
 const SLERP_LERP_FALLBACK: f64 = 1e-6;
 
-/// Above this angle (radians) between the two quaternions, [`slerp`] uses the
-/// exact `acos`/`sin` form; at or below it, the transcendental-free series in
-/// [`slerp_weight`].
+/// Quaternion angle `acos(qa·qb)` (half the rotation angle) above which [`slerp`]
+/// uses the exact `acos`/`sin` form; at or below it, the series in
+/// [`slerp_weight`]. Six terms hold 1e-15 up to 0.165 rad (7 terms: 0.248), so
+/// 0.15 sits inside; `slerp_series_matches_exact_below_threshold` measures it.
 ///
-/// **The angle is `acos(qa·qb)`, which is *half* the rotation angle** the pair
-/// spans, because `qa·qb = cos(Δ/2)`. `0.15` here is a rotation of `0.30` rad,
-/// and every figure below says which of the two it is — measured by bisecting
-/// the branch boundary, which lands on quaternion `0.150000000` rad / rotation
-/// `0.300000000` rad.
-///
-/// **Measured, not guessed** — the same discipline as `THETA_SMALL` in
-/// `docs/PHASE1.md` §3.3 (`docs/PROJECT.md` §5 D12), and for the same reason:
-/// the first draft of this constant was 0.25 by eyeball, and
-/// `slerp_series_matches_exact_below_threshold` showed the real error there was
-/// **3e-9**, seven orders worse than claimed.
-///
-/// Measured largest θ holding 1e-15 relative error, by term count:
-/// 4 terms 0.037 · 5 terms 0.091 · **6 terms 0.165** · 7 terms 0.248 rad.
-/// [`slerp_weight`] uses six, so 0.15 sits just inside the measured bound.
-///
-/// **Why this covers the cases that matter.** The two quaternions are *adjacent
-/// samples on one edge*, so the arc between them is set by the publish rate and
-/// the body's angular velocity — and θ is half of that arc. At a brisk 180 °/s,
-/// where the arc is Δ = π/f:
-///
-/// ```text
-/// f         Δ (rotation)   θ = Δ/2      branch
-/// 1 kHz        3.1 mrad     1.6 mrad    series
-/// 200 Hz      15.7 mrad     7.9 mrad    series
-/// 50 Hz       62.8 mrad    31.4 mrad    series
-/// 10 Hz      314.2 mrad   157.1 mrad    exact
-/// ```
-///
-/// **The Δ column is what this table used to give, alone, against a threshold
-/// stated in θ** — a factor of two, in the direction that makes the fast path
-/// look roomier than it is. No row changes side, so the paragraph's conclusion
-/// survives, but the margin does not: the 10 Hz row clears the threshold by
-/// **4.7%**, not by 2×, and the crossover for a 180 °/s body is at
-/// `f = ω/(2·0.15)` = **10.47 Hz**. A 10 Hz edge on such a body takes the exact
-/// path, which is correct — and it is a marginal case, not a comfortable one.
-/// Shared with [`crate::dualquat::screw_pow`], which raises a unit dual
-/// quaternion to a real power and needs the identical `sin(a·φ)/sin(φ)` series
-/// over the identical range — in both cases `φ` is the *half* angle between two
-/// adjacent samples on one edge.
+/// Adjacent samples of a 180 °/s body take the series above 10.47 Hz
+/// (`f = ω/(2·0.15)`). Shared with [`crate::dualquat::screw_pow`], which needs
+/// the same `sin(a·φ)/sin(φ)` series over the same half-angle range.
 pub(crate) const THETA_SLERP_SMALL: f64 = 0.15;
 
-// **Both constants are quoted as literals outside this file**, and neither is
-// `pub` — a re-measurement is allowed to move them, and that is exactly why
-// these two lines are here: the prose is what a re-measurement would leave
-// behind. What the assertions can do is refuse to compile until whoever moved
-// the constant comes here; what they cannot do is find the prose. So the sites
-// are listed, because "grep for `0.15`" over this repository is not a short
-// list:
-//
-// * `slerp`'s own rustdoc, below — `# Angles`, `# Preconditions` and
-//   `# Numerics`, which is the crates.io page an external caller reads and the
-//   only place the fallback band and the crossover are stated in a form they
-//   can act on.
-// * `THETA_SLERP_SMALL`'s own doc comment above (the per-term-count table and
-//   the 10.47 Hz crossover), and `slerp_weight`'s.
-// * `crates/tf_tree_math/README.md`, *Numerics, and where the constants came
-//   from* — the crates.io front page.
-// * `docs/API.md` §6 row 16.
-// * `crates/tf_tree_math/tests/slerp_public.rs`, which mirrors the crossover in
-//   a single `THETA_CROSSOVER` const and derives its sweep from it, so that
-//   file has one site rather than nine.
+// Both constants are quoted as literals in `slerp`'s rustdoc, the crate README,
+// `docs/API.md` §6 row 16 and `tests/slerp_public.rs`; move them together.
 const _: () = assert!(SLERP_LERP_FALLBACK == 1e-6);
 const _: () = assert!(THETA_SLERP_SMALL == 0.15);
 
@@ -122,31 +68,17 @@ impl ScLerp {
     /// [`Interp::eval`], plus the segment's body twist **per unit `s`** —
     /// `docs/PHASE4.md` §2.3.
     ///
-    /// The twist is `ξ = log_se3(a⁻¹b)` and is *constant across the segment*,
-    /// which is the property that makes it exact rather than a finite
-    /// difference. Divide by the segment's duration to get velocity: for stamps
-    /// `t_i, t_j` in nanoseconds, `V^b = ξ · 1e9/(t_j − t_i)`.
-    ///
-    /// The pose is bit-identical to [`Interp::eval`], endpoint shortcuts
-    /// included — pinned by `eval_with_twist_pose_matches_eval`. There is
-    /// deliberately **no equivalent on [`LerpSlerp`]**: it has a body twist, but
-    /// one that rotates through the segment as an artifact of the interpolant
-    /// rather than of the motion (§2.4), so `tf_tree_core` refuses the query
-    /// instead of returning it.
+    /// The twist `ξ = log_se3(a⁻¹b)` is constant across the segment; for stamps
+    /// in nanoseconds, `V^b = ξ · 1e9/(t_j − t_i)`. The pose is bit-identical to
+    /// [`Interp::eval`] (`eval_with_twist_pose_matches_eval`). There is no
+    /// [`LerpSlerp`] equivalent (§2.4): its twist is an artifact of the
+    /// interpolant, so `tf_tree_core` refuses the query.
     #[inline]
     #[must_use]
     pub fn eval_with_twist(a: &Iso3, b: &Iso3, s: f64) -> (Iso3, Twist) {
         let rel = a.inv_mul(b);
-        // The endpoint test is made *before* the power, not after. `ScrewParts::pow`
-        // is the half of the decomposition that carries the transcendental on the
-        // large-arc branch, and at `s ∈ {0, 1}` its result is discarded. LLVM does
-        // not sink the call out of the untaken branch, so computing it first and
-        // then throwing it away is a real cost on the two stamps most likely to be
-        // queried: an exact hit on a published sample, and `t == t_new`.
-        //
-        // The twist is still needed at the endpoints — it is a property of the
-        // segment, not of `s` — so only the power is skipped, never the screw
-        // decomposition itself.
+        // Endpoint test before the power: LLVM does not sink the transcendental
+        // out of the untaken branch. The twist is still needed at the endpoints.
         if s == 0.0 {
             return (*a, screw_twist(&rel));
         }
@@ -176,10 +108,8 @@ impl Interp for LerpSlerp {
 impl Iso3 {
     /// `self⁻¹ · rhs`, the relative transform from `self` to `rhs`.
     ///
-    /// Computed directly — rotation `q_self*·q_rhs`, translation
-    /// `q_self*·(t_rhs − t_self)` — rather than materializing `self.inverse()`
-    /// and composing, which saves a vector rotation and a negation pass on the
-    /// ScLerp interpolation hot path.
+    /// Rotation `q_self*·q_rhs`, translation `q_self*·(t_rhs − t_self)`, without
+    /// materializing `self.inverse()`.
     #[inline]
     #[must_use]
     fn inv_mul(&self, rhs: &Iso3) -> Iso3 {
@@ -192,87 +122,48 @@ impl Iso3 {
 
 /// Shortest-arc spherical linear interpolation of two unit quaternions.
 ///
-/// The rotation kernel [`LerpSlerp`] evaluates, public so that a caller holding
-/// two rotations need not build a pair of [`Iso3`] with throwaway zero
-/// translations to reach it. `docs/API.md` §2.7 authorises the tier and carries
-/// what the round trip cost; the `tf_tree` facade re-exports this as
-/// `tf_tree::slerp`, so an engine consumer takes no second dependency for it.
-///
-/// Every angle below is a **quaternion** angle — `acos(qa·qb)`, which is half
-/// the rotation the pair spans. Read as rotations these are out by two.
+/// The rotation kernel [`LerpSlerp`] evaluates (`docs/API.md` §2.7); the
+/// `tf_tree` facade re-exports it. Every angle below is a **quaternion** angle,
+/// half the rotation the pair spans.
 ///
 /// # Preconditions
 ///
-/// Both inputs must be unit, and nothing checks — not even a `debug_assert!`.
-/// No push path in the engine normalizes a stored pose, so an assertion would
-/// fire on drifted real data rather than on a bug, and it would miss the hazard
-/// this function actually has (`# Storage order`).
-///
-/// `s` is a dimensionless fraction of the segment, **not** a stamp. A caller
-/// interpolating between two samples divides in integer nanoseconds and passes
-/// the ratio; nothing in this crate knows what time is.
+/// Both inputs must be unit; nothing checks. `s` is a dimensionless fraction of
+/// the segment, not a stamp.
 ///
 /// # Range of `s`
 ///
-/// `s` belongs to `[0, 1]`; nothing clamps or refuses. Outside it the function
-/// extrapolates, and how well is a property of the *pair* rather than of `s`,
-/// because the pair alone picks the branch. Only the closed form holds:
-/// `7.2e-15` at `|s| = 20`, against a series that loses `1e-15` somewhere
-/// between `|s| ≈ 2.3` and `≈ 5` depending on the angle. **So extrapolation is
-/// not supported here** — `tf_tree_core` answers an out-of-window stamp with
-/// `ExtrapPolicy` and never passes an `s` outside `(0, 1)`.
-/// `out_of_range_s_extrapolates_and_only_the_closed_form_holds` keeps those
-/// figures honest.
+/// `s` belongs to `[0, 1]`; nothing clamps. Outside it only the closed form
+/// holds (`7.2e-15` at `|s| = 20`; the series loses `1e-15` by `|s| ≈ 2.3..5`),
+/// so extrapolation is unsupported: `tf_tree_core` never passes `s` outside
+/// `(0, 1)`. Pinned by `out_of_range_s_extrapolates_and_only_the_closed_form_holds`.
 ///
 /// # Storage order
 ///
-/// [`Quat`] is `[w, x, y, z]` — scalar **first**. Eigen and `nalgebra` store it
-/// last, and a transposed conversion compiles, type-checks, and returns a
-/// perfectly unit quaternion that is the wrong rotation. A boundary that
-/// crosses this convention needs a tested adapter, not a careful reading.
+/// [`Quat`] is `[w, x, y, z]`, scalar first; a transposed conversion from a
+/// last-`w` library returns a unit quaternion that is the wrong rotation.
 ///
 /// # Endpoints and degenerate inputs
 ///
-/// The weights at `s = 0` and `s = 1` are exactly `(1, 0)` and `(0, 1)`, so both
-/// endpoints come back bit-for-bit — with four qualifications, all measured:
+/// The weights at `s = 0` and `s = 1` are exact, with these exceptions:
 ///
-/// * **`s = 1` returns `-qb` whenever `qa·qb < 0`** — the sign fix arriving at
-///   the endpoint, not an endpoint failure. There is no `s == 1.0` shortcut
-///   because the limit from below goes to `-qb` as well. Compare rotations.
-/// * **Below the LERP fallback** (quaternion angle under `1e-6` rad) the result
-///   is a renormalized LERP, so the endpoints hold to an ulp rather than
-///   bit-for-bit (`endpoints_lose_bit_exactness_only_in_the_lerp_fallback`).
-/// * **A `-0.0` component survives none of the three weighted branches**, since
-///   the exact weights make `s = 0` return `qa·1.0 + qb·0.0` and `-0.0 + (+0.0)`
-///   is `+0.0`; the fallback's `normalize` loses it too. Stated rather than
-///   fixed: the fix is an `s == 0.0` shortcut whose `s == 1.0` twin the first
-///   bullet rules out on purpose
-///   (`signed_zero_components_are_the_endpoint_exception`). The identical-input
-///   return below is the exception — it hands back `qa` untouched.
-/// * **Numerically identical inputs return `qa` for every `s`**, `s` unread —
-///   an early return, because there is no direction to interpolate along. Two
-///   consecutive samples from a stationary body are exactly this case.
+/// * **`s = 1` returns `-qb` when `qa·qb < 0`** (the sign fix). Compare rotations.
+/// * **Below the LERP fallback** (angle under `1e-6`) the result is a
+///   renormalized LERP, exact to an ulp
+///   (`endpoints_lose_bit_exactness_only_in_the_lerp_fallback`).
+/// * **A `-0.0` component is lost** (`signed_zero_components_are_the_endpoint_exception`).
+/// * **Numerically identical inputs return `qa` for every `s`**, unread.
 ///
-/// A `NaN` **`s`** propagates, with that identical-input return the one
-/// exception: it answers `qa` before `s` is read, for `NaN` and `±inf` alike. A
-/// `NaN` **component** is the other case and does not reach it — `h` is `NaN`
-/// and `NaN <= x` is false for every `x`, so it clears the early return *and*
-/// both branch tests and lands on the closed form whatever the angle. Do not add
-/// a `sin_angle == 0.0` guard there, which would turn it into a plausible pose.
-/// `nan_propagates_except_through_the_identical_input_return` pins both halves.
-///
-/// The output is otherwise **not** renormalized — `qa·wa + qb·wb` is unit to
-/// within `f64`, not exactly. A caller whose type enforces unit norm should
-/// normalize on the way in to its own type.
+/// A `NaN` `s` propagates except through the identical-input return; a `NaN`
+/// component reaches the closed form — do not add a `sin_angle == 0.0` guard
+/// (`nan_propagates_except_through_the_identical_input_return`). The output is
+/// unit only to within `f64`.
 ///
 /// # Numerics
 ///
-/// Above a quaternion angle of `THETA_SLERP_SMALL` (`0.15` rad) the weights are
-/// the closed `acos`/`sin` form; below it, a six-term series with no
-/// transcendental and no division, taking θ² from the *chord* rather than from
-/// `acos(dot)`. Both constants are calibrated, with the measurement in their own
-/// doc comments, and both are private: they are numbers a re-measurement may
-/// move, and a `pub const` is a promise not to.
+/// Above `THETA_SLERP_SMALL` (`0.15` rad) the weights are the closed `acos`/`sin`
+/// form; below it, a six-term series with θ² from the chord. Both constants are
+/// private so a re-measurement may move them.
 ///
 /// ```
 /// use tf_tree_math::{exp_so3, slerp, Quat, Vec3};
@@ -293,12 +184,8 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
     let dot = qa.dot(qb);
     let qb = if dot < 0.0 { qb.neg() } else { qb };
 
-    // `1 - dot` is catastrophic cancellation exactly where this code spends its
-    // life (adjacent samples, dot → 1), and `acos` loses half its significant
-    // digits there too. For unit quaternions `|qb - qa|² = 2 - 2·dot`, and
-    // computing it from the component differences cancels nothing — so `h` below
-    // is accurate to full precision no matter how close the two are.
-    let h = 0.5 * qa.sub(qb).norm_squared(); // = 1 - |dot|, cancellation-free
+    // `|qb - qa|² = 2 - 2·dot`, from component differences: no `1 - dot` cancellation.
+    let h = 0.5 * qa.sub(qb).norm_squared(); // = 1 - |dot|
     if h <= 0.0 {
         return qa; // identical (or numerically identical) inputs
     }
@@ -307,8 +194,6 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 
     if theta_sq <= THETA_SLERP_SMALL * THETA_SLERP_SMALL {
         if theta_sq < SLERP_LERP_FALLBACK * SLERP_LERP_FALLBACK {
-            // Near-parallel: LERP and renormalize. Kept because the weights
-            // below are exact here but the inputs carry no usable direction.
             return lerp_norm(qa, qb, s);
         }
         let wa = slerp_weight(1.0 - s, theta_sq);
@@ -316,8 +201,7 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
         return qa.scale(wa).add(qb.scale(wb));
     }
 
-    // Large arc: the exact form. Reached only by low-rate edges on a fast-moving
-    // body, and by `at_adaptive`'s wide bisection spans.
+    // Large arc: exact form.
     let angle = libm::acos(if dot < 0.0 { -dot } else { dot }.min(1.0));
     let sin_angle = libm::sin(angle);
     let wa = libm::sin((1.0 - s) * angle) / sin_angle;
@@ -327,40 +211,16 @@ pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
 
 /// `θ²` from `h = 1 − |cos θ|`, without `acos`.
 ///
-/// `θ = 2·asin(d)` where `d` is the half-chord and `d² = h/2`, so
-/// `θ² = 2h·Σ Cₖ hᵏ` with the `Cₖ` below coming from squaring the `asin` series.
-/// `asin` near zero is well conditioned: the caller obtains `h` from component
-/// differences, so nothing in this path ever forms `1 − dot` or feeds `acos` an
-/// argument near 1.
+/// `θ² = 2h·Σ Cₖ hᵏ` from squaring the `asin` series of the half-chord, so
+/// nothing forms `1 − dot` or feeds `acos` an argument near 1. `Cₙ = 2ⁿ⁺¹ /
+/// ((n+1)²·C(2n+2, n+1))`.
 ///
 /// ```text
 /// C₀..C₇ = 1, 1/6, 2/45, 1/70, 8/1575, 4/2079, 16/21021, 2/6435
 /// ```
 ///
-/// **Eight terms, and the count is load-bearing.** This series converges much
-/// more slowly than it looks: at θ = 0.15, four terms give 8e-11 relative error,
-/// six give 1.6e-15, and eight are exact to `f64`. Four terms would silently cap
-/// the whole fast path at ~1e-10.
-///
-/// The closed form is `Cₙ = 2ⁿ⁺¹ / ((n+1)²·C(2n+2, n+1))`; deriving each term
-/// from it rather than by hand is the only reliable way to get eight right. The
-/// shipped `C₇` was `128/315315` until a review caught it — the correct value is
-/// `2/6435`, exactly `49/64` of the shipped one (23% smaller). *This read
-/// "31% smaller", which is the reciprocal comparison stated in the wrong
-/// direction: `128/315315` is 30.6% larger than `2/6435`. A paragraph whose
-/// subject is a coefficient error caught by review is a bad place for
-/// arithmetic nobody checked.* Inside the θ ≤ 0.15 fast path the term contributes
-/// ~1e-17 relative, so no test could see it and no result was ever wrong; at
-/// θ = 0.3 it is the difference between 3.2e-14 and 1.2e-15. It mattered because
-/// the "exact to `f64`" claim above is what any future threshold increase would
-/// rest on.
-///
-/// The first draft of this function had `C₂ = 3/40` instead of `2/45` — a
-/// hand-derivation slip. It cost 3.8e-6 relative error at θ = 0.15, which the
-/// synthetic fixture differential did **not** catch (its arcs are tiny) but the
-/// *recorded* stream did, blowing up from 6.7e-15 to 4.8e-8. Hence
-/// `theta_sq_matches_acos_across_the_fast_path` below: the conversion is now
-/// tested on its own rather than only through `slerp`.
+/// Eight terms are load-bearing: at θ = 0.15, four give 8e-11, six 1.6e-15.
+/// Tested on its own by `theta_sq_matches_acos_across_the_fast_path`.
 #[inline]
 #[must_use]
 pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
@@ -394,32 +254,15 @@ pub(crate) fn theta_sq_from_chord(h: f64) -> f64 {
 ///                        + (1−x)(2555−1636x+410x²−52x³+3x⁴)·u⁵/119750400 ]
 /// ```
 ///
-/// Obtained by exact rational long division of the two Maclaurin series. Two
-/// things about this that are easy to get wrong, and did get wrong here first:
-///
-/// * The `u³` coefficient is `31−18x+3x²`. The first draft read `31−42x+11x²`,
-///   a hand-expansion slip that
-///   `slerp_series_matches_exact_below_threshold` caught immediately.
-/// * **Six terms, not four.** The coefficients fall only ~10× per order while
-///   `u = θ²` shrinks by ~0.02 at the threshold, so convergence is far slower
-///   than it looks. Measured maximum θ holding 1e-15 relative error: 4 terms
-///   0.037 rad, 5 terms 0.091, **6 terms 0.165**, 7 terms 0.248. Four terms
-///   would have forced a threshold so low that every edge below ~1 kHz fell to
-///   the slow path — which is most of them.
-///
-/// `(1 − x)` factors out of every term above `u⁰`, which is why both endpoints
-/// stay exact: at `a = 1` every correction vanishes and the weight is 1; at
-/// `a = 0` the leading `a` makes it 0. That is a property of the algebra, not of
-/// the truncation, so it survives at any term count.
-///
-/// Horner in `u`, with each coefficient itself Horner in `x`. Pure multiply–add:
-/// no transcendental, no divide, and no data-dependent branch, so it is also a
-/// shape a vectorizer can take.
+/// From exact rational long division of the two Maclaurin series. Six terms:
+/// the coefficients fall only ~10× per order (see [`THETA_SLERP_SMALL`]). The
+/// `(1 − x)` factor keeps both endpoints exact at any term count. Horner in `u`,
+/// branch-free.
 #[inline]
 #[must_use]
 pub(crate) fn slerp_weight(a: f64, u: f64) -> f64 {
     let x = a * a;
-    let k = 1.0 - x; // (1 − a²) factors out of every term
+    let k = 1.0 - x;
     let c1 = 1.0 / 6.0;
     let c2 = (7.0 - 3.0 * x) / 360.0;
     let c3 = (31.0 + x * (-18.0 + 3.0 * x)) / 15120.0;
@@ -448,14 +291,7 @@ mod tests {
         libm::sin(a * theta) / libm::sin(theta)
     }
 
-    /// The conversion `h -> theta^2` must itself be exact across the whole fast
-    /// path, and it must be tested **separately** from `slerp_weight`.
-    ///
-    /// This test did not exist on the first draft, and its absence is how the
-    /// wrong `C2` reached the recorded-stream differential:
-    /// `slerp_series_matches_exact_below_threshold` feeds `slerp_weight` a `u`
-    /// computed by the *test*, so it validated the weights while the input
-    /// conversion was broken.
+    /// `h -> theta^2` is exact across the fast path, tested apart from `slerp_weight`.
     #[test]
     fn theta_sq_matches_acos_across_the_fast_path() {
         let mut worst = 0.0f64;
@@ -465,10 +301,7 @@ mod tests {
             if theta < 1e-9 {
                 continue;
             }
-            // Build `h` the way production does — from the half-chord, which is
-            // cancellation-free — NOT as `1 - cos(theta)`, which loses all
-            // precision for small theta and would be testing the test.
-            // h = 1 - cos(theta) = 2*sin^2(theta/2).
+            // h = 2*sin^2(theta/2), cancellation-free like production.
             let d = libm::sin(0.5 * theta);
             let h = 2.0 * d * d;
             let got = theta_sq_from_chord(h);
@@ -486,18 +319,11 @@ mod tests {
         );
     }
 
-    /// The threshold sweep `docs/PHASE1.md` §3.3 demands for any series/closed-form
-    /// switch: show *where* the two agree, and pick the constant from the data
-    /// rather than from taste.
-    ///
-    /// The series truncation error grows as θ⁸, so it degrades sharply above its
-    /// range; `THETA_SLERP_SMALL` must sit comfortably inside where it still
-    /// holds 1e-15.
+    /// The `docs/PHASE1.md` §3.3 threshold sweep: series vs exact holds 1e-15 up to `THETA_SLERP_SMALL`.
     #[test]
     fn slerp_series_matches_exact_below_threshold() {
         let mut worst = 0.0f64;
         let mut worst_at = (0.0, 0.0);
-        // Log grid over the range the fast path claims, times a spread of `s`.
         for i in 0..=240 {
             let theta = 1e-9 * libm::pow(10.0, i as f64 * 8.5 / 240.0);
             if theta > THETA_SLERP_SMALL {
@@ -530,10 +356,7 @@ mod tests {
         );
     }
 
-    /// The series *does* lose 1e-15 beyond its measured range — which is why
-    /// the threshold is 0.15 and not "as large as we can get away with". If this
-    /// ever stops failing, the series gained a term and the threshold must be
-    /// re-derived from a fresh sweep rather than nudged upward by hand.
+    /// The series loses 1e-15 beyond its range; if this fails, re-derive the threshold from a sweep.
     #[test]
     fn series_degrades_beyond_its_range() {
         let theta = 0.45f64;
@@ -547,42 +370,25 @@ mod tests {
             .fold(0.0f64, f64::max);
         assert!(
             worst > 1e-15,
-            // The θ is interpolated, not spelled: the literal here read
-            // `theta=0.9` — twice the value the probe above actually uses —
-            // from the commit that introduced both lines, so the one thing a
-            // maintainer sees when this fires named a θ the test never probes.
             "the series is accurate at theta={theta}; the threshold could be raised \
              (worst rel err {worst:e}) — re-derive it from a sweep"
         );
     }
 
-    /// Rotating both inputs about a fixed axis by a growing angle walks `slerp`
-    /// across the threshold. The result must be continuous there — a visible step
-    /// would mean the two branches disagree, which is the failure mode a
-    /// threshold switch is prone to.
+    /// Both branches track the exact form across the threshold.
     #[test]
     fn no_discontinuity_across_the_threshold() {
-        // Unit axis, written out so the test needs no Vec3 helper it does not have.
         let n = (0.3f64 * 0.3 + 0.5 * 0.5 + 0.81 * 0.81).sqrt();
         let axis = Vec3::new(0.3 / n, -0.5 / n, 0.81 / n);
         let s = 0.37;
         let mut worst = 0.0f64;
-        // Straddle the threshold from half of it to one and a half times it, so
-        // roughly half these samples take the series branch and half the exact
-        // one.
+        // Straddles the threshold: half of it to 1.5×.
         for i in 0..4000 {
             let theta = THETA_SLERP_SMALL * 0.5 + (i as f64) * (THETA_SLERP_SMALL / 4000.0);
             let qa = Quat::IDENTITY;
-            // `exp_so3` takes a rotation vector; the quaternion angle is half it.
             let qb = exp_so3(axis.scale(2.0 * theta));
 
-            // Compare against the exact closed form directly. Comparing adjacent
-            // *samples* to each other cannot work: consecutive angles differ by
-            // the step, so the difference is the function's own slope, which
-            // swamps any branch mismatch. Requiring both branches to track one
-            // reference is the statement with content — and the previous version
-            // of this test, which compared neighbours behind an unreachable
-            // `if`, asserted nothing at all.
+            // Compare against the closed form, not adjacent samples (the slope swamps a mismatch).
             let angle = libm::acos(qa.dot(qb).min(1.0));
             let sin_angle = libm::sin(angle);
             let want = qa
@@ -598,20 +404,14 @@ mod tests {
             assert!(d < 1e-15, "theta={theta} err={d:e}");
             worst = worst.max(d);
         }
-        // A tolerance nothing reached would be as vacuous as the old guard.
         assert!(worst > 0.0, "no sample was actually compared");
     }
 
-    /// Endpoints stay exact (proptest #6 in `docs/PHASE1.md` §10.1) on both
-    /// branches — the fast path must not perturb `s = 0` or `s = 1`.
+    /// Endpoints stay exact on both branches (proptest #6, `docs/PHASE1.md` §10.1).
     #[test]
     fn endpoints_are_exact_on_both_branches() {
         let axis = Vec3::new(1.0, 0.0, 0.0);
-        // Kept below pi/2 in *quaternion* angle: past that the shortest-arc sign
-        // fix negates qb, so `slerp(.., 1.0)` returns `-qb` — the same rotation,
-        // different components. That is correct behaviour, not an endpoint
-        // failure, so comparing raw components there would be testing the wrong
-        // thing.
+        // Below pi/2 in quaternion angle: past it the sign fix returns `-qb`.
         for &theta in &[1e-7, 1e-3, 0.1, 0.24, 0.26, 1.0, 1.5] {
             let qa = Quat::IDENTITY;
             let qb = exp_so3(axis.scale(2.0 * theta));
@@ -628,15 +428,9 @@ mod tests {
         }
     }
 
-    /// **`eval_with_twist`'s pose must be bit-identical to `eval`'s.**
+    /// `eval_with_twist`'s pose is bit-identical to `eval`'s.
     ///
-    /// A caller gets the pose and its derivative from one call and is entitled
-    /// to assume they describe the same instant. If the pose drifted by even an
-    /// ulp from the `at()` path, two lookups at the same stamp through different
-    /// entry points would disagree — the kind of discrepancy that costs a day.
-    ///
-    /// Mutant: drop the `s == 1.0` shortcut from `eval_with_twist` ⇒ fails at
-    /// `s = 1`, where `a · rel^1` is `b` only to rounding.
+    /// Mutant: drop the `s == 1.0` shortcut from `eval_with_twist`.
     #[test]
     fn eval_with_twist_pose_matches_eval() {
         for k in 0..50 {

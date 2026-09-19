@@ -1,22 +1,10 @@
 //! Publisher names → dense `u32` ids, with a hard cap.
 //!
-//! # Why publishers get an interner and edges get an index
-//!
-//! An edge's identity is a *pair* fixed by the config, so [`crate::edgeindex`]
-//! answers it once at construction. A publisher's identity is a single name that
-//! arrives on the wire and is not in any config — §5.3's GID→node resolution
-//! produces it, and on an RMW with no endpoint introspection it degrades to one
-//! of three fixed sentinels. So this table grows at runtime and must therefore be
-//! **capped**, exactly as `NameNormalizer::seen` and `Ingest::undeclared` are, and
-//! for the same reason: the key comes from outside and nothing upstream bounds
-//! how many distinct ones a misbehaving node can invent.
-//!
-//! Past the cap [`StrInterner::intern`] returns `None`. Every caller treats that
-//! as "no row", which in `crate::clock::OffsetTable` means the publisher cannot
-//! corroborate a clock step and in `crate::authority::Authority` means its
-//! conflicts are counted but not broken out per pair. Both degradations make an
-//! outcome *harder* to reach, never easier — the safe direction, since the
-//! outcomes in question are a halted bridge and a dropped transform.
+//! Publisher names arrive on the wire, so the table is **capped**: past the cap
+//! [`StrInterner::intern`] returns `None`, which callers treat as "no row"
+//! (`crate::clock::OffsetTable` cannot corroborate a step; `crate::authority::Authority`
+//! counts conflicts without a per-pair breakdown). Both make an outcome harder to
+//! reach, never easier.
 
 use crate::edgeindex::{buckets_for, mix};
 
@@ -51,8 +39,6 @@ pub(crate) struct StrInterner {
 impl StrInterner {
     /// An interner holding at most `cap` distinct names.
     pub(crate) fn with_cap(cap: usize) -> StrInterner {
-        // Shared with `crate::edgeindex`, so the two tables cannot drift about
-        // what "full" means — see `buckets_for`.
         let len = buckets_for(cap);
         StrInterner {
             buckets: vec![
@@ -82,9 +68,7 @@ impl StrInterner {
             if b.entry == EMPTY {
                 return None;
             }
-            // Confirmed against the stored name, never on the hash alone — the
-            // same argument `crate::edgeindex` makes, and here it decides which
-            // *publisher* owns an edge.
+            // Confirmed against the stored name, never on the hash alone.
             if b.hash == h && &*self.names[b.entry as usize] == s {
                 return Some(b.entry as usize);
             }
@@ -125,11 +109,9 @@ impl StrInterner {
 mod tests {
     use super::*;
 
-    /// A name round-trips to its own id and back to its own string.
+    /// A name round-trips to its own id.
     ///
-    /// Mutant: return `Some(b.entry as usize)` from `find` on a hash match
-    /// without comparing the stored name — applied, and this failed on the
-    /// `id_of("/other")` assertion, which came back as `/ekf`'s id.
+    /// Mutant: skip the stored-name comparison in `find` — fails on `id_of("/other")`.
     #[test]
     fn a_name_round_trips() {
         let mut t = StrInterner::with_cap(8);
@@ -142,16 +124,9 @@ mod tests {
         assert_eq!(t.id_of("/other"), None);
     }
 
-    /// **Past the cap, a new name gets no id**, and an already-interned one still
-    /// resolves.
+    /// Past the cap a new name gets no id; an interned one still resolves.
     ///
-    /// The degradation has to be that way round: a publisher that already has a
-    /// row keeps working, and a new one is simply not tracked. Refusing the
-    /// *known* ones instead would make a full table lose the information it
-    /// already had.
-    ///
-    /// Mutant: drop the `self.names.len() >= self.cap` guard — applied, and this
-    /// failed at `Some(PublisherId(4))` where `None` was asserted.
+    /// Mutant: drop the `self.names.len() >= self.cap` guard.
     #[test]
     fn the_cap_refuses_new_names_and_keeps_old_ones() {
         let mut t = StrInterner::with_cap(4);
@@ -163,8 +138,7 @@ mod tests {
         assert_eq!(t.id_of("p0"), Some(first), "a known name still resolves");
     }
 
-    /// Enough distinct names to walk the probe sequence still resolve to
-    /// themselves — the linear-probing invariant.
+    /// Names that walk the probe sequence still resolve to themselves.
     #[test]
     fn every_name_under_the_cap_resolves_to_itself() {
         let mut t = StrInterner::with_cap(64);

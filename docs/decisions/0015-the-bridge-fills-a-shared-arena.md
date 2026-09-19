@@ -4,135 +4,49 @@
 **Owner:** @NoeFontana
 **Implementation:** **all eight numbered steps have landed**, across four PRs.
 
-- **Step 0** — `Open::require_create` + `OpenError::ArenaAlreadyLive` — landed in
-  **#139**, not in this record's own first PR: it is `0019`'s step 1 commit that
-  carries it, because that commit was already rewriting `Open`'s defaults and the
-  two changes touch the same twenty lines.
-- **Steps 1–2** — **#141**, `feat/0015-bridge-shared-arena`: the `struct_size`
-  prefix rule *ported* to `tft_bridge_options` with `arena_name` appended, and
-  `open_shared` refusing rather than downgrading, in both the `shm` and the
-  no-`shm` build.
-- **Steps 3–4** — **#142**, `feat/0015-ros-arena-name`:
-  `BridgeOptions::arena_name`, the `arena_name` node parameter,
-  `test_shared_arena.cpp`, and the `TFT_HAVE_SHM` probe step 4 turned out to rest
-  on — see the correction under step 4.
-- **Steps 5–6** — **#143**, `feat/0015-dds-processes-arm`:
-  `bench_consumer --mode tf_tree_bridge` / `--mode tf_tree_attach`, the fourth
-  `just dds-bench` arm, the deletion of `dds_report::MISSING_ARM` and the
-  `tests/dds_report_aggregate.rs` pin step 6 turned out to need.
-- **Step 7** — split. Its `docs/PHASE5.md` §0.0 half went with **#143**, because
-  that row asserted this arm could not exist and called this record a draft, and
-  `CLAUDE.md` names §0.0 the authoritative status table, so it could not be left
-  saying so on `main`. Its `docs/PHASE4.md` §5.8 half is this PR.
+Steps 0-7 landed (#139, #141-#143, #146); step 7's `PHASE4.md` §5.8 half in the
+last PR. The record stays `ready`, not `implemented` (which is the folder's
+immutability lock, [`README.md`](./README.md) *Gates*), for one owed item:
+`docs/PHASE5.md` §9.2's *Scaling curve, N = 1...16* row for the new arm.
+`ros/dds_bench.sh` defaults `CONSUMERS` to 4, the only value
+`tf_tree.processes` has run at.
 
-**And the record stays `ready`, not `implemented`.** `implemented` is this
-folder's immutability lock — [`README.md`](./README.md)'s *Gates* say an
-implemented document is never edited to match reality, only superseded — and two
-things this record is answerable for are still unbuilt. Neither is worth a
-superseding record; both are worth naming rather than dropping:
-
-1. ~~**The fork test the *Invariants to maintain* clause demands.**~~ **Landed
-   in #146**, as its own commit for the reason this item gave: it needed a
-   fourth mode of `crates/tf_tree_bench/src/bin/fork_child.rs` behind an
-   optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
-   `tf_tree_bench`, which is a crate-graph change. The *Invariants* clause is
-   no longer an assumption.
-
-   It also found this record wrong twice about the thing it was demanding — the
-   panic guard is not the mechanism, and two of the three entry points do not
-   return a status — both corrected in the blockquote under that clause. **A
-   test written from this record's wording would have asserted the wrong
-   field.**
-2. **`docs/PHASE5.md` §9.2's *Scaling curve, N = 1…16* row, for the new arm.**
-   `ros/dds_bench.sh` defaults `CONSUMERS` to 4, and 4 is the only value
-   `tf_tree.processes` has ever run at. This record's *Consequences* claim that
-   §9.2's *total RSS across N consumers* row "becomes measurable" for a
-   bridge-filled arena, and measurable at one point is what has been shown. The
-   arm is what makes the sweep possible; the sweep is still owed, and
-   `docs/benchmarks/tf2.md` says so where it extrapolates from N = 4 to N = 16.
-
-> **Moved `draft` → `ready` by
-> [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md), which resolves
-> all three of the open questions below and scopes this record against the
-> other answer to the same problem.** The *Decision* and the seven-step
-> *Implementation plan* are unchanged.
->
-> The scoping matters as much as the answers: **the bridge owns the arena when a
-> ROS stack is the source of truth, and `tf_tree serve` owns it when nothing else
-> is a natural owner.** A deployment runs one or the other, never both. Without
-> that line this record and `PHASE2.md` §9 were two answers to one question, each
-> written as though the other did not exist.
+Moved `draft` -> `ready` by [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md),
+which resolved the three open questions and scoped this record: **the bridge owns
+the arena when a ROS stack is the source of truth; `tf_tree serve` owns it when
+nothing else is a natural owner. A deployment runs one or the other, never both.**
 
 ## Context
 
-`docs/PHASE5.md` §9.1 specifies the benchmark artifact as *"N `tf2` consumers
-versus **one bridge plus N `tf_tree` consumers**"*, and §9.2 requires **total RSS
-across N consumers** as a row. Both sentences assume the N consumers are separate
-processes reading what the bridge writes. They cannot be, today.
-
-`tft_bridge_create` builds its arena with `TreeBuilder::build()` — an ordinary
-**heap** arena — so nothing outside the bridge's own process can reach it. The
-`BridgeHandle::tree()` accessor hands out a `tft_tree *` valid only in-process.
-
-The consequence is not theoretical; it is the shape of the comparison that
-shipped. `just dds-bench` runs three arms and **prints, above its own table on
-every run**, that the fourth cannot exist:
-
-| arm | procs | consumers | svc p50 | PSS |
-|---|---|---|---|---|
-| `tf2.processes` | 4 | 4 | 4.16 µs | 63.02 MiB |
-| `tf2.composed` | 1 | 4 | 1.58 µs | 24.02 MiB |
-| `tf_tree.composed` | 1 | 4 | 0.83 µs | 24.81 MiB |
-| `tf_tree.processes` | — | — | **not measurable** | **not measurable** |
-
-The missing row is the one the project's central claim is about.
-`docs/PROJECT.md`'s argument is that tf_tree's cost is *O(1) in the number of
-consumers* where `/tf` is O(consumers × edges × rate), and
-`docs/PHASE5.md` §12's criterion 4 — *"16 workers sharing one `.tft`: total Pss
-within 1.2× of one worker"* — calls the sharing claim "the wedge's central
-claim". `crates/tf_tree_bench`'s `contended_scaling` and `mp_bench` both
-demonstrate it, but they build their own shared arenas: **nothing demonstrates
-it for an arena a ROS bridge filled**, which is the only way a real robot gets
-one.
-
-Phase 2 already built every mechanism this needs. `TreeBuilder::build_shared`,
-`Tree::attach_shared`, `tf_tree::open()`, the rendezvous, fd passing, claims as
-leases, reaping and fork poisoning all ship and are gated by `just shm-check`.
-What is missing is a way to ask the bridge for one.
-
-This is new public surface on the C ABI's §5 seam, so `CLAUDE.md` routes it here
-rather than to a PR.
+`docs/PHASE5.md` §9.1 compares N `tf2` consumers with **one bridge plus N
+`tf_tree` consumers**, and §9.2 requires total RSS across N consumers. Those must
+be separate processes reading what the bridge writes, but `tft_bridge_create`
+builds a **heap** arena via `TreeBuilder::build()`, reachable only in-process, so
+`just dds-bench` has a `tf_tree.processes` row that is "not measurable". That row
+is the one the project's O(1)-in-consumers claim is about; nothing demonstrates it
+for an arena a ROS bridge filled. Phase 2 already ships every mechanism
+(`build_shared`, `attach_shared`, `tf_tree::open()`, rendezvous, fd passing,
+leases, reaping, fork poisoning); what is missing is a way to ask the bridge for
+one. New public surface on the C ABI's §5 seam, so a record.
 
 ## Decision
 
-**Give `tft_bridge_options` an optional arena name. When it is set, the bridge
-builds a shared arena under it instead of a heap one; when it is not, nothing
-changes.**
+**Give `tft_bridge_options` an optional arena name. When set, the bridge builds a
+shared arena under it instead of a heap one; when not, nothing changes.**
 
 ### The ABI
 
 `tft_bridge_options` gains one field, at the end.
 
-> **Correction — the prefix rule §3.6 describes is implemented for exactly one
-> struct, and `tft_bridge_options` is not it.** `tft_bridge_create`
-> validates with **exact equality** (`crates/tf_tree_c/src/bridge.rs:890-893`)
-> and then reads the whole struct (`:896`). The rule exists for
-> `tft_bridge_sample` alone — frozen shadow struct at `:293-301`, compile-time
-> offset assertions at `:303-323`, bounded copy in `read_sample` at
-> `:1368-1402`. `tft_bridge_outcome`, `tft_bridge_remap` and `tft_bridge_stats`
-> are exact-equality too, and stay that way: they are `out` parameters, and
-> accepting a short one means the callee must know which fields to skip writing,
-> which is a different and larger design.
->
-> So this record's **first** step is to *port* the rule, not to rely on it: a
-> `tft_bridge_options_v1` shadow struct with the same offset assertions, and a
-> `read_options` that narrows the copy to the declared size. **Relaxing `!=` to a
-> length test without narrowing the read is an out-of-bounds read**, in the one
-> crate whose entire `unsafe` budget is argument validation — `read_sample`'s own
-> doc comment is explicit that the narrowed copy *is* the safety argument.
-> `tft_bridge_create`'s safety contract widens from "whose `struct_size` is set"
-> to "…and which has at least that many readable bytes", matching
-> `tft_bridge_offer`'s.
+The `struct_size` prefix rule (§3.6) is implemented for one struct only,
+`tft_bridge_sample`; `tft_bridge_create` validates `tft_bridge_options` by **exact
+equality** (`crates/tf_tree_c/src/bridge.rs:890-893`) and reads the whole struct.
+`tft_bridge_outcome`, `_remap` and `_stats` stay exact-equality (they are `out`
+parameters). So step 1 *ports* the rule: a `tft_bridge_options_v1` shadow struct
+with offset assertions and a `read_options` that narrows the copy to the declared
+size. **Relaxing `!=` without narrowing the read is an out-of-bounds read**;
+`tft_bridge_create`'s safety contract widens to "at least that many readable
+bytes", as `tft_bridge_offer`'s does.
 
 ```c
 typedef struct {
@@ -150,20 +64,12 @@ typedef struct {
 } tft_bridge_options;
 ```
 
-`tft_bridge_create` routes the same builder through `tf_tree::Open` instead of
-calling `build()`.
-
-> **Correction — `build_shared(name)` alone cannot do this.**
-> `TreeBuilder::build_shared` **publishes no rendezvous**:
-> `crates/tf_tree/src/tree.rs:373-376` is explicit that the name is a debug label
-> that appears in `/proc/<pid>/fd`, and that *"segments are not discoverable by
-> name — the fd is the capability"*. A second process could not find it. The path
-> that publishes is `Open::open`'s `Created`/`TookOver` arm
-> (`crates/tf_tree/src/open.rs:337-345`), which is `build_shared` **plus**
-> `use_ofd_liveness`, `use_claim_leases`, `spawn_owner_server` and
-> `hold_ownership`.
-
-The call is:
+`build_shared(name)` alone cannot do this: it publishes **no rendezvous**
+(`crates/tf_tree/src/tree.rs:373-376`: the name is a debug label). The path that
+publishes is `Open::open`'s `Created`/`TookOver` arm
+(`crates/tf_tree/src/open.rs:337-345`), which is `build_shared` plus
+`use_ofd_liveness`, `use_claim_leases`, `spawn_owner_server` and
+`hold_ownership`. So:
 
 ```rust
 Open::new().name(arena_name)?
@@ -174,345 +80,146 @@ Open::new().name(arena_name)?
     .open()
 ```
 
-`layout_if_creating` is what preserves §5.6: the builder still comes from
-`ingest.declared()` and never from `config`, so a `tf_prefix`-rewritten topology
-sizes the arena, exactly as `bridge.rs:978-988` requires today.
+`layout_if_creating` preserves §5.6: the builder comes from `ingest.declared()`,
+never `config`, so a `tf_prefix`-rewritten topology sizes the arena.
 
-**`arena_name` is the rendezvous *name*; the rendezvous *domain* is not
-`tft_bridge_options.domain`.** That field is §5.5's *time* domain. The rendezvous
-domain comes from `$TF_TREE_DOMAIN`, else `$ROS_DOMAIN_ID`, else 0 — which is
-precisely [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3's
-resolution of question 2, and why no derivation from `tf_prefix` is needed. Two
-fields named "domain" in one header meaning different things is a documentation
-obligation, not an accident to be discovered. Everything downstream — the claims, the ingest pipeline, the counters,
-the outcome POD — is unchanged, because a `Tree` is a `Tree`.
+`arena_name` is the rendezvous *name*. The rendezvous *domain* is not
+`tft_bridge_options.domain` (§5.5's *time* domain): it is `$TF_TREE_DOMAIN`, else
+`$ROS_DOMAIN_ID`, else 0 ([`0019`](./0019-one-binary-and-topology-you-can-wait-for.md)
+§3, question 2), so nothing is derived from `tf_prefix`. Two "domain" fields
+meaning different things is a documentation obligation.
 
 ### The rclcpp surface
 
-`tf_tree_ros::BridgeOptions` gains `std::string arena_name` (empty = heap), and
-`BridgeNode` a `arena_name` parameter, default `""`. §5.8's three deployment
-forms all inherit it.
-
-> **Correction — form 3 inherits the *field*, not the parameter.** Forms 1 and 2
-> are `BridgeNode` and get it from the ROS parameter; form 3 never constructs a
-> `BridgeNode` and has no parameters at all, so `BridgeOptions::arena_name` is
-> its whole surface. That is why `test_shared_arena.cpp` asserts both paths
-> separately: a `BridgeNode` that did something private with the name would
-> leave form 3 — the form this project dogfoods — unable to publish an arena at
-> all.
->
-> One rule is added at the parameter layer and only one: an `arena_name` carrying
-> **whitespace an operator cannot see** — entirely whitespace, or whitespace at
-> either end — is refused there. Empty means "no shared arena", so `""` and `" "`
-> are the same string to an operator and opposite instructions to the bridge;
-> and a consumer selects by exact name, so `" foo"` and `"foo"` are the same
-> string to that same operator and *different rendezvous*. To C all of the
-> non-empty ones are ordinary valid single-component names that `ArenaName`
-> accepts (measured, not assumed), and the difference appears in no log line on
-> either side. **Refused, not trimmed**: this layer refuses what the ABI cannot
-> see rather than rewriting what the operator wrote. Every other malformed name —
-> over 64 bytes, `../escape` — is `tf_tree_ipc::ArenaName`'s to refuse, and it
-> arrives as a `BridgeError` naming the name. (An *empty* name is not in that
-> list: `BridgeHandle` maps `""` to a NULL `arena_name`, the ABI's spelling for
-> "private heap arena", so `ArenaName` never sees one from this package.) A
-> narrower rule at the ROS layer would make `tf_tree_ros` reject names
-> `$TF_TREE_NAME` and `tf_tree serve` accept.
+`tf_tree_ros::BridgeOptions` gains `std::string arena_name` (empty = heap) and
+`BridgeNode` an `arena_name` parameter, default `""`. Form 3 (no `BridgeNode`, no
+parameters) inherits the *field* only, so `test_shared_arena.cpp` asserts both
+paths. One rule at the parameter layer: an `arena_name` that is entirely
+whitespace or has leading/trailing whitespace is **refused, not trimmed** (`""` and
+`" "` are opposite instructions to the bridge; `" foo"` and `"foo"` are different
+rendezvous, and neither shows in a log). Every other malformed name is
+`tf_tree_ipc::ArenaName`'s to refuse, arriving as a `BridgeError` naming it.
+`BridgeHandle` maps `""` to a NULL `arena_name`.
 
 ### What a consumer does
 
-Exactly what it already does for any shared arena — `tf_tree::open()` in Rust,
-`tf_tree::Tree::open()` in C++, `tf_tree.open()` in Python. **No new consumer
-API**, which is the point: the bridge becomes an ordinary producer of the arena
-Phase 2 already specified, rather than a special case.
+`tf_tree::open()` / `Tree::open()` / `tf_tree.open()` as for any shared arena. No
+new consumer API.
 
 ### Failure
 
-A shared build can fail where a heap build cannot — the name is taken, the
-runtime directory is unwritable, `memfd_create` is refused. Those are startup
-failures and join the ones `tft_bridge_create` already reports (domain, cycle,
-claim). **They need one new status code, and the bridge needs one new builder
-knob.**
+A shared build can fail where a heap build cannot (name taken, runtime directory
+unwritable, `memfd_create` refused). Nothing existing means these
+(`TFT_ERR_BAD_CONFIG` is topology text, `TFT_ERR_TIME_DOMAIN` is §5.5), and
+collapsing onto `TFT_ERR_INTERNAL` - what `tft_tree_open` does today - leaves an
+operator unable to tell "another bridge holds this name" from "the runtime
+directory is on NFS" from "a bug". So **`TFT_ERR_ARENA_UNAVAILABLE`**: one code,
+specific `tft_error` message, `TFT_ERR_BAD_CONFIG`'s granularity. A **minor bump**
+under §3.6, on `TFT_ERR_BAD_STAMP`'s precedent, tighter here because it is
+reachable only when `arena_name` is non-NULL, which a previous-layout caller
+cannot set.
 
-> **Correction — "no new error class" does not survive contact.** Nothing
-> existing means these: `TFT_ERR_BAD_CONFIG` is the topology *text*,
-> `TFT_ERR_TIME_DOMAIN` is §5.5's domain agreement, and the claim family is
-> per-edge with `frame_a`/`frame_b` in its detail. Collapsing them onto
-> `TFT_ERR_INTERNAL` — what `tft_tree_open` does today — leaves an operator
-> unable to tell "another bridge holds this name" from "the runtime directory is
-> on NFS" from "a bug", which is the diagnosis this section exists to protect.
->
-> So: **`TFT_ERR_ARENA_UNAVAILABLE`**, one code with a specific `tft_error`
-> message, at the granularity `TFT_ERR_BAD_CONFIG` already uses for every way a
-> config can be wrong. Under §3.6 that is a **minor bump**, on the precedent
-> `TFT_ABI_VERSION_MINOR`'s own documentation sets for `TFT_ERR_BAD_STAMP` — and
-> the argument is tighter here, because the code is reachable only when
-> `arena_name` is non-NULL, which a caller whose `struct_size` names the previous
-> layout cannot set.
->
-> **And `CreatePolicy` has no "create, or refuse if one is already live"
-> variant.** With plain `IfAbsent` a second bridge takes the *join* path,
-> attaches read-write, and starts claiming edges in somebody else's arena — the
-> fault [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3's
-> question 3 closes. `Never` forbids creating; `Always` is `--force-new` and
-> documents itself as "never take this path automatically". So
-> `Open::require_create(bool)` + `OpenError::ArenaAlreadyLive`, in
-> `crates/tf_tree/src/open.rs` where the session is already in hand.
->
-> **A `bridge`-without-`shm` build must refuse, not ignore.** `bridge` and `shm`
-> are independent cargo features and **no recipe builds both together**;
-> `build_shared` and `tft_tree_open` are `#[cfg(feature = "shm")]`. Such a build
-> carries `arena_name` in its header with no `tf_tree::Open` behind it, and must
-> return `TFT_ERR_ARENA_UNAVAILABLE` naming the missing feature. Ignoring the
-> field is precisely the silent downgrade the rest of this section forbids,
-> reached by a *build configuration* rather than a runtime fault — and it is the
-> more likely of the two. `just shm-check` gains the `--features bridge,shm`
-> lines that make the combination compile at all.
+`CreatePolicy` has no "create, or refuse if one is live": with `IfAbsent` a second
+bridge would join read-write and claim edges in another's arena (`0019` §3
+question 3). `Never` forbids creating; `Always` is `--force-new`. Hence
+`Open::require_create(bool)` + `OpenError::ArenaAlreadyLive`.
 
-There is no runtime fallback to a heap arena. **A bridge asked for a shared arena that
-cannot make one must refuse to start**, because a silent downgrade would leave
-every consumer waiting on a rendezvous that will never appear, which is the
-failure mode hardest to diagnose from the consumer's side.
+A `bridge`-without-`shm` build must **refuse, not ignore**: it carries
+`arena_name` with no `tf_tree::Open` behind it and must return
+`TFT_ERR_ARENA_UNAVAILABLE` naming the missing feature. `just shm-check` gains the
+`--features bridge,shm` lines.
+
+There is no runtime fallback to a heap arena: consumers see only "the rendezvous
+is not there yet", so a silent downgrade presents as a bridge that never came up.
 
 ## Rationale
 
-**Why an option rather than always shared.** A shared arena costs a `memfd`, a
-rendezvous entry in the runtime directory, and a participant slot; a bridge
-composed into the same process as its only consumer needs none of them, and
-§5.8's form 3 exists precisely for that deployment. Making it unconditional
-would also change the behaviour of every existing caller, which the
-`struct_size` rule exists to avoid.
-
-**Why the name, and not a file descriptor.** Handing back an fd would work and
-is strictly more flexible, but it makes every consumer's attach path
-bridge-specific: the consumer would need the bridge's fd, which means a socket,
-which means the bridge grows a protocol. The rendezvous is the protocol
-`docs/decisions/0005` already specified and `tf_tree::open()` already speaks.
-
-**Why not a second bridge entry point** (`tft_bridge_create_shared`). Two
-constructors that differ in one field is the shape that drifts: every later
-option has to be added to both, and one of them is eventually forgotten. §3.6's
-`struct_size` mechanism exists for exactly this and is already load-bearing
-elsewhere in the ABI.
-
-**Why refusing beats falling back.** A fallback is attractive — the bridge keeps
-running, the robot keeps moving — and it is the wrong trade here. The consumers
-are separate processes whose only signal is "the rendezvous is not there yet",
-which is indistinguishable from "the bridge has not started yet". A bridge that
-downgraded silently would present as a bridge that never came up, on the
-consumer side, forever.
+- **Option, not always shared:** a shared arena costs a `memfd`, a runtime-dir
+  entry and a participant slot; §5.8's form 3 needs none, and unconditional would
+  change every existing caller.
+- **Name, not fd:** an fd makes every consumer's attach bridge-specific and grows
+  the bridge a protocol; the rendezvous is `0005`'s and `tf_tree::open()` speaks it.
+- **Not a second entry point:** two constructors differing in one field drift;
+  `struct_size` exists for this.
 
 ## Consequences
 
-**Easier.** §9.1's comparison becomes complete: `dds_bench` grows a
-`tf_tree.processes` arm and `dds_report`'s `MISSING_ARM` sentence is deleted
-rather than reworded. §9.2's *total RSS across N consumers* row becomes
-measurable for a bridge-filled arena, and §12 criterion 4's claim becomes
-demonstrable on the online path and not only the frozen one. A robot can run one
-bridge and N nodes without composing them into one process.
-
-**Harder.** The bridge acquires a failure mode at startup it did not have, and
-an operational surface — a name that two bridges can collide on. `tf_tree
-doctor` and `tf_tree top` gain a participant they did not previously see, which
-is a *benefit* for diagnosis and a change in their output that their tests pin.
+`dds_bench` gains the `tf_tree.processes` arm and `MISSING_ARM` is deleted.
+The bridge gains a startup failure mode and a name two bridges can collide on;
+`tf_tree doctor` / `top` see a new participant (their tests pin the output).
 
 **Invariants to maintain.** The bridge remains the single writer of every edge it
 claims; consumers attach **read-only** and the ABI must not grow a way for them
-not to. Fork poisoning, reaping and the claim leases apply to the bridge exactly
-as to any other participant, and the bridge's ingest thread is the one that
-created the arena — so `docs/decisions/0005` step 9's `atfork` rules apply to it
-unchanged and must be tested, not assumed.
+not to. Fork poisoning, reaping and claim leases apply as to any participant, and
+`0005` step 9's `atfork` rules apply unchanged and are tested, not assumed:
 
-> **The fork test does not exist yet, and this is what it has to be.** Every one
-> of the eight steps landed without it, so the sentence above is still an
-> assumption — which is the thing it forbids, and it is why this record is
-> `ready` and not `implemented`. Written out rather than left as a clause,
-> because the reason it did not land is a real constraint and not an oversight.
->
-> *Half of it is already covered.* `BridgeInner` holds exactly two guarded
-> shapes: `Arc<Tree>` and one `tf_tree::OwnedWriter` per declared dynamic edge
-> (`tft_bridge_create` claims through `Tree::claim_owned`, per `0017`). That is
-> the same pair `crates/tf_tree_bench/src/bin/fork_child.rs`'s **`owned` mode**
-> already forks and checks — `0017` step 4 — so the Rust-level claim, that a
-> forked child is refused rather than reading a `MADV_DONTFORK` hole and that its
-> destructors do not release the parent's OFD lease, holds for the bridge by
-> construction.
->
-> *The uncovered half is the C ABI layer above it*, and it is the half a ROS
-> node actually reaches: that `tft_bridge_offer`, `tft_bridge_get_stats` and
-> `tft_bridge_free` called on an inherited handle in a forked child **come back
-> at all** — never a `SIGSEGV` and never an `abort()` — and that the parent's
-> bridge still applies an offer, and its arena is still readable from a third
-> process, after that child has exited.
->
-> > **Two corrections, both found by writing the test.** This paragraph
-> > originally said the three calls "return a status — §3.4's panic guard
-> > turning `ChildDetached` into `TFT_ERR_CHILD_DETACHED`", and it was wrong
-> > about the mechanism and about two of the three entry points. A test written
-> > from its wording would have asserted the wrong field.
-> >
-> > *The panic guard is not what does this.* Removing `catch_unwind` from
-> > `guard()` entirely leaves the test passing: nothing panics in a forked
-> > child. `OwnedWriter::push` returns an ordinary
-> > `Err(PushError::ChildDetached)` and `publisher::map::push` maps it. The
-> > guard is an independent second defence that would matter only if a future
-> > detach path panicked instead of returning — which is worth having and is not
-> > this property.
-> >
-> > *"Each return a status" is false for two of the three.*
-> > `tft_bridge_free` returns **`void`**; all the child can be held to is
-> > returning, and the destructor half is observed from the parent — its lease
-> > still held, its rendezvous still serving. And `tft_bridge_offer` returns
-> > **`TFT_OK`**: the detachment arrives on the *outcome*
-> > (`action = TFT_BRIDGE_REJECTED`, `out.status = TFT_ERR_CHILD_DETACHED`),
-> > which is the documented split — the return value answers a different
-> > question from the outcome — so this paragraph was describing an entry point
-> > it had not re-read. Only `tft_bridge_get_stats` returns the code directly.
->
-> **It cannot live in `tf_tree_c`.** What has to be produced is `fork()` without
-> `exec` (`std::process::Command` always `exec`s, and a thread is not a process),
-> and the only primitive for that is `libc::fork`, which `tf_tree_c` does not
-> depend on. Adding it would put a second real `fork()` in the workspace against
-> `0005`'s recorded single exception, and add `libc` to the C ABI's dependency
-> graph — both of which are `0007` budget questions and therefore a decision
-> record, not a PR.
->
-> **So it belongs in `crates/tf_tree_bench`**, as a fourth mode of the existing
-> `fork_child` binary — the file `0005` already grants the exception to and which
-> already carries the scratch rendezvous, the `exited`-versus-`signalled`
-> protocol and the parent re-validation this needs. The cost is one new crate
-> edge: an optional `tf_tree_c = { features = ["bridge", "shm"] }` behind a
-> `bridge` feature on `tf_tree_bench`, and a line in `just shm-check` beside the
-> `fork_child` build it already has. That edge is what makes this its own commit
-> rather than a rider on step 2.
+- `crates/tf_tree_bench/src/bin/fork_child.rs` has a fourth mode (behind an
+  optional `tf_tree_c = { features = ["bridge", "shm"] }` edge on
+  `tf_tree_bench`, landed #146) forking with `libc::fork`; it cannot live in
+  `tf_tree_c`, which would add a second real `fork()` and `libc` to the C ABI
+  (`0007` budget questions).
+- The Rust-level claim is covered by `0017` step 4's `owned` mode. This mode
+  covers the C layer: `tft_bridge_offer`, `tft_bridge_get_stats` and
+  `tft_bridge_free` on an inherited handle in a forked child **come back at all**
+  (no `SIGSEGV`, no `abort()`), and the parent's bridge still applies an offer
+  and its arena is readable from a third process after the child exits.
+- The panic guard is *not* the mechanism: `OwnedWriter::push` returns
+  `Err(PushError::ChildDetached)`, which `publisher::map::push` maps. Only
+  `tft_bridge_get_stats` returns the code directly; `tft_bridge_free` returns
+  `void`; `tft_bridge_offer` returns `TFT_OK` with the detachment on the
+  *outcome* (`action = TFT_BRIDGE_REJECTED`, `out.status =
+  TFT_ERR_CHILD_DETACHED`).
 
 ## Implementation plan
 
-0. **`Open::require_create` + `OpenError::ArenaAlreadyLive`** — not in this
-   record's original seven, and required by them (see *Failure*). — verified by
-   `just shm-rendezvous` with a case asserting a second `require_create(true)`
+0. **`Open::require_create` + `OpenError::ArenaAlreadyLive`** (landed with `0019`
+   step 1). Verified by `just shm-rendezvous`: a second `require_create(true)`
    open against a live arena fails and leaves the first serving.
-1. **Port the `struct_size` prefix rule to `tft_bridge_options`** — shadow
-   struct, offset assertions, a `read_options` that narrows the copy, and
-   *deletion* of the whole-struct `read_unaligned` — then append `arena_name`
-   defaulting to NULL; `tft_bridge_create` branches to the `Open` path of
-   *The ABI* above. — verified by a new
-   `crates/tf_tree_c/tests/bridge.rs` case asserting a caller passing the
-   *previous* `struct_size` still gets a heap arena, plus the existing 52 cases
-   staying green.
-2. **Refuse rather than downgrade**: a shared build failure is a startup status,
-   with no heap fallback. — verified by a test that creates a bridge under a name
-   already held and asserts the create fails and no arena is published.
-3. **`tf_tree_ros::BridgeOptions::arena_name` and the `arena_name` node
-   parameter**, wired through §5.8's three forms. — verified by
-   `ros/tf_tree_ros/test/test_node.cpp` gaining a parameter case; `just ros-test`.
-4. **A second process attaches to a bridge-filled arena and reads what the
-   bridge wrote.** — verified by a new ctest that spawns the shipped
-   `tf_tree_bridge` executable, publishes `/tf`, attaches with `tft_tree_open`
-   and asserts a lookup matches; `just ros-test`.
-
-   > **Correction — this step names the wrong property, and a prerequisite it
-   > does not mention.**
-   >
-   > *The property.* "A second **process** reads what the bridge wrote" is step
-   > 2's, and step 2 discharged it:
-   > `crates/tf_tree_c/tests/bridge_shared.rs`'s
-   > `a_second_process_reads_what_the_bridge_wrote` spawns a real child that
-   > links no `tf_tree_c` at all and compares the bytes. Spawning
-   > `tf_tree_bridge` from a ctest would re-run that across a middleware and an
-   > ament install tree, and it would still not test the thing this step is
-   > actually for — **that the ROS parameter reaches
-   > `tft_bridge_options::arena_name`**. A bridge whose parameter was dropped on
-   > the floor publishes no rendezvous, so a spawned-executable test fails, but
-   > so does a much cheaper one. What no version of "attach and assert a lookup
-   > matches" catches on its own is the reverse: it passes just as well against
-   > an implementation that publishes *unconditionally*.
-   >
-   > So `ros/tf_tree_ros/test/test_shared_arena.cpp` is a **comparison**: the
-   > same node, topology and attach, once without the parameter (nothing is
-   > findable under the name) and once with it (the attach succeeds and reads
-   > the topology's static edge). Plus the same thing through
-   > `BridgeOptions::arena_name` for §5.8's form 3, which has no parameters at
-   > all, and the held-name refusal crossing `BridgeHandle`'s promise as a
-   > `BridgeError`.
-   >
-   > *The prerequisite.* `tf_tree.h` hides `tft_tree_open` behind
-   > `#if defined(TFT_HAVE_SHM)` and **nothing in the CMake package defined it**,
-   > so no `find_package(tf_tree CONFIG)` consumer — this ctest, `ros/tf_tree_ros`,
-   > `just cmake-check` — could call the entry point this record's consumers
-   > exist to call, except by hand-typing the macro against an archive that may
-   > not have the feature in it. `crates/tf_tree_c/CMakeLists.txt` now probes
-   > **each** resolved library with `nm` — the `.a` and the `.so` separately —
-   > and propagates a per-target `TFT_HAVE_SHM=1` through
-   > `tf_treeConfig.cmake.in`, and `ros/build.sh` builds `--features bridge,shm`
-   > and checks one symbol per feature. The "each" is not decoration: one probe
-   > answering for both exported targets made a `TF_TREE_PREBUILT_DIR` holding a
-   > `bridge,shm` `.a` beside a `bridge`-only `.so` announce `TFT_HAVE_SHM=1` and
-   > then fail to link the shared target, which is the link-time failure the
-   > probe exists to convert into a compile-time one. None of that is in the
-   > seven steps; it is what step 4 turned out to rest on.
-5. **`dds_bench` grows a `tf_tree.processes` arm**; `bench_consumer` gains
-   `--mode tf_tree_attach` that calls `tf_tree::Tree::open()` instead of hosting
-   a bridge. — verified by `just dds-bench` reporting four arms at 0 % failure.
-6. **Delete `dds_report::MISSING_ARM`** and the paragraph in
-   `docs/benchmarks/tf2.md` it mirrors, replacing both with the measured row. —
-   **the test this step used to name does not exist.** `dds_report.rs` has no
-   `mod tests` and nothing under `crates/tf_tree_bench/tests/` references
-   `MISSING_ARM`; the `REQUIRED_ROWS` machinery that sounds like it belongs to
-   `bench_report`, a different binary. The sentence is pinned by nothing, so
-   deleting it is unverified by construction. This step therefore *adds* the pin
-   as well: a test over `aggregate`'s rendered output asserting four arm labels
-   and the absence of `NOT MEASURED`.
-7. **Update `docs/PHASE4.md` §5.8 and `docs/PHASE5.md` §0.0's §9 row.** —
-   verified by review.
+1. **Port the `struct_size` prefix rule to `tft_bridge_options`** (shadow struct,
+   offset assertions, narrowing `read_options`, deleting the whole-struct
+   `read_unaligned`), append `arena_name` defaulting to NULL, branch
+   `tft_bridge_create` to the `Open` path. Verified by a
+   `crates/tf_tree_c/tests/bridge.rs` case that the *previous* `struct_size` still
+   gets a heap arena.
+2. **Refuse rather than downgrade**, no heap fallback. Verified by creating a
+   bridge under a held name and asserting the create fails and nothing is
+   published.
+3. **`BridgeOptions::arena_name` and the `arena_name` node parameter**, through
+   §5.8's three forms. Verified by `test_node.cpp`; `just ros-test`.
+4. **The ROS parameter reaches `tft_bridge_options::arena_name`.**
+   `a_second_process_reads_what_the_bridge_wrote` in
+   `crates/tf_tree_c/tests/bridge_shared.rs` already covers a second process, so
+   `ros/tf_tree_ros/test/test_shared_arena.cpp` is a *comparison* (same node,
+   topology and attach, without the parameter nothing is findable, with it the
+   attach reads the static edge), plus form 3 through `BridgeOptions`, plus the
+   held-name refusal as a `BridgeError`. A pure "attach and assert" test would
+   pass against an implementation that publishes unconditionally.
+   Prerequisite: `tf_tree.h` hides `tft_tree_open` behind `TFT_HAVE_SHM`, so
+   `crates/tf_tree_c/CMakeLists.txt` probes **each** resolved library (`.a` and
+   `.so` separately) with `nm` and propagates a per-target `TFT_HAVE_SHM=1`
+   through `tf_treeConfig.cmake.in`; `ros/build.sh` builds `--features
+   bridge,shm` and checks one symbol per feature.
+5. **`dds_bench` grows a `tf_tree.processes` arm**; `bench_consumer --mode
+   tf_tree_attach` calls `tf_tree::Tree::open()`. Verified by `just dds-bench`
+   reporting four arms at 0 % failure.
+6. **Delete `dds_report::MISSING_ARM`** and its mirrored paragraph in
+   `docs/benchmarks/tf2.md`, adding the pin nothing had
+   (`crates/tf_tree_bench/tests/dds_report_aggregate.rs`: four arm labels and no
+   `NOT MEASURED`).
+7. **Update `docs/PHASE4.md` §5.8 and `docs/PHASE5.md` §0.0's §9 row.**
 
 ## Open questions
 
-**All three are resolved by
-[`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3, which is why
-this record is `ready`.** They are kept below as written, with the answer under
-each, because the reasoning that produced the question is worth more than the
-answer alone.
+All three are resolved by [`0019`](./0019-one-binary-and-topology-you-can-wait-for.md) §3.
 
-> **1 — Resolved: refuse.** The leaning below was right. A live arena under this
-> name with a different `layout_hash` is a startup refusal; `LayoutMismatch`
-> already exists as an attach error naming both values, and `CreatePolicy::Always`
-> is the operator's explicit act and already documents itself as "never take this
-> path automatically". That adding an edge restarts every participant is stated
-> rather than engineered around — it is D4 and `0004` being what they are.
->
-> **2 — Resolved: no derivation.** The rendezvous is already namespaced by
-> `(domain, name)`, and `domain_from_env` falls back `TF_TREE_DOMAIN` →
-> `ROS_DOMAIN_ID` — precisely the convention two robots on one host already use.
-> So the collision this question worried about is already handled one layer down,
-> and deriving from `tf_prefix` would both couple what `PHASE4.md` §5.6 keeps
-> apart and make the name unguessable for the operator who has to attach to it.
->
-> **3 — Resolved: beside §5.4, not inside it.** A second bridge on a held name is
-> a *rendezvous* fault; §5.4 is about two publishers on one *edge*, with per-edge
-> attribution. Folding them together would give one diagnostic two meanings —
-> the error `PHASE5.md` §6's `TFT017`/`TFT018` amendment refused when it declined
-> to reuse an existing id.
-
-1. **Who sizes the arena, and can it be resized without a restart?** The
-   topology config fixes capacity at build time (`0004`, D4: fixed capacity, no
-   growth), so a shared bridge arena is sized by the same file. That is
-   consistent, but it means adding an edge to the config is a restart *of every
-   consumer*, not just of the bridge — the arena is a new `memfd` and the old
-   mapping is stale. Phase 2's rendezvous has an instance UUID for exactly this;
-   what is unresolved is whether the bridge should refuse to start when a live
-   arena with the same name has a different `layout_hash`, or replace it and let
-   the reapers clean up. **Leaning: refuse, and make `--force` the operator's
-   explicit act.**
-
-2. **Does the bridge need `--arena-name` to imply anything about `tf_prefix`?**
-   Two robots on one host each running a bridge will collide on a default name.
-   A name derived from `tf_prefix` would avoid it automatically and would also
-   couple two things §5.6 keeps separate. **Leaning: no derivation, and a
-   collision is the refusal in question 1 — but this needs a look at what
-   `docs/PHASE2.md` §3.3's rendezvous already does about namespacing.**
-
-3. **Should `Strict` authority interact with a shared arena?** A second bridge
-   attaching to a name already held is a different fault from two publishers on
-   one edge, and it is not obvious whether it belongs in §5.4's conflict
-   machinery or beside it. Probably beside it, but the diagnostic wording should
-   be settled before the code is.
+1. **Resolved: refuse.** A live arena under this name with a different
+   `layout_hash` is a startup refusal (`LayoutMismatch` names both values);
+   `CreatePolicy::Always` is the operator's explicit act. Adding an edge restarts
+   every participant (D4, `0004`).
+2. **Resolved: no derivation.** The rendezvous is namespaced by `(domain, name)`
+   and `domain_from_env` falls back `TF_TREE_DOMAIN` -> `ROS_DOMAIN_ID`;
+   deriving from `tf_prefix` would couple what `PHASE4.md` §5.6 keeps apart.
+3. **Resolved: beside §5.4, not inside it.** A second bridge on a held name is a
+   *rendezvous* fault; §5.4 is two publishers on one *edge*. Folding them gives
+   one diagnostic two meanings, which `PHASE5.md` §6's `TFT017`/`TFT018`
+   amendment refused.

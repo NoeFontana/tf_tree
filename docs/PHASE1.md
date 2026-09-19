@@ -1,113 +1,38 @@
 # tf_tree — Phase 1 Implementation Specification
 
-> **Companion document:** `docs/PROJECT.md` holds the project overview, the full eight-phase roadmap, and the decision log with rationale. When this spec does not answer a question, check the decision log there before choosing — several obvious-looking simplifications are deliberately excluded and the reasons are recorded.
+> **Companion:** `docs/PROJECT.md` holds the overview, roadmap and decision log. Where this spec is silent, check the log first — several obvious simplifications are deliberately excluded.
 
-**Deliverable:** a single-process transform tree engine in Rust, benchmarked against ROS 2 `tf2`.
-
-**Critical framing:** Phase 2 maps the sample storage into shared memory so that a second process runs the *identical, unmodified* reader code against an `mmap`'d arena. Phase 1 is therefore not "the simple version" — it is the shared-memory version backed by a heap allocation instead of a `memfd`. Every layout decision in this document exists to make that swap a one-line change in `tf_tree_arena`. Do not simplify them away.
-
-Sections marked **NORMATIVE** are requirements. Code blocks are illustrative unless the section says otherwise; signatures and layouts are normative even when bodies are sketches.
-
----
+**Critical framing:** Phase 2 maps sample storage into shared memory so a second process runs the *identical, unmodified* reader code against an `mmap`'d arena. Phase 1 is the shared-memory version backed by a heap allocation; every layout decision exists so that swap is a one-line change in `tf_tree_arena`. Do not simplify them away. Sections marked **NORMATIVE** are requirements; code blocks are illustrative, but signatures and layouts are normative.
 
 ## 0. Non-goals and guardrails — read first
 
-**NORMATIVE.** Do not implement any of the following in Phase 1. Each is either a later phase or a deliberate permanent exclusion.
+**NORMATIVE.** Do not implement in Phase 1: `async`/`tokio`/any runtime (a lookup is a pure function); generic scalar `T: RealField` (f64 only); `serde` in `tf_tree_core` (Phase 6; breaks `no_std`); dynamic capacity growth (remapping invalidates reader mappings); `String` in any error type or hot path (errors carry IDs, `Display` resolves names via the arena); covariance and copy-on-write branches (cut, `0009`; the slot layout is exactly one cacheline); GPU code, point-cloud apply and deskew helpers (permanently out of core; `sample_many` is the whole surface); network, discovery, multicast (Phase 6).
 
-| Excluded | Why |
-|---|---|
-| `async` / `tokio` / any runtime | The core is synchronous. A lookup is a pure function. |
-| Generic scalar `T: RealField` | f64 only. Generics double the test matrix and the monomorphized code size for a benefit not yet measured. Revisit after benchmarks. |
-| `serde` in `tf_tree_core` | Wire formats are Phase 6. Serialization pulls in allocation and breaks `no_std`. |
-| Dynamic capacity growth | Growth means remapping, which invalidates reader mappings in Phase 2. Capacity is fixed at construction. |
-| `String` in any error type or hot path | Errors carry IDs; `Display` resolves names by consulting the arena. Keeps errors `Copy` and `no_std`. |
-| Covariance / uncertainty | Phase 5. Do not add fields for it now; the slot layout is exactly one cacheline and must stay that way. |
-| Copy-on-write branches | Phase 5. |
-| Any GPU code, CUDA dependency, or point-cloud apply | Permanently out of core. The engine's product is a sampled trajectory, not transformed points. |
-| Network, discovery, multicast | Phase 6. |
-| Deskew / point-cloud helpers | See above. `sample_many` is the whole surface. |
+**Dependency budget for `tf_tree_core`:** `libm`, `bytemuck`, and `blake3`. Nothing else. `tf_tree_arena` adds `rustix` in Phase 2 only. Test/bench-only dependencies are unrestricted.
 
-**Dependency budget for `tf_tree_core`:** `libm` (no_std transcendentals), `bytemuck` (checked POD casts), and `blake3`. Nothing else. `tf_tree_arena` adds `rustix` in Phase 2 only. Test/bench-only dependencies are unrestricted.
+`blake3` is a deliberate third entry: §5.1 mandates `BLAKE3-256 truncated to 64 bits`; two processes intern into one arena, so the hash must be deterministic across processes, builds and toolchains, and truncation is safe only with cryptographic-quality avalanche. Replacing it changes the arena format.
 
-`blake3` is a **deliberate third entry**, resolving what was an outright
-contradiction: §5.1 mandates `BLAKE3-256 truncated to 64 bits` for frame-name
-hashing and justifies it with a collision analysis, while this budget listed two
-crates. The hash cannot be swapped for a `std` hasher — Phase 2 has two
-*processes* interning into one arena, so it must be deterministic across
-processes, builds and toolchain versions, which rules out anything randomly
-seeded, and the 64-bit truncation is only safe with cryptographic-quality
-avalanche.
+**Unsafe budget:** the rule is [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md)'s criterion as amended by [`0048`](./decisions/0048-a-kind-is-not-a-crate-name.md): `unsafe` only at a boundary the compiler cannot see across, bound to a crate **root**, indexed in `scripts/unsafe-budget.txt`. In Phase 1: `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree_cli`; `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]` (`OwnedWriter`, [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md)); `unsafe` in `tf_tree_arena` and exactly two `tf_tree_core` modules (`buffer.rs`, `arena_view.rs`), each with a module-level `// SAFETY:` block stating its invariants. Every `unsafe` block gets its own `// SAFETY:` comment naming the invariant it relies on.
 
-**Open cost, to be settled with the Phase 2 `FORMAT_VERSION` bump, not before:**
-`blake3` pulls five runtime crates and a `cc` build dependency, and a C build
-step is exactly what the safety-critical integrator D14 is written for would
-object to. Replacing it with an inlined non-cryptographic hash of adequate
-avalanche would change `FrameRecord::name_hash` and therefore the arena format,
-so it is not a change to make casually mid-phase. Revisit it when the format
-version moves anyway.
-
-**Unsafe budget:** `#![forbid(unsafe_code)]` on `tf_tree_math`, `tf_tree_cli`. `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]`. `unsafe` is permitted only in `tf_tree_arena` and in exactly two modules of `tf_tree_core` (`buffer.rs`, `arena_view.rs`), each of which must carry a module-level `// SAFETY:` doc block stating its invariants. Every `unsafe` block gets its own `// SAFETY:` comment naming which invariant it relies on.
-
-> **`tf_tree`'s entry was corrected in place**, and this paragraph's crate list
-> is Phase 1's only; the rest of the budget is unchanged. It said `forbid` for
-> `tf_tree` until
-> [`0017`](./decisions/0017-owned-handles-and-the-lifetime-rule.md) moved the
-> crate to `deny` for one lifetime extension, in `OwnedWriter` — which exists to
-> replace two hand-rolled `extend_to_static` helpers in crates the Rust test
-> suite cannot instrument (`tf_tree_c`, `tf_tree_py`). **`0017` steps 6–7 have
-> deleted both**, so it is now the workspace's only lifetime extension rather
-> than one of three. The rule the list is a snapshot of is
-> [`0007`](./decisions/0007-the-unsafe-budget-and-the-c-abi.md)'s criterion —
-> `unsafe` only at a boundary the compiler cannot see across — and the phases
-> after this one added `tf_tree_ipc`, `tf_tree_py` and `tf_tree_c` under it.
-> Corrected rather than annotated because this section is normative and a rule
-> that says `forbid` while the code says `deny` is worse than either.
->
-> **And the list is a snapshot in a second way this note did not say**, which
-> [`0048`](./decisions/0048-a-kind-is-not-a-crate-name.md) settles: `0007`'s kinds
-> are **properties**, the crate names beside them were an index, and the index
-> now lives in `scripts/unsafe-budget.txt` where a check recomputes it. Two
-> further things it decides bear on the paragraph above. The budget binds every
-> **crate root**, not every package — `#![forbid(unsafe_code)]` on a `src/lib.rs`
-> governs no bin, test, bench or example of the same package, and this paragraph
-> naming crates rather than roots is how that went unnoticed. And kind 3 is *"a
-> foreign runtime **or library**"*, so `tf_tree_tf2_sys` was never a new kind.
-
-**If a design question is not answered by this document, stop and ask rather than choosing.** The most expensive failure mode here is an agent that picks a reasonable-looking simplification in the concurrency or layout sections.
-
----
+**If a design question is not answered by this document, stop and ask.**
 
 ## 1. Workspace layout
 
 ```
-tf_tree/
-├── Cargo.toml                  # workspace, resolver = "2"
-├── rust-toolchain.toml         # pinned stable
-├── docs/
-│   ├── PROJECT.md              # project overview — read this first
-│   └── PHASE1.md               # this document
-├── crates/
-│   ├── tf_tree_math/           # no_std. SE(3)/SO(3), dual quats. zero unsafe.
-│   │   └── src/{lib,quat,iso3,dualquat,interp,reference}.rs
-│   ├── tf_tree_arena/          # no_std+alloc. Arena abstraction + layout math.
-│   │   └── src/{lib,layout,heap,header}.rs
-│   ├── tf_tree_core/           # no_std+alloc. The engine.
-│   │   └── src/{lib,frame,topology,edge,buffer,arena_view,plan,sample,error}.rs
-│   ├── tf_tree/                # std facade. Re-exports + ergonomic helpers.
-│   ├── tf_tree_bench/          # criterion, incl. tf2 comparison harness
-│   └── tf_tree_cli/            # binary `tf_tree` (alias `tft`)
-└── xtask/                        # loom, bench-gate, headers runners
+crates/tf_tree_math/   no_std; SE(3)/SO(3), dual quats; zero unsafe
+crates/tf_tree_arena/  no_std+alloc; arena abstraction + layout math
+crates/tf_tree_core/   no_std+alloc; the engine (frame, topology, edge, buffer, arena_view, plan, sample, error)
+crates/tf_tree/        std facade
+crates/tf_tree_bench/  criterion + tf2 comparison harness
+crates/tf_tree_cli/    binary `tf_tree` (alias `tft`)
+xtask/                 loom, bench-gate, headers runners
 ```
 
-Crate names use underscores throughout (as `serde_json` and `parking_lot` do), so the import path matches the project name: `use tf_tree::...`.
-
-`tf_tree_math` and `tf_tree_arena` are separately publishable and separately testable. Keeping the math crate free of `unsafe` and free of the arena is what makes it cheap for Miri to interpret as a *callee* — no `unsafe`, no arena, no provenance to track. **Its own test suite is not run under Miri**: `just miri` runs `-p tf_tree_arena -p tf_tree_core` and `-p tf_tree`, and has never named `tf_tree_math`. The crate is `#![forbid(unsafe_code)]`, so what Miri would check there is the standard library's own soundness.
-
----
+`tf_tree_math` and `tf_tree_arena` are separately publishable and testable. Keeping the math crate free of `unsafe` and the arena makes it cheap for Miri as a *callee*; its own suite is not run under Miri (`just miri` runs `-p tf_tree_arena -p tf_tree_core` and `-p tf_tree`).
 
 ## 2. Load-bearing invariants
 
-**NORMATIVE.** These are the invariants every other section depends on. Encode each as a debug assertion where cheap, and as a documented `// INVARIANT:` comment at the definition site.
+**NORMATIVE.** Encode each as a debug assertion where cheap and a `// INVARIANT:` comment at the definition site.
 
 1. **Append-only identity.** `FrameId` and `EdgeId` are never reused. Removal is tombstoning (`kind = Tombstone`). A stale `Plan` may therefore index a valid, in-bounds record; it will fail the generation check, but it can never cause out-of-bounds access.
 2. **No pointers in the arena.** Every intra-arena reference is a `u32` element index or byte offset relative to the arena base. The arena must be relocatable by `memcpy`.
@@ -118,13 +43,9 @@ Crate names use underscores throughout (as `serde_json` and `parking_lot` do), s
 7. **All multi-byte arena fields are little-endian.** Phase 6 wire encoding is separate; the arena is host-native but must assert LE at construction.
 8. **Every heap allocation happens at construction.** `push` and `at` allocate nothing. Enforced by a counting allocator in tests, not by inspection.
 
----
-
 ## 3. `tf_tree_math`
 
 ### 3.1 Types
-
-**NORMATIVE layouts.**
 
 ```rust
 #[repr(C)] #[derive(Clone, Copy, Debug, PartialEq)]
@@ -140,65 +61,38 @@ pub struct Quat { pub w: f64, pub x: f64, pub y: f64, pub z: f64 }  // 32 B
 pub struct Iso3 { pub q: Quat, pub t: Vec3 }                        // 56 B
 ```
 
-**Convention lock-in.** Hamilton (not JPL). `w` first (not last — note this differs from Eigen's storage order; the C++ wrapper in Phase 4 must transpose). Active rotations. `Iso3` composition `a * b` means `T_a_x * T_x_b`. Adjoint convention is right-perturbation: `T = T̂ · exp(ξ^)`. Write these five facts in the crate-level doc comment; every downstream bug in this project will trace back to one of them.
+**Convention lock-in.** Hamilton (not JPL), `w` first (unlike Eigen's storage order; the C++ wrapper transposes), active rotations, `Iso3` composition `a * b` means `T_a_x * T_x_b`, adjoint by right-perturbation `T = T̂ · exp(ξ^)`. Stated in the crate-level doc comment.
 
-Assert layout in a test: `assert_eq!(size_of::<Iso3>(), 56)`, `assert_eq!(align_of::<Iso3>(), 8)` —
-`crates/tf_tree_math/src/iso3.rs` and `tf_tree_core`'s
-`the_sizes_0042_halved_stay_halved` are those tests.
+Layout tests: `crates/tf_tree_math/src/iso3.rs` (`size_of::<Iso3>() == 56`, `align_of == 8`) and `tf_tree_core`'s `the_sizes_0042_halved_stay_halved`.
 
 ### 3.2 SE(3) exponential and logarithm
 
-Required operations: `exp_se3(xi: [f64; 6]) -> Iso3`, `log_se3(t: Iso3) -> [f64; 6]`, with `xi = [ω(3), v(3)]`.
+`exp_se3(xi: [f64; 6]) -> Iso3`, `log_se3(t: Iso3) -> [f64; 6]`, with `xi = [ω(3), v(3)]`.
 
 ```
 exp:  R = exp_so3(ω)              t = V(ω) · v
 log:  ω = log_so3(R)              v = V⁻¹(ω) · ω_t   where ω_t is the translation
 ```
 
-with, for `θ = |ω|` and `W = [ω]×`:
+
+for `θ = |ω|` and `W = [ω]×`:
 
 ```
 V(ω)   = I + c1·W + c2·W²        c1 = (1 − cos θ)/θ²      c2 = (θ − sin θ)/θ³
 V⁻¹(ω) = I − ½·W + c3·W²         c3 = 1/θ² − (1 + cos θ)/(2θ·sin θ)
 ```
 
-### 3.3 Numerical requirements — measured, not assumed
+### 3.3 Numerical requirements
 
-**NORMATIVE.** Two findings drive this section. Both were verified against a 50-digit reference; do not weaken them.
+**NORMATIVE.** Both findings were verified against a 50-digit reference.
 
-**(a) `log_so3` must go through the quaternion, never through `acos(trace)`.**
+**(a) `log_so3` goes through the quaternion, never `acos(trace)`.** At ‖ω‖ ≈ π the trace form has relative error **1.3e-7** against 3.0e-16 for `2·atan2(‖q_v‖, q_w)`; elsewhere both are ~2e-16.
 
-Measured relative error of `log_so3` across rotation magnitudes:
+Use `theta = 2.0 * libm::atan2(sqrt(q.x² + q.y² + q.z²), q.w)`, then wrap to (−π, π].
 
-| ‖ω‖ | `acos((tr R − 1)/2)` form | `2·atan2(‖q_v‖, q_w)` form |
-|---|---|---|
-| 1e-7 | 3.2e-16 | 2.0e-16 |
-| 1e-3 | 4.4e-16 | 2.2e-16 |
-| 1.0 | 2.7e-16 | 2.2e-16 |
-| ~π | **1.3e-7** | 3.0e-16 |
+**(b) The small-angle series threshold is θ < 0.1, not 1e-8, and needs four terms.** The closed forms of `c1`, `c2`, `c3` lose 4 to 11 digits well above 1e-8 (`c3`: 1.2e-7 at θ = 1e-4, against 4.2e-17 for the series); the series degrades above ~0.3 (1.6e-11 at 0.3). The crossover is θ ≈ 0.1.
 
-The trace form loses nine significant digits near θ = π. A rear-facing camera or a flipped IMU mount is a π rotation, and these are among the most common static transforms in any real robot. Use:
-
-```rust
-let n = (q.x*q.x + q.y*q.y + q.z*q.z).sqrt();
-let theta = 2.0 * libm::atan2(n, q.w);   // then wrap to (−π, π]
-```
-
-**(b) The small-angle series threshold is θ < 0.1, not 1e-8, and needs four terms.**
-
-The closed forms for `c1`, `c2`, `c3` suffer catastrophic cancellation long before they underflow. Measured relative error of the float64 closed form versus the 4-term series:
-
-| θ | c1 closed / series | c2 closed / series | c3 closed / series |
-|---|---|---|---|
-| 1e-6 | 8.9e-5 / 4.4e-17 | 7.8e-5 / 1.6e-17 | 9.8e-4 / 6.9e-17 |
-| 1e-4 | 5.2e-9 / 4.2e-17 | 3.1e-8 / 9.7e-17 | 1.2e-7 / 4.2e-17 |
-| 1e-2 | 2.9e-13 / 2.7e-18 | 2.6e-12 / 2.3e-17 | 3.9e-12 / 1.7e-17 |
-| 1e-1 | 1.1e-14 / 5.6e-15 | 1.8e-14 / 1.5e-15 | 9.1e-14 / 2.6e-15 |
-| 3e-1 | 8.6e-16 / 3.6e-11 | 4.1e-15 / 9.9e-12 | 2.4e-14 / 1.6e-11 |
-
-The crossover where both are accurate is a narrow band around θ ≈ 0.1. A threshold of 1e-8 — the value most SE(3) libraries use, and the one you would naturally reach for — leaves the closed form running in the regime where it has already lost 4 to 11 digits.
-
-**Required constants** (coefficients of θ^0, θ², θ⁴, θ⁶):
+**Required constants** (coefficients of θ^0, θ², θ⁴, θ⁶), evaluated by Horner in `θ²`:
 
 ```rust
 const THETA_SMALL: f64 = 0.1;   // NORMATIVE
@@ -210,123 +104,38 @@ const C2: [f64; 4] = [1.0/6.0,  -1.0/120.0, 1.0/5040.0,  -1.0/362880.0];
 const C3: [f64; 4] = [1.0/12.0,  1.0/720.0, 1.0/30240.0,  1.0/1209600.0];
 ```
 
-Evaluate by Horner in `θ²`. Four terms are mandatory at this threshold — three terms would need `THETA_SMALL = 0.01`. Add a test that sweeps θ across `[1e-12, π]` on a log grid and asserts relative error against a hardcoded high-precision reference table stays below 1e-14, with no discontinuity exceeding 1e-15 across the branch boundary.
+Three terms would need `THETA_SMALL = 0.01`. A test sweeps θ over `[1e-12, π]` on a log grid against a hardcoded high-precision table, error below 1e-14, no discontinuity above 1e-15 across the branch boundary.
 
 ### 3.4 Interpolation
 
-```rust
-pub trait Interp {
-    fn eval(a: &Iso3, b: &Iso3, s: f64) -> Iso3;
-}
-pub struct LerpSlerp;   // tf2-compatible
-pub struct ScLerp;      // SE(3) geodesic — default
-```
+`Interp::eval(a: &Iso3, b: &Iso3, s: f64) -> Iso3` has two implementors: `LerpSlerp` (tf2-compatible: LERP translation, shortest-arc slerp with a LERP fallback below 1e-6) and `ScLerp` (SE(3) geodesic, the default).
 
-**`ScLerp` gets two implementations.**
+`ScLerp` has two implementations: `reference::sclerp` — `a * exp_se3(s * log_se3(a.inverse() * b))`, the definition of correct — and `sclerp`, unit dual quaternion power (one `atan2`, one `sin_cos`). **NORMATIVE:** a differential proptest asserts agreement to 1e-14 over 10⁵ random pairs including near-identity and near-π.
 
-- `reference::sclerp` — `a * exp_se3(s * log_se3(a.inverse() * b))`. Obvious, slow, and the definition of correct.
-- `sclerp` — unit dual quaternion power. Extract screw parameters `(θ, d, l, m)` from `a* ⊗ b`, scale, recompose. One `atan2` and one `sin_cos` total, versus two of each for the log/exp route.
-
-**NORMATIVE:** a differential proptest asserts the two agree to 1e-14 over 10⁵ random pairs including near-identity and near-π cases. This reference/fast pairing is a pattern to repeat everywhere in this project — write the obvious version first, keep it, and test the fast one against it forever.
-
-`LerpSlerp` is `t = (1−s)·t_a + s·t_b`, `q = slerp(q_a, q_b, s)` with the standard shortest-arc sign fix (`if q_a·q_b < 0 { negate q_b }`) and a LERP fallback when the half-angle is below 1e-6.
-
-**Invariance properties**, asserted as tests because they encode the design claim:
+**Invariance properties**, asserted as tests:
 
 | Property | ScLerp | LerpSlerp |
 |---|---|---|
 | `interp(G·a, G·b, s) == G·interp(a, b, s)` | must hold to 1e-13 | must hold to 1e-13 |
 | `interp(a·H, b·H, s) == interp(a, b, s)·H` | must hold to 1e-13 | **must be asserted to FAIL** |
 
-The second row is a positive test that `LerpSlerp` is not right-invariant. Write it as `assert!(max_err > 1e-6)` over a fixed seeded set, with a comment explaining that this is the whole reason `ScLerp` is the default. If someone later "fixes" `LerpSlerp`, this test tells them they have changed its semantics.
-
----
+The second row is a positive test that `LerpSlerp` is not right-invariant: `assert!(max_err > 1e-6)` over a fixed seeded set. It is the reason `ScLerp` is the default; do not "fix" it.
 
 ## 4. `tf_tree_arena`
 
 ### 4.1 Header
 
-**This block is Phase 1's header, and it is no longer the normative layout — it is two format bumps behind.**
-
-The normative v3 header is `crates/tf_tree_arena/src/header.rs`: `FORMAT_VERSION` is **3**, the struct is **320 bytes** (256 before the bump), and its `key_field_offsets_are_stable` test pins every offset that a v3 reader depends on.
-
-The fields the Phase 1 block below does not have, enumerated so a v3 reader is not built from it: `participant_table_off`, `max_participants` and `participant_count` (Phase 2's registry); `owner_start_time`, `boot_id[16]` and `instance_uuid[16]` (identity across PID reuse and reboots); `edge_counters_off` and `participant_counters_off` (`FORMAT_VERSION` 3's two counter regions); `topo_lock`; and `spline_region_off`/`spline_degree`, Phase 6's two reserved fields declared absent (D22). `topo_generation` and `topo_active` are also gone, replaced by the single packed `topo: AtomicU64` that A1's rotation needs.
-
-**This paragraph named four things that are not header fields at all until it was corrected**: `nominal_rate_mhz` and `declared_by_slot` are `EdgeRecord` fields, `0036`'s receipt time is `ClaimRecord::clock_offset_nanos`, and Phase 6 reserves two header fields rather than four.
-
-All offsets below are byte offsets from arena base.
-
-```rust
-pub const TF_TREE_MAGIC: [u8; 8] = *b"TF_TREE\0";  // byte array, not a u64 literal: no endianness ambiguity
-pub const FORMAT_VERSION: u32 = 1;
-
-#[repr(C, align(64))]
-pub struct ArenaHeader {
-    pub magic: u64,
-    pub format_version: u32,
-    pub layout_hash: u32,        // compile-time hash of all repr(C) sizes/offsets
-    pub arena_size: u64,
-    pub max_frames: u32,
-    pub max_edges: u32,
-    pub stamp_slots: u32,        // total across all edges
-    pub pose_slots: u32,
-    pub frame_table_off: u32,
-    pub frame_hash_off: u32,
-    pub topo_block_off: u32,     // 2 blocks, contiguous
-    pub topo_block_stride: u32,
-    pub claim_table_off: u32,
-    pub edge_table_off: u32,
-    pub stamp_arena_off: u32,
-    pub pose_arena_off: u32,
-    pub topo_generation: AtomicU64,  // seqlock: odd = write in progress
-    pub topo_active: AtomicU32,      // 0 or 1
-    pub frame_count: AtomicU32,
-    pub edge_count: AtomicU32,
-    pub creator_pid: u32,
-    pub creator_boot_id: u64,
-    _reserved: [u8; 40],
-}
-```
-
-`layout_hash` is a `const fn` over `size_of` and `offset_of` for every arena struct. Phase 2 checks it on attach; a mismatch is a hard error, not a warning. Compute it now even though nothing reads it yet — retrofitting it after processes exist in the wild is impossible.
-
-`creator_boot_id` comes from `/proc/sys/kernel/random/boot_id` (Phase 2 uses it to detect a stale segment surviving a reboot). Phase 1 populates it and does nothing else with it.
+The normative header is `crates/tf_tree_arena/src/header.rs`: `FORMAT_VERSION` is **3**, the struct is **320 bytes**, and its `key_field_offsets_are_stable` test pins every offset a reader depends on. Phase 1's original 256-byte header lacked the participant registry (`participant_table_off`, `max_participants`, `participant_count`), identity fields (`owner_start_time`, `boot_id[16]`, `instance_uuid[16]`), the counter regions (`edge_counters_off`, `participant_counters_off`), `topo_lock`, and the reserved Phase 6 `spline_region_off`/`spline_degree` (D22); its `topo_generation`/`topo_active` became one packed `topo: AtomicU64`. Fields Phase 1 introduced and still holds: `magic` (`b"TF_TREE\0"`, a byte array to avoid endianness ambiguity), `format_version`, `layout_hash`, `arena_size`, `max_frames`, `max_edges`, region offsets, `frame_count`, `edge_count`, `creator_pid`, `creator_boot_id`. `layout_hash` is a `const fn` over `size_of` and `offset_of` for every arena struct; attach checks it and a mismatch is a hard error. `creator_boot_id` comes from `/proc/sys/kernel/random/boot_id`.
 
 ### 4.2 Arena trait
 
-```rust
-pub unsafe trait Arena: Send + Sync {
-    fn base(&self) -> *mut u8;
-    fn len(&self) -> usize;
-}
+`pub unsafe trait Arena: Send + Sync { fn base(&self) -> *mut u8; fn len(&self) -> usize; }` is implemented by `HeapArena` (64-byte-aligned `Vec<u8>`); Phase 2 adds `MappedArena` (memfd + mmap).
 
-pub struct HeapArena { /* aligned Vec<u8>, 64-byte aligned */ }
-// Phase 2: pub struct MappedArena { /* memfd + mmap */ }
-```
-
-`HeapArena::new(layout: &ArenaLayout)` allocates `layout.total_size()` bytes with 64-byte alignment, zeroes them, and writes the header. **The only Phase 2 change in the entire codebase should be adding `MappedArena` and a constructor that selects it.** If you find yourself needing to change anything in `tf_tree_core` to support that, the Phase 1 design was wrong — stop and report it.
+`HeapArena::new(layout: &ArenaLayout)` allocates `layout.total_size()` bytes 64-byte aligned, zeroes them and writes the header. **The only Phase 2 change should be adding `MappedArena` and a constructor selecting it**; if `tf_tree_core` must change, the Phase 1 design was wrong — stop and report it.
 
 ### 4.3 Layout computation
 
-```rust
-pub struct ArenaLayout {
-    max_frames: u32,
-    max_edges: u32,
-    max_participants: u32,           // DEFAULT_MAX_PARTICIPANTS = 64, set inside `new`
-    edge_capacities: Vec<u32>,       // per edge, power of two, 0 for static
-    computed: Computed,              // the region table, computed once at construction
-}
-```
-
-> That is the point of the type: the power-of-two invariant on each capacity
-> cannot be violated from outside, so the regions are computed once in
-> `ArenaLayout::new` and read through accessors. `max_participants` is not a
-> parameter — it is `DEFAULT_MAX_PARTICIPANTS = 64`, chosen inside `new` — which
-> is where the two participant rows of the table below get their size, and the
-> listing gave a reader nowhere to find that.
-
-
-Region sizes, each 64-byte aligned and laid out in header order:
+`ArenaLayout::new` (`crates/tf_tree_arena/src/layout.rs`) validates that each per-edge capacity is `0` (static) or a power of two and that exactly `max_edges` were supplied. `max_participants` is `DEFAULT_MAX_PARTICIPANTS = 64`, chosen inside `new`. Region sizes, each 64-byte aligned and laid out in header order:
 
 | Region | Size |
 |---|---|
@@ -342,32 +151,9 @@ Region sizes, each 64-byte aligned and laid out in header order:
 | **edge counters** | `align64(max_edges * 128)` |
 | **participant counters** | `align64(max_participants * 128)` |
 
-> The authority is `crates/tf_tree_arena/src/layout.rs`'s `sizes` array in `compute`. **It is not compile-checked**: `sizes` is an unannotated array literal, so dropping a row gives a runtime index-out-of-bounds in the `while i < N_REGIONS` loop. The compile-time check is on a *different* array — `let strides: [u32; N_REGIONS + 1]` in `layout_hash` — and its own comment is explicit that it is a **cardinality** check and nothing more: it cannot see a stride written at the wrong index or with the wrong value. D22 is why the counter regions are counted whether or not the `counters` feature is on.
->
-> `layout_hash` folds these strides, so a table that disagrees with them is describing an arena no participant would attach to.
+> The authority is the `sizes` array in `compute` in `layout.rs`; `layout_hash` folds these strides. `sizes` is not compile-checked (dropping a row is a runtime index error); the `strides: [u32; N_REGIONS + 1]` array in `layout_hash` is a cardinality check only. The counter regions are counted whether or not the `counters` feature is on (D22).
 
-A 1000-frame, 1000-edge tree with 4096 samples per edge: ~260 MB of pose arena. Note that in a real robot only a handful of edges are dynamic, so size capacities per edge rather than uniformly. The constructor that ships is `ArenaLayout::new` (`crates/tf_tree_arena/src/layout.rs`), which validates that each per-edge capacity is `0` (a static edge, no ring) or a power of two and that exactly `max_edges` of them were supplied. **`ArenaLayout::from_edges` does not exist** — the per-edge sizing it was written for is what `new` takes, and the builder-side spelling is `0004`'s builder-time edge declaration.
-
-**Topology block stride is 12 bytes per frame, not 6.** §5.3 requires `edge_of_child[c]` to live *in the topology
-block* so plan compilation is a pure array walk, and that makes a block
-`parent: u32` + `edge_of_child: u32` + `depth: u16` = 10 B of payload — which
-`layout.rs` rounds to **12** (`align64(max_frames * 12)`), the two trailing pad
-bytes keeping each frame's triple 4-byte aligned. **The distinction is not
-cosmetic**: 12 is what `layout_hash` folds, so a reader built to a 10-byte
-stride computes a different hash and is refused at attach — the failure the
-blockquote under §4.3's table describes. The 6-byte figure predates that requirement and is
-wrong. This is not merely an accounting fix: keeping `edge_of_child` inside the
-block is what puts it under the *same* double-buffer publish as `parent` and
-`depth`, so a reader always observes a consistent `(parent, depth, edge)` triple.
-Storing it anywhere else would reintroduce the torn-read this design exists to
-prevent. The two `u32` arrays are placed first so both stay 4-byte aligned for
-any `max_frames`, with the `u16` `depth` array trailing.
-
-`TOPO_BLOCKS` is **4** (`crates/tf_tree_arena/src/header.rs`). The stride is
-unchanged by A1; what A1 changed is the count and the publish, from a
-double-buffer to a rotation over one packed word (§5.2).
-
----
+**Topology block stride is 12 bytes per frame.** §5.3 puts `edge_of_child[c]` in the block, so it is `parent: u32` + `edge_of_child: u32` + `depth: u16` = 10 B, rounded to **12** so each triple stays 4-byte aligned. 12 is what `layout_hash` folds; a reader built to another stride is refused at attach. Keeping `edge_of_child` in the block puts it under the same publish as `parent` and `depth`, so a reader always sees a consistent `(parent, depth, edge)` triple. `TOPO_BLOCKS` is **4** (`crates/tf_tree_arena/src/header.rs`): blocks rotate over one packed word (§5.2).
 
 ## 5. `tf_tree_core` records
 
@@ -378,15 +164,13 @@ double-buffer to a rotation over one packed word (§5.2).
 pub struct FrameRecord {
     pub name_hash: u64,       // BLAKE3-256 truncated to 64 bits, of the full name
     pub name: [u8; 48],       // UTF-8, NUL-padded, truncated for display only
-    pub name_len: u8,
-    pub flags: u8,
-    _pad: [u8; 6],
+    pub name_len: u8, pub flags: u8, _pad: [u8; 6],
 }
 ```
 
-48 bytes covers every real frame name; longer names hash in full but display truncated. `FrameId` is a `NonZeroU32` so `Option<FrameId>` is 4 bytes — index 0 is reserved as "no parent" (root sentinel).
+48 bytes covers every real frame name; longer names hash in full but display truncated. `FrameId` is a `NonZeroU32` so `Option<FrameId>` is 4 bytes; index 0 is the "no parent" root sentinel.
 
-**Interning table:** open addressing, linear probing, `next_pow2(2 * max_frames)` slots. **Three** parallel arrays: `hashes: [AtomicU64]` (0 = empty), `ids: [AtomicU32]` and `claiming: [AtomicU32]`, for a stride of `FRAME_HASH_STRIDE = 8 + 4 + 4 = 16` bytes. *This line said two arrays until 2026-09-09*, which is the Phase 1 shape before `PHASE2.md` §1 **A8** added `claiming` — and the stride is what §4.3's table folds into `layout_hash`, so the two derivations had to agree and did not. On the `ids` sentinel, see the loom model's note: the arrays are zero-initialised exactly as the production arena is, and seeding a non-zero "unpublished" marker is what once made that model pass over an inert handshake.
+**Interning table:** open addressing, linear probing, `next_pow2(2 * max_frames)` slots, **three** parallel arrays: `hashes: [AtomicU64]` (0 = empty), `ids: [AtomicU32]`, `claiming: [AtomicU32]` (`PHASE2.md` §1 A8), stride `FRAME_HASH_STRIDE = 8 + 4 + 4 = 16` bytes — the value §4.3 folds into `layout_hash`. The arrays are zero-initialised as in the production arena.
 
 ```
 intern(name):
@@ -406,21 +190,11 @@ intern(name):
     i = (i + 1) & mask
 ```
 
-The publish-then-spin dance exists because Phase 2 has two processes interning concurrently. It costs nothing in Phase 1 and cannot be retrofitted. Collision on `h` with a different name is a hard error (`FrameHashCollision`) — check the stored name on hash match. 64 bits at 10⁴ frames gives ~3e-12 collision probability, but detect it rather than corrupt silently.
+Publish-then-spin exists because two processes intern concurrently. A hash match with a different stored name is `FrameHashCollision`.
 
 ### 5.2 Topology
 
-```rust
-#[repr(C)]
-pub struct TopologyBlock {
-    // both arrays are max_frames long, indexed by FrameId
-    // parent[i] == 0 means root or unattached
-    // parent: [u32; max_frames]
-    // depth:  [u16; max_frames]
-}
-```
-
-**Four** blocks, rotated (`TOPO_BLOCKS = 4`, A1). **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary and this is the single most tempting Phase-1 simplification.
+Per-frame `parent: [u32]`, `depth: [u16]` and `edge_of_child: [u32]` arrays, each `max_frames` long and indexed by `FrameId` (`parent == 0` means root or unattached). **Four** blocks, rotated (`TOPO_BLOCKS = 4`, A1). **`ArcSwap` is forbidden here** — `Arc` refcounts do not cross a process boundary.
 
 **Writer protocol (topology mutation):**
 
@@ -436,8 +210,6 @@ copy block[active] -> block[next], apply mutation, recompute depths
 topo.store(pack_topo(g + 2, next), Release)     // publish + mark stable, one store
 ```
 
-Topology mutations are serialized by a single `Mutex` on the builder side. They occur at most a few hundred times over a process lifetime.
-
 **Reader protocol (plan compilation only — `at()` never reads topology):**
 
 ```
@@ -450,24 +222,22 @@ loop {
 }
 ```
 
-`Plan::at()` performs one `Relaxed` load of `topo_generation` and compares to the plan's stored generation. Mismatch is `TopologyChanged`, which is a legitimate, actionable error meaning "re-plan". It is not a failure to hide with a retry loop.
+`Plan::at()` does one `Relaxed` load of the generation and compares it to the plan's. Mismatch is `TopologyChanged` — "re-plan", not a failure to hide with a retry loop.
 
-**Cycle detection:** on every mutation, walk from the new child to root with a step budget of `max_frames`; exceeding it is `WouldCreateCycle`. Depth recomputation is a BFS over the whole block — O(max_frames), fine at mutation rates.
+**Cycle detection:** each mutation walks from the new child to root with a step budget of `max_frames`; exceeding it is `WouldCreateCycle`. Depths are recomputed by BFS over the block.
 
 ### 5.3 Edges
 
 ```rust
 #[repr(C, align(64))]
 pub struct EdgeRecord {
-    pub parent: u32,
-    pub child: u32,
+    pub parent: u32, pub child: u32,
     pub kind: u8,          // 0 Dynamic, 1 Static, 2 Tombstone
     pub interp: u8,        // InterpPolicy discriminant
     pub domain: u8,        // time domain id
     _pad0: u8,
     pub capacity: u32,     // power of two; 0 for Static
-    pub stamp_off: u32,    // element index into stamp arena
-    pub pose_off: u32,     // element index into pose arena
+    pub stamp_off: u32, pub pose_off: u32,   // element indices into the stamp / pose arenas
     _pad1: u32,
     pub head: AtomicU64,   // monotone total samples published
     pub static_pose: [u64; 7],  // f64 bit patterns; Static only
@@ -475,7 +245,7 @@ pub struct EdgeRecord {
 }
 ```
 
-`EdgeId` indexes this table. The edge for child frame `c` is found via a `u32` side array `edge_of_child[c]` living in the topology block — this makes plan compilation a pure array walk with no search.
+The edge for child `c` is found via `edge_of_child[c]`, making plan compilation a pure array walk.
 
 ### 5.4 Claims
 
@@ -483,17 +253,14 @@ pub struct EdgeRecord {
 #[repr(C, align(64))]
 pub struct ClaimRecord {
     pub state: AtomicU32,        // 0 free, 1 held
-    pub owner_pid: u32,
-    pub owner_boot_id: u64,
+    pub owner_pid: u32, pub owner_boot_id: u64,
     pub heartbeat: AtomicU64,    // bumped by the writer on every push
     pub claim_epoch: AtomicU64,  // incremented on every successful claim
     _pad: [u8; 32],
 }
 ```
 
-Claim is a `compare_exchange(0, 1, AcqRel, Acquire)`. Failure is `EdgeAlreadyClaimed { owner_pid }`. Release stores 0 with `Release`. A `Publisher` handle holds the `EdgeId` and the `claim_epoch` it observed; `Drop` releases. Phase 1 implements claim, release, and epoch. The liveness reaper (heartbeat staleness plus PID/boot-id check) is Phase 2 — the fields exist now so the record layout never changes.
-
----
+Claim is `compare_exchange(0, 1, AcqRel, Acquire)`; failure is `EdgeAlreadyClaimed { owner_pid }`; release stores 0 with `Release`. A `Publisher` holds the `EdgeId` and observed `claim_epoch`; `Drop` releases. The liveness reaper is Phase 2; the fields exist now so the layout never changes.
 
 ## 6. Sample buffers — the concurrency core
 
@@ -510,48 +277,13 @@ pub struct PoseSlot {
 }
 ```
 
-Exactly 64 bytes — one cacheline, one slot, no false sharing between adjacent samples during a read.
+One cacheline per slot. **Why `[AtomicU64; 7]` and not `[f64; 7]` behind `UnsafeCell`:** a classic seqlock reads data non-atomically and discards it on version mismatch — a data race, UB in the Rust and C++ models. `Relaxed` atomic loads make it sound at zero cost. Do not "optimize" this into a `memcpy`.
 
-**Why `[AtomicU64; 7]` and not a plain `[f64; 7]` behind `UnsafeCell`:** the classic seqlock reads data non-atomically and discards the result on a version mismatch. That is a data race, and therefore UB in the Rust and C++ memory models, even though it works on every real CPU. Using relaxed atomic loads makes the protocol sound with zero runtime cost — a `Relaxed` `AtomicU64` load compiles to a plain `mov` on x86-64 and `ldr` on aarch64. Do not "optimize" this into a `memcpy`.
-
-Stamps live in a **separate** array of `AtomicI64`, so binary search touches 8 stamps per cacheline and never pulls in pose data. The seqlock in the pose slot protects the logical sample, covering both arrays.
+Stamps live in a **separate** `AtomicI64` array so binary search touches 8 stamps per cacheline and never pulls in pose data. The slot's seqlock protects the logical sample across both arrays.
 
 ### 6.2 Publish protocol (single writer)
 
-> **The listing below was corrected in place, four times** — it had drifted
-> from the shipped `SampleRing::push`, and this section is normative, so the
-> listing is now the amended version rather than the original with a note
-> attached. What changed, and why, so a reader comparing this against an older
-> revision is not left guessing:
->
-> - **The odd flip** is `slot.seq.load(Relaxed) | 1`, where this listing used to
->   read `s.wrapping_add(1)`. That is amendment **A5** in
->   [`PHASE2.md`](./PHASE2.md) §1: forcing the parity instead of incrementing it
->   means a writer killed mid-write leaves a stale odd value the next writer
->   heals idempotently, rather than landing its `s+1` on an even value and
->   inverting the protocol for that slot from then on. A5 shipped in the code;
->   this listing had never been updated for it.
-> - **The heartbeat** is a plain `store(h + 1)`, where this listing used to read
->   `fetch_add(1)`. The ordering annotation is unchanged — `Relaxed` either way —
->   and no atomic ordering is weakened. Only the atomicity goes, which bought
->   nothing: the ring is single-writer by construction (D7), the same guarantee
->   the neighbouring plain `head.store` already rests on, and `heartbeat` equals
->   `head` at every quiescent point because `head` is written in exactly one
->   place and never reset. The stored value is identical. Measured 8.66 → 4.65
->   ns/push.
-> - **`self.mask()`**, where this listing used to read `self.mask`. `SampleRing`
->   stored the ring capacity twice — as `poses.len()` and as a `pub mask: u64`
->   whose relationship to it nothing enforced — and a ring built with the two
->   disagreeing returns a silently wrong pose rather than an error. The mask is
->   derived from `poses.len()` now; the arithmetic is identical.
-> - **`edge: self.edge`** in the `NonMonotonicStamp` refusal, which this
->   listing and the shipped code both omitted (2026-09-14). D11 says an error
->   names the edge it is about; the ring always held its `EdgeId` and its own
->   doc said so, and the variant was the one `PushError` without it. The field
->   is loaded only on the refusal branch.
->
-> The ordering annotations remain NORMATIVE as written; none of these
-> corrections weakens one.
+The listing matches `SampleRing::push`. The odd flip is `slot.seq.load(Relaxed) | 1` (A5, `PHASE2.md` §1): a writer killed mid-write leaves a stale odd value the next writer heals idempotently. The heartbeat is a plain `store` because the ring is single-writer (D7).
 
 ```rust
 // NORMATIVE ordering annotations.
@@ -601,7 +333,7 @@ fn read_slot(&self, idx: usize) -> Result<Iso3, LookupError> {
 }
 ```
 
-**NORMATIVE:** every ordering annotation above is deliberate. The `fence(Acquire)` before the second `seq` load prevents the data loads from being reordered after it on weakly-ordered targets; it is a no-op on x86-64 and a real barrier on aarch64. **Do not weaken any of these to `Relaxed` on the grounds that a test passes on x86.** The loom tests in §10.2 exist to catch exactly that.
+**NORMATIVE:** every ordering annotation above is deliberate. The `fence(Acquire)` before the second `seq` load keeps the data loads from reordering after it on weakly-ordered targets (no-op on x86-64, real barrier on aarch64). **Do not weaken any to `Relaxed` because a test passes on x86**; the loom tests in §10.2 catch exactly that.
 
 ### 6.4 Bracket search
 
@@ -613,11 +345,9 @@ sample(edge, t, policy):
   lo_logical = h - n                    // oldest valid logical index
   t_old = stamps[lo_logical & mask]
   t_new = stamps[(h-1) & mask]
-
   if t < t_old                          -> Err(Extrapolation{ before })
   if t > t_new                          -> per policy: Err(Extrapolation{ after }) | Hold | ConstantTwist
   if t == t_new                         -> read_slot(h-1)
-
   // binary search over LOGICAL indices in [lo_logical, h-1] for the last index with stamp <= t
   // map each probe through `& mask`
   i = partition_point(...)
@@ -625,16 +355,11 @@ sample(edge, t, policy):
   a = read_slot(i & mask); b = read_slot((i+1) & mask)
   s = (t - stamps[i & mask]) as f64 / (stamps[(i+1) & mask] - stamps[i & mask]) as f64
   result = Interp::eval(&a, &b, s)
-
   // revalidate: the ring must not have lapped us mid-read
   if head.load(Acquire) - i > capacity  -> Err(SlotRecycled{ edge })
 ```
 
-The trailing revalidation is what makes the read wait-free-in-practice rather than merely lock-free: with 4096 samples at 1 kHz you have 4 seconds of slack, so it never fires outside a pathological stall. Return the error rather than looping; the caller knows whether a retry makes sense.
-
-Binary search over logical indices with masking on probe is required — searching the physical array directly is wrong once the ring has wrapped, and this is a classic off-by-one source. Add a test that specifically exercises a buffer that has wrapped 3.5 times.
-
----
+The trailing revalidation makes the read wait-free in practice (4096 samples at 1 kHz is 4 s of slack). Return the error rather than loop; the caller knows whether a retry makes sense. Binary search runs over logical indices, masking on probe — searching the physical array is wrong once the ring has wrapped; a test exercises a buffer wrapped 3.5 times.
 
 ## 7. Plan compilation and evaluation
 
@@ -645,167 +370,44 @@ pub const MAX_DEPTH: usize = 32;
 pub const MAX_PATH_EDGES: usize = 64;
 
 #[derive(Clone, Copy)]
-pub enum Step {
-    Static(Iso3),
-    Dyn { edge: EdgeId, inverted: bool },
-}
+pub enum Step { Static(Iso3), Dyn { edge: EdgeId, inverted: bool } }
 
-pub struct Plan {
-    generation: u64,
-    steps: [Step; MAX_DEPTH],
-    len: u8,
-    domain: u8,
-}
+pub struct Plan { generation: u64, steps: [Step; MAX_DEPTH], len: u8, domain: u8 }
 ```
 
-Fixed array, no `SmallVec`, no allocation, no dependency.
+**Two bounds price different slots** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)). `MAX_DEPTH` bounds the *compiled* plan, counted **after** §7.2's folding: a slot is a `Step`, **64 bytes** ([`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md)), carried by value in every `Plan` and in a 16-slot thread-local cache. `MAX_PATH_EDGES` bounds the *raw walk*: a slot is a `u32` on `compile`'s stack.
 
-**Two bounds, and they price different slots** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
-`MAX_DEPTH` bounds the *compiled* plan, counted **after** §7.2's folding: a slot
-there is a `Step`, **64 bytes measured** (128 until
-[`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md) dropped
-`Iso3`'s cacheline padding), carried by value in every `Plan` and in a 16-slot
-thread-local cache. `MAX_PATH_EDGES` bounds the *raw walk*: a slot there is a
-`u32` in `compile`'s stack frame. 64 bytes against 4 is why one number cannot
-price both, and this section said otherwise until `0034` — it read
-"combined depth exceeding 16 is `TreeTooDeep` — generous, since real trees are
-4–8", which is sound about a moving `/tf` graph and wrong about a rigid
-assembly, where a 20-link fixed chain folds to **one step** and was refused
-anyway.
+Either overrun is `TreeTooDeep` (one variant; the C ABI status table is frozen). Its `depth` says which: `MAX_PATH_EDGES + 1` is the walk refusing; at or below `MAX_PATH_EDGES` it is the exact folded step count.
 
-Either bound overrun is `TreeTooDeep`, one variant for both because the C ABI's
-status table is frozen. Its `depth` field says which: `MAX_PATH_EDGES + 1` is the
-walk refusing (the walk stops when it runs out of buffer, so it never learns the
-real length), and anything at or below `MAX_PATH_EDGES` is the **exact** folded
-step count.
-
-"Real trees are 4–8" is retired as a justification, and what replaces it is a
-survey rather than an intuition: 91 real robot descriptions from 26 repositories,
-whose worst *graph diameter* — up to the lowest common ancestor and back down,
-which is the quantity a lookup pays, not root-to-leaf depth — is **30 joints**,
-p95 24, median 10. 32 is the next power of two above 30; 64 is ~1.9× the 30 plus
-a deployed `map → odom → base_footprint` prefix.
+Basis: 91 real robot descriptions have a worst *graph diameter* (up to the LCA and back down) of **30 joints**; 32 is the next power of two, 64 is ~1.9× that plus a deployed prefix.
 
 ### 7.2 Compilation
 
-Edge for child `c` stores `T_parent(c)_c`. For `lookup(target, source)`:
+Edge for child `c` stores `T_parent(c)_c`, and `T_target_source = (T_lca_target)⁻¹ · T_lca_source`.
 
-```
-T_target_source = (T_lca_target)⁻¹ · T_lca_source
-```
+`compile(target, source)` returns the empty plan when they are equal. Otherwise it lifts the deeper frame to equal `depth`, then steps both up until they meet, returning `Disconnected { cut_at }` if either reaches a `0` parent first. Target-side frames (`[target, .., child_of_lca]`) emit `Dyn { edge_of_child[f], inverted: true }` in that order; source-side frames emit `inverted: false` in **reverse** (`child_of_lca` first).
 
-```
-compile(target, source):
-  if target == source: return empty plan
-  a = target; b = source
-  up_t = []; up_s = []
-  while depth[a] > depth[b]: up_t.push(a); a = parent[a]
-  while depth[b] > depth[a]: up_s.push(b); b = parent[b]
-  while a != b:
-      if parent[a] == 0 || parent[b] == 0 -> Err(Disconnected{ cut_at: a })
-      up_t.push(a); a = parent[a]
-      up_s.push(b); b = parent[b]
-  // up_t is [target, .., child_of_lca];  emit in that order, inverted
-  for f in up_t:            steps.push(Dyn{ edge_of_child[f], inverted: true })
-  // up_s is [source, .., child_of_lca]; emit REVERSED, forward
-  for f in up_s.rev():      steps.push(Dyn{ edge_of_child[f], inverted: false })
-```
+Verify the direction by hand on a three-frame example first; backwards gives a plausible transform that is wrong everywhere.
 
-Verify the direction by hand once against a three-frame example before writing code; getting it backwards produces a plausible-looking transform that is wrong everywhere.
-
-**Constant folding, applied after compilation:**
+**Constant folding, after compilation:**
 
 1. Replace any `Dyn` whose edge `kind == Static` with `Static(pose)` (pre-inverting if `inverted`).
-2. Collapse every run of adjacent `Static` into a single `Static` by composing them.
+2. Collapse every run of adjacent `Static` into one by composing them.
 
-A depth-6 chain with 4 static edges typically folds to 3 steps. Assert in a test that the canonical URDF fixture folds from 6 steps to 3.
+A test asserts the canonical URDF fixture folds from 6 steps to 3.
 
-**Folding takes the walk's two `u32` buffers, not an intermediate `[Step; MAX_DEPTH]`
-array** ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)).
-The buffers hold everything a step does — an edge id, plus an `inverted` flag
-that is `true` iff the edge came from the target side — so the copy was free to
-delete, and deleting it is what lets `MAX_PATH_EDGES` be generous without a
-second 128-bytes-a-slot array.
+**Folding reads the walk's two `u32` buffers** (edge id plus an `inverted` flag, true iff the edge came from the target side), not an intermediate `[Step; MAX_DEPTH]` ([`0034`](./decisions/0034-the-depth-bound-priced-two-slots-the-same.md)), **and writes into the `Plan` being returned**: `Plan::identity` makes the buffer and `fold_into` fills it through `&mut Plan`, including `len`, `domain`, `dyn_count`, `first_dyn`. `Plan::identity` is the only constructor — a plan is complete the moment it exists (zero steps is the answer for `target == source`), so no arm can forget to finish one and answer `Iso3::IDENTITY` where a refusal belongs.
 
-**And it writes its output into the `Plan` being returned, not into one it hands
-back** (#264). `0034` deleted the array *before* the fold and left the two after
-it: `fold` returned `[Step; MAX_DEPTH]` by value and `Plan::new` took one by
-value, so the same array crossed two by-value boundaries and was materialised at
-each. Disassembled at `MAX_DEPTH = 32`, none of the three copies on the
-`Tree::plan` path had been optimised away:
+Load-bearing properties of the fold:
 
-| copy | site | bytes |
-|---|---|---|
-| 1 | `fold` returning `out` into the caller's `sret` buffer | 4096 |
-| 2 | `Plan::new` copying its parameter into `self.steps` | 4096 |
-| 3 | `compile`'s `Plan` into `Tree::plan`'s `sret` slot | 4160 |
-
-**Measured at `MAX_DEPTH = 32` with the then-current `Step`.**
-[`0042`](./decisions/0042-the-cacheline-the-arena-never-asked-for.md) has since
-halved `Step`, so the surviving copy 3 is **2064 bytes**; copies 1 and 2 were
-deleted by this change and their figures are history either way.
-
-12 352 bytes of `memcpy` to compile a plan that is usually six steps long, none
-of it proportional to the path. So `Plan::identity` makes the buffer and
-`fold_into` fills it through `&mut Plan` — writing the steps *and* the four
-fields that are a function of them (`len`, `domain`, `dyn_count`, `first_dyn`),
-accumulated as the steps are appended rather than by a second pass. That deletes
-copies 1 and 2 and leaves one array, one writer and one construction step in the
-whole compile. Measured, three builds interleaved, medians of 5 rounds of 20 000
-reps, `taskset -c 2`: a 6-step `Tree::plan` goes **265.0 ns → 118.7 ns, −55.2%**,
-ranges [261-267] against [114-122] and so non-overlapping.
-
-`Plan::identity` is the only constructor, and that is deliberate: a plan is a
-complete, correct value the moment it exists (zero steps is the answer
-`compile` owes for `target == source`), so there is no half-built state a
-second call has to finish — and therefore none a future arm can forget to
-finish. A plan that skipped its fold would otherwise answer `Iso3::IDENTITY`
-for every stamp, which is a wrong answer where a refusal belongs.
-
-Copy 3 stays. It is `compile`'s return-by-value, not a temporary, and removing it
-means an out-parameter on a `pub` function — an `API.md` §7 change, for the
-remaining third. Marking `fold_into` `#[inline]` was tried and moves nothing:
-the `sret` `memcpy` survives it byte for byte.
-
-Two properties of the fold are load-bearing and neither is obvious:
-
-* **The source half is emitted in reverse of walk order**, which is what makes
-  the composition associate `((s[n-1] · s[n-2]) · …)`. `Iso3` composition is not
-  associative under rounding and every test in the suite is tolerance-based
-  (`TOL = 1e-12`), so a change that folds during the walk — meeting `s[0]` first
-  — would produce different bits and pass every test. Verify a change here
-  against **bits**, not tolerance.
-* **The loop does not stop when the output array fills.** It skips the write,
-  keeps counting, and goes on resolving every remaining edge, so (a) `TreeTooDeep`
-  reports the true folded length rather than the bound, and (b) `UnknownEdge` and
-  `MixedTimeDomains` still win over `TreeTooDeep` for a defect that sits past the
-  bound. Stopping early is cheaper and was measured; it is not what ships, and
-  `error_precedence_over_defect_kind_position_and_foldability` in
-  `crates/tf_tree_core/src/tests.rs` is the table that pins the difference.
+* **The source half is emitted in reverse of walk order**, so composition associates `((s[n-1] · s[n-2]) · …)`. `Iso3` composition is not associative under rounding and the tests are tolerance-based (`TOL = 1e-12`), so folding during the walk would change bits and pass every test. Verify a change here against **bits**.
+* **The loop does not stop when the output array fills.** It skips the write, keeps counting and resolves every remaining edge, so `TreeTooDeep` reports the true folded length and `UnknownEdge` and `MixedTimeDomains` still win over it. `error_precedence_over_defect_kind_position_and_foldability` in `crates/tf_tree_core/src/tests.rs` pins it.
 
 ### 7.3 Evaluation
 
-```rust
-pub fn at(&self, g: &Guard, t: Stamp) -> Result<Iso3, LookupError> {
-    let cur = g.header.topo_generation.load(Ordering::Relaxed);
-    if cur != self.generation {
-        return Err(LookupError::TopologyChanged { plan: self.generation, current: cur });
-    }
-    let mut acc = Iso3::IDENTITY;
-    for step in &self.steps[..self.len as usize] {
-        acc = match step {
-            Step::Static(m) => acc * *m,
-            Step::Dyn { edge, inverted } => {
-                let p = g.sample(*edge, t)?;
-                if *inverted { acc.mul_inv(&p) } else { acc * p }
-            }
-        };
-    }
-    Ok(acc)
-}
-```
+`Plan::at(&self, g: &Guard, t: Stamp)` compares the header's generation (one `Relaxed` load) to the plan's — mismatch is `TopologyChanged { plan, current }` — then folds `acc = Iso3::IDENTITY` over `steps[..len]`: `Static(m)` is `acc * m`; `Dyn { edge, inverted }` samples the edge (`g.sample(edge, t)?`) and applies `acc.mul_inv(&p)` if inverted, else `acc * p`.
 
-`mul_inv(a, b) = a * b⁻¹` computed directly rather than inverting then composing — saves a negation pass and a rotation. Provide it, and differential-test it against the naive form to 1e-14.
+`mul_inv(a, b) = a * b⁻¹` is computed directly and differential-tested against the naive form to 1e-14.
 
 ### 7.4 Batch sampling
 
@@ -815,108 +417,61 @@ pub fn at_adaptive(&self, g: &Guard, span: (Stamp, Stamp), tol: ErrBound)
     -> Result<(&[Stamp], &[Iso3]), LookupError>;
 ```
 
-`at_many` detects monotone input and, when monotone, replaces binary search with an exponential (galloping) search resuming from the previous index — O(1) amortized instead of O(log n).
-
-`at_adaptive` emits the minimum knot set such that linear interpolation between knots stays within `tol`. Bisect recursively: evaluate the midpoint exactly, compare against the LERP of the endpoints, subdivide if the error exceeds tolerance. Bound recursion depth at 16 and knot count at 4096. This is the API that replaces the abandoned deskew helper: the consumer LERPs between knots on whatever device the points live on, and the error is bounded by construction. Typical output for a 100 ms sweep at 1 cm / 1e-4 rad tolerance is tens of knots, not thousands.
-
-`at_adaptive` may allocate from a caller-provided scratch buffer only. No global allocation.
-
----
+`at_many` detects monotone input and switches to a galloping search resuming from the previous index. `at_adaptive` emits the minimum knot set such that linear interpolation stays within `tol`: evaluate the midpoint exactly, compare against the LERP of the endpoints, subdivide on excess. Recursion depth ≤ 16, knots ≤ 4096. It replaces the abandoned deskew helper — the consumer LERPs between knots wherever the points live. It may allocate only from a caller-provided scratch buffer.
 
 ## 8. Public API surface
 
-**Edges are declared on the builder, before `build()`.** An earlier draft of this
-section declared them *after* — `tree.declare_dynamic(odom, base, EdgeCfg { capacity: 8192, .. })`
-— which cannot work: the arena is a single fixed allocation whose pose region is
-`sum(per-edge capacity) × 64 B`, sized when the bytes are allocated, and invariant
-3 forbids growth. A post-`build` declaration would have nowhere to put its ring.
-`build()` therefore sizes the arena from exactly the declarations it was given.
-The only runtime topology change is [`Tree::reparent`], which reuses an
-already-declared edge and allocates nothing. See
-[`docs/decisions/0004`](./decisions/0004-builder-time-edge-declaration.md) for the
-full argument.
+**Edges are declared on the builder, before `build()`**: the arena is one fixed allocation whose pose region is `sum(per-edge capacity) × 64 B`, so a post-`build` declaration would have nowhere to put its ring. The only runtime topology change is [`Tree::reparent`], which reuses a declared edge. See [`docs/decisions/0004`](./decisions/0004-builder-time-edge-declaration.md).
 
 ```rust
-// construction — topology is declared on the builder, which is what lets
-// `build()` size the arena from exactly these edges
 let tree = TreeBuilder::new()
-    .default_interp(InterpPolicy::ScLerp)   // `Interp` is a trait; the builder takes the policy
+    .default_interp(InterpPolicy::ScLerp)
     .dynamic_edge("map", "odom", EdgeCfg::new(Capacity::history(50.0, 10.0)))
-    .dynamic_edge("odom", "base_link", EdgeCfg::new(Capacity::history(200.0, 10.0)))
     .static_edge("base_link", "camera_mount", &iso)
-    .static_edge("camera_mount", "camera_optical", &iso)
     .frame_headroom(8)                        // only if names are interned later
     .build()?;                                // -> Tree (owns a HeapArena)
 
-// resolution — every frame this snippet uses, declared above
-let map:  FrameId = tree.frame("map")?;
-let odom: FrameId = tree.frame("odom")?;
-let base: FrameId = tree.frame("base_link")?;
-let cam:  FrameId = tree.frame("camera_optical")?;
+let mut w: EdgeWriter = tree.claim(base, odom)?;   // (child, parent); Drop releases
+w.push(stamp, &iso)?;                              // wait-free, no alloc
 
-// writing
-let mut w: EdgeWriter = tree.claim(base, odom)?;      // (child, parent); Drop releases
-w.push(stamp, &iso)?;                                // wait-free, no alloc
-
-// reading
-let plan: Plan = tree.plan(cam, map)?;               // (target, source); compile once
-let g: Guard = tree.guard();                         // pins generation + arena
+let plan: Plan = tree.plan(cam, map)?;             // (target, source); compile once
+let g: Guard = tree.guard();                       // pins generation + arena
 let t = plan.at(&g, stamp)?;
-
-// convenience path — interned + plan-cached internally, for casual users
-let t = tree.lookup("camera_optical", "map", stamp)?;   // (target, source), as above
+let t = tree.lookup("camera_optical", "map", stamp)?;   // convenience: interned + plan-cached
 ```
 
-> None of this is checked by anything: the block is not a doctest, and `just doc` cannot reach it — which is why five defects accumulated in it.
+`Tree: Send + Sync`. `Plan: Send + Sync + Copy`. `Publisher: Send + !Sync` (single writer is a type-level property). `Guard<'a>` borrows the tree.
 
-`Tree: Send + Sync`. `Plan: Send + Sync + Copy`. `Publisher: Send + !Sync` (single writer is a type-level property, not a convention). `Guard<'a>` borrows the tree.
-
-The convenience `lookup` keeps a small per-thread plan cache keyed by `(arena, FrameId, FrameId, generation)`, 16 entries, direct-mapped. Progressive disclosure: casual use is fast, expert use is fastest.
-
-The `arena` component was missing from this line, and from the code, until issue #196: the cache is `thread_local!` and shared by every `Tree` the thread touches, while the other three components agree across two trees built from the same names in the same order — ids are handed out in interning order and a fresh tree's generation is its declared edge count — so a second tree was served the first one's compiled plan. It is the arena's identity, not the handle's: two `Tree`s mapping one shared segment share one entry deliberately, because they share one topology.
+`lookup` keeps a per-thread plan cache keyed by `(arena, FrameId, FrameId, generation)`, 16 entries, direct-mapped. The `arena` component is the arena's identity, not the handle's: the cache is shared by every `Tree` the thread touches, and two `Tree`s mapping one segment share an entry deliberately.
 
 ### Time
 
-```rust
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Stamp<D: Domain = SystemDomain>(i64, PhantomData<D>);  // nanoseconds
+`Stamp<D: Domain = SystemDomain>(i64, PhantomData<D>)` holds nanoseconds; `Query` is `At(Stamp) | Latest | LatestCommon | Bracket(Stamp, i64)`.
 
-pub enum Query { At(Stamp), Latest, LatestCommon, Bracket(Stamp, i64) }
-```
+Phase 1 implements `At`, `Latest`, `LatestCommon`. `LatestCommon` is the `min` over the plan's dynamic edges of their newest stamp — what tf2's `Time(0)` means; document it explicitly.
 
-Phase 1 implements `At`, `Latest`, `LatestCommon`. `LatestCommon` is the largest stamp for which *every* dynamic edge on the plan has data — compute it as `min` over the plan's edges of their newest stamp. Document it explicitly; this is what tf2's `Time(0)` means and its documentation is the source of endless confusion.
-
-Domains are phantom types in Phase 1 with a runtime `u8` tag stored on the edge. Cross-domain lookup is `TimeDomainMismatch`. The alignment machinery is Phase 6; the type-level separation must exist now so it is not a breaking change later.
-
----
+Domains are phantom types with a runtime `u8` tag on the edge; cross-domain lookup is `TimeDomainMismatch`. Alignment machinery is Phase 6.
 
 ## 9. Errors
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq)]
-#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)] #[non_exhaustive]
 pub enum LookupError {
-    UnknownFrame { hash: u64 },
-    Disconnected { target: FrameId, source: FrameId, cut_at: FrameId },
-    TreeTooDeep { depth: u16 },
-    NoData { edge: EdgeId },
+    UnknownFrame { hash: u64 }, Disconnected { target: FrameId, source: FrameId, cut_at: FrameId },
+    TreeTooDeep { depth: u16 }, NoData { edge: EdgeId },
     Extrapolation { edge: EdgeId, requested: i64, oldest: i64, newest: i64 },
-    SlotRecycled { edge: EdgeId },
-    SlotContended { edge: EdgeId },
-    TopologyChanged { plan: u64, current: u64 },
-    TimeDomainMismatch { expected: u8, got: u8 },
+    SlotRecycled { edge: EdgeId }, SlotContended { edge: EdgeId },
+    TopologyChanged { plan: u64, current: u64 }, TimeDomainMismatch { expected: u8, got: u8 },
 }
 ```
 
-`Copy`, no allocation, `no_std`. **Every variant that can name an edge does name one** — "lookup would require extrapolation into the future" without saying *which edge* is the single most-complained-about thing in tf2, and fixing it costs one field.
-
-`Display` is implemented on a wrapper `Described<'a>(LookupError, &'a Tree)` that resolves IDs to names by consulting the arena. This keeps the error itself allocation-free while giving humans readable messages.
-
----
+`Copy`, no allocation, `no_std`. **Every variant that can name an edge does name one.** `Display` is implemented on `Described<'a>(LookupError, &'a Tree)`, which resolves IDs to names via the arena.
 
 ## 10. Test plan
 
 ### 10.1 Property tests (`proptest`)
+
+Minimum set, each over ≥10⁴ cases with a fixed seed in CI:
 
 Minimum set, each over ≥10⁴ cases with a fixed seed in CI:
 
@@ -938,32 +493,16 @@ Minimum set, each over ≥10⁴ cases with a fixed seed in CI:
 
 ### 10.2 Concurrency (`loom`)
 
-Under `cargo xtask loom`, with a reduced buffer (capacity 4) so the state space is tractable:
+`cargo xtask loom`, reduced buffer (capacity 4):
 
-- One writer pushing 3 samples, one reader sampling concurrently: reader observes either a fully-consistent sample or a documented error, never a torn one.
-- Writer wrapping the ring while a reader is mid-`read_slot`: reader returns `SlotRecycled` or a valid sample.
-- Two threads racing `intern` on the same name: both get the same `FrameId`.
-- Two threads racing `claim` on the same edge: exactly one succeeds.
-- Topology mutation concurrent with plan compilation: compilation either sees the old topology or the new one, never a mix, and `at()` reports `TopologyChanged`.
-- A reclaimer sweeping the participant table concurrently with a joiner registering: the state word is observed **before** the lock byte is probed, and no record a joiner published is erased. Both are properties of the **caller** of `ParticipantTable::reclaim`; that function's own CAS guard is pinned by the unit test `reclaim_fails_when_the_observed_word_has_changed`, *not* by this model, which measurably never reaches the CAS on a contended slot. Its two failing controls — the reads reversed, and the observation weakened to `Relaxed` — are `#[should_panic]` tests in the same file rather than a paragraph describing them, because a model whose property cannot fail proves nothing (`docs/decisions/0028` open question 6). **`reclaim`'s own `AcqRel`/`Acquire` survives the mutation test below** — `Relaxed`/`Relaxed` passes the whole `tf_tree_core` suite and all of `cargo xtask loom` — so, per that paragraph's own instruction, which of the two it is has been investigated and the answer is written on the function: the strength is required by the byte-as-authority protocol, and nothing here can distinguish it because the byte probe is a syscall.
+- One writer pushing 3 samples, one concurrent reader: a consistent sample or a documented error, never a torn one.
+- Writer wrapping the ring mid-`read_slot`: `SlotRecycled` or a valid sample.
+- Two threads racing `intern` on one name: same `FrameId`.
+- Two threads racing `claim` on one edge: exactly one succeeds.
+- Topology mutation concurrent with plan compilation: old or new topology, never a mix, and `at()` reports `TopologyChanged`.
+- A reclaimer sweeping the participant table while a joiner registers: the state word is observed **before** the lock byte is probed, and no record a joiner published is erased. These are properties of the **caller** of `ParticipantTable::reclaim`; its CAS guard is pinned by `reclaim_fails_when_the_observed_word_has_changed`, and the two failing controls (reads reversed; observation weakened to `Relaxed`) are `#[should_panic]` tests in the same file (`0028` open question 6). `reclaim`'s own `AcqRel`/`Acquire` is required by the byte-as-authority protocol; nothing here can distinguish it because the byte probe is a syscall.
 
-**Add a mutation test:** weaken each `Acquire`/`Release` in §6.2 and §6.3 to `Relaxed` one at a time and confirm the corresponding loom test fails. If weakening an ordering does not break any test, either the ordering is unnecessary or the test coverage is insufficient — investigate which.
-
-> **Run on 2026-09-08, and it found the second branch.** Each mutation was applied alone to a clean tree and run with `RUSTFLAGS='--cfg loom' LOOM_MAX_PREEMPTIONS=3 cargo test -p tf_tree_core --tests --release`, the shipped runner's settings (`xtask/src/main.rs`).
->
-> | Mutation (`crates/tf_tree_core/src/buffer.rs`) | Result |
-> |---|---|
-> | `fence(Release)` before the payload stores — deleted | **fails** both writer models |
-> | `slot.seq.store(odd+1, Release)` → `Relaxed` | **fails** `writer_three_pushes_reader_never_torn` |
-> | `self.head.store(h + 1, Release)` → `Relaxed` | **passed the entire suite** — 20/20 |
-> | `slot.seq.load(Acquire)` → `Relaxed` | **fails** `writer_three_pushes_reader_never_torn` |
-> | `fence(Acquire)` before the second `seq` load — deleted | **fails** both writer models |
->
-> **The survivor was insufficient coverage, not an unnecessary ordering**, and the ordering is relied on in code rather than only in prose: §7's `stamp_at` loads stamps `Relaxed` and rests that on this exact edge, and `docs/design/fast-path.md` builds a proposed optimisation on it.
->
-> **Why no `sample`-shaped fixture could have caught it** — the part worth keeping, because it is a property of the protocol and not of the old models. `push` places its `fence(Release)` *before* that push's stamp store, so observing `head == h` orders stamps `0 ..= h-2` and leaves `stamps[h-1]`, the newest, as the single unprotected one. `sample` reads exactly that stamp as `t_new`. A stale stamp reads as the arena's zero-initialised `0` (or, after lapping, its previous era's value), and stamps only increase — so a stale `t_new` is always *below* the fresh one and every `t` above it leaves through the tolerated `Extrapolation` arm before reaching any assertion. Only `t < 0` reaches it, which pins the zero sentinel rather than the ordering.
->
-> So the ordering is pinned by an invariant model instead: `head_publishes_every_stamp_below_it` asserts that observing `head == h` makes all `h` stamps visible — `sample`'s own first two steps, and the sentence `stamp_at` rests on. It fails under the `Relaxed` mutant and passes at `Release`, verified both ways. The three §6.2/§6.3 model names are now the answer to "which test covers this ordering", and `buffer.rs`'s module doc carries the same table's conclusion.
+**Mutation test:** weaken each `Acquire`/`Release` in §6.2 and §6.3 to `Relaxed` one at a time and confirm the corresponding loom test fails. If none does, the ordering is unnecessary or coverage is insufficient — investigate which. Run as `RUSTFLAGS='--cfg loom' LOOM_MAX_PREEMPTIONS=3 cargo test -p tf_tree_core --tests --release` (`xtask/src/main.rs`'s settings). Result in `crates/tf_tree_core/src/buffer.rs`: deleting either `fence` or weakening `slot.seq`'s `Release` store or `Acquire` load fails `writer_three_pushes_reader_never_torn` (fences: both writer models); weakening `head.store(h + 1, Release)` passes every `sample`-shaped model, because `push`'s `fence(Release)` precedes that push's stamp store and observing `head == h` leaves `stamps[h-1]` (the `t_new` `sample` reads) unprotected, while a stale one leaves through the tolerated `Extrapolation` arm. `head_publishes_every_stamp_below_it` pins that ordering (fails under the `Relaxed` mutant); §7's `stamp_at` relies on it.
 
 ### 10.3 Miri
 
@@ -971,13 +510,11 @@ Under `cargo xtask loom`, with a reduced buffer (capacity 4) so the state space 
 
 ### 10.4 Allocation
 
-A `CountingAllocator` wrapping the system allocator, with a test that asserts zero allocations across 10⁶ `push` and `at` calls after construction.
+A `CountingAllocator` test asserts zero allocations across 10⁶ `push` and `at` calls after construction.
 
 ### 10.5 Differential against tf2
 
-A harness that drives `tf2::BufferCore` and `tf_tree` with an identical tree and identical sample stream, then compares `lookupTransform` results across 10⁵ random queries with `Interp::LerpSlerp`. Agreement must be within 1e-12. This test is what makes migration credible to anyone currently shipping tf2; treat a failure as a release blocker.
-
----
+A harness drives `tf2::BufferCore` and `tf_tree` with an identical tree and sample stream and compares `lookupTransform` across 10⁵ random queries with `Interp::LerpSlerp`, within 1e-12. A failure is a release blocker.
 
 ## 11. Benchmarks and the go/no-go gate
 
@@ -1002,11 +539,9 @@ Do not benchmark a synthetic two-frame tree. Use:
 | read scaling: 1/2/4/8/16 reader threads, 4 concurrent writers, cores pinned | aggregate throughput, per-thread p99.9 |
 | identical everything against `tf2::BufferCore` | ratio per row |
 
-**p99.9 is the number that matters**, not the mean. A control loop cares about the tail.
+**p99.9 is the number that matters**; a control loop cares about the tail.
 
-**And on the `push` row, the tail is what ships unmeasured.** [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md) step 1 put a clock-offset sampler on `EdgeWriter::push`: one push in `sample_every` reads a wall clock and stores `wall clock - stamp`, and the read is 38.4 ns on the development host. The *mean* is measured — `push` went from 4.85–5.0 ns to 5.87–6.1 ns, **+1.0–1.1 ns**, paired in one process by `just push-sampler-cost`, and re-derived after the sampler was amended rather than carried over from the first shape of it.
-
-**That measurement is at one interval, and the shape of the cost is not the same at the others.** The sampler is a rate-independent counter (~1.06 ns) plus `38.4 / sample_every` ns of amortised clock, and it was measured on an edge declaring no rate, where `sample_every` is 1024 and the clock is 3% of the total. The rest of this table is arithmetic from those two measured constants:
+**The `push` row's tail ships unmeasured.** [`0036`](./decisions/0036-the-receipt-time-the-format-already-reserved.md) step 1 put a clock-offset sampler on `EdgeWriter::push`: one push in `sample_every` reads a wall clock (38.4 ns on the development host). The *mean* is measured — `push` 4.85–5.0 ns → 5.87–6.1 ns, **+1.0–1.1 ns**, paired by `just push-sampler-cost` — on an edge declaring no rate (`sample_every` 1024). The rest is arithmetic from a ~1.06 ns rate-independent counter plus `38.4 / sample_every` ns of amortised clock:
 
 | declared rate | `sample_every` | per push | clock's share | per second of publishing |
 |---|---|---|---|---|
@@ -1016,7 +551,7 @@ Do not benchmark a synthetic two-frame tree. Use:
 | 10 Hz | 10 | 4.90 ns | 78% | ~49 ns |
 | ≤ 1 Hz | 1 | 39.5 ns | 97% | ~39 ns |
 
-**The last column is the one a robot pays.** Per-push cost rises as the rate falls while the absolute cost falls, because a slow publisher reaches its clock read rarely in wall-clock terms however large a fraction of its own cheap push it is. So `sample_every` is a real knob at low rates and nearly none at 1 kHz, where the counter is what anyone reclaiming this path would have to delete. The **p99.9** is not measured and is arithmetic: for a publisher at 1 kHz with `sample_every = 1000`, 1-in-1000 *is* the 99.9th percentile, so that percentile is the sampled push and sits ~38 ns above its neighbours. Whether that reaches a consumer is `publish_to_visible`'s question, and that row is `unavailable` on this host — 4 physical cores against the 17 it needs, and no ROS 2 — so **it ships without one**. This paragraph is the disclosure `0036`'s step 5 owes, and it is not a substitute for the measurement.
+The last column is what a robot pays. The **p99.9** is arithmetic, not measured: for a 1 kHz publisher with `sample_every = 1000`, the 99.9th percentile *is* the sampled push, ~38 ns above its neighbours. Whether that reaches a consumer is `publish_to_visible`'s question, `unavailable` on this host (4 physical cores against the 17 it needs, no ROS 2), so it ships without one. This is the disclosure `0036` step 5 owes.
 
 ### 11.3 Gate
 
@@ -1026,70 +561,41 @@ Proceed to Phase 2 if:
 - Zero allocations confirmed.
 - **Read throughput scales at least 2.5× from 1 to 4 threads**, on ≥ 4 physical cores, *and* **tf_tree's 1→4 scaling factor is at least 5× tf2's** over the same sweep.
 
-> **The first and third criteria were re-cut by [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md), which is `ready`; its *Resolution* holds the arguments and this is the normative statement of the result.** Neither change is a concession to a regression, and both were previously ungateable rather than merely unmet.
->
-> **The first** used to read *"under 150 ns with `ScLerp`, under 100 ns with `LerpSlerp`"*. Those figures were chosen before anything in this repository had measured interpolation: the fixture's query stamp `NOW_NS` was an exact multiple of all four dynamic periods, so every edge took `SampleRing::sample`'s exact-hit branch, `I::eval` never ran, and the row timed `bracket` plus a seqlock read. Off-grid the same rows measure **192.7 ns ScLerp** (band 190.4–268.9, n = 9) and **151.8 ns LerpSlerp** (band 146.2–190.4, n = 9). The new ceilings sit ~1.12× above each observed *maximum*, not above the median: a ceiling under 268.9 would fail about one run in nine on an unchanged engine, and a gate that flaps is one people learn to ignore. They are stated per interpolator because the two differ by 1.27× off-grid and by 1.00× on-grid — a single number written for the slower one would leave `LerpSlerp` effectively ungated. The 25 % regression clause is the half that actually bites, and is not new machinery: `bench_report`'s `lookup_latency` row has been gating exactly that (`LATENCY_SLACK`) all along.
->
-> **The third** used to read *"scales at least 6× from 1 to 8 threads"*, and **no host this project has can evaluate it** — 8 threads on 4 physical cores can exceed 4× only through SMT, so the measured 5.35–5.62× (criterion benches) and 5.73× / 5.20× (`contended_scaling`, pinned, four writers) are neither a pass nor a fail. That figure is **retained as informational**, with its measurement, and is the number to re-take on ≥ 8 physical cores. What replaces it is decidable here: tf_tree measured **2.79×** (recorded stream) and **3.09×** (fixture) from 1 to 4 threads, against a 4× ceiling, so 2.5× passes with margin and a slide to 2× fails. The ratio clause is the one carrying the argument this criterion's own prose gives below — tf2 does not merely scale less, it *anti-scales* (0.36× at 4 threads, 0.31× at 8, reproduced by a pure C++ control with our binding deleted), so the measured separation is 2.79 / 0.36 = **7.75×**. An absolute cannot state that and a ratio can.
+> The first and third criteria were re-cut by [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md) (`ready`); its *Resolution* holds the arguments and this is the normative result. The 25 % clause is enforced by `bench_report`'s `lookup_latency` row (`LATENCY_SLACK`). Ceilings are per interpolator (off-grid ScLerp 192.7 ns, LerpSlerp 151.8 ns, ~1.12× above each observed maximum). The former 1→8 ≥ 6× criterion is undecidable on 4 physical cores and is retained as informational; 1→4 ≥ 2.5× is decidable (tf_tree 2.79× recorded stream, 3.09× fixture) and the ratio clause is 7.75× measured (tf2 anti-scales: 0.36× at 4 threads).
 
-**Every latency row this gate bounds is measured with the fold *inlined* into its caller — NORMATIVE.** `benches/lookup.rs` measures it that way today. The same depth-3 `LerpSlerp` fold costs **147.6 ns** inlined and **200.3 ns** behind an `#[inline(never)]` call: the call alone is ~51.5 ns, which is larger than the headroom the ceilings above are set with, so a budget that does not pin the call shape has no fixed meaning. The non-inlined, out-of-crate cost is **not** ungated — it is `docs/PHASE5.md` §9.2's `embedding_cross_crate` row, gated at 5 % and currently *failing* at 1.250–1.254×. The split is deliberate: **§11.3 gates the engine, §9.2 gates the boundary.** One number for both could not say which of them had moved.
+**Every latency row this gate bounds is measured with the fold *inlined* into its caller — NORMATIVE.** `benches/lookup.rs` does so. The depth-3 `LerpSlerp` fold costs 147.6 ns inlined and 200.3 ns behind `#[inline(never)]`; the call alone exceeds the ceilings' headroom. The non-inlined, out-of-crate cost is gated by `docs/PHASE5.md` §9.2's `embedding_cross_crate` row: **§11.3 gates the engine, §9.2 gates the boundary.**
 
-**"Depth-3" means three *dynamic* steps after constant folding — NORMATIVE.**
-The phrase was ambiguous and the two readings differ by ~2.8×, so it is pinned
-here. A static edge folds to a precomputed `Iso3` and costs one multiply; a
-"depth-3" chain that folds to a single dynamic step measures almost nothing, and
-a fixture chosen to be static-heavy would let the gate be passed without the
-sampling path ever being exercised. The gate exists to bound the *sampling and
-interpolation* path, so the number that matters is the count of `Step::Dyn`
-entries in the compiled plan.
+**"Depth-3" means three *dynamic* steps after constant folding — NORMATIVE.** A static edge folds to a precomputed `Iso3` and costs one multiply; a static-heavy fixture would pass the gate without exercising the sampling path. **Every reported latency row must state its dynamic-step count**, not just its nominal depth.
 
-**Every reported latency row must state its dynamic-step count**, not just its
-nominal depth. A row labelled only "depth 3" is not interpretable.
+The third criterion decides the project: `tf2::BufferCore` serializes every lookup on one mutex and anti-scales (0.36× at 4 threads, 0.31× at 8), so the gate is a *ratio* against tf2, not only tf_tree's own factor.
 
-A note on the first criterion: `ScLerp` costs roughly 150–200 flops with two transcendental pairs via log/exp, or ~80 flops with one pair via the dual-quaternion route. Depth-3 means three of them. The ceiling already assumes the dual-quaternion implementation; if it comes in slower, that is information about the interpolation cost, not a reason to abandon the design — report it and consider making `LerpSlerp` the default for latency-critical plans. **That last clause has now been acted on in one place and not the other:** measured off-grid, ScLerp costs 1.27× LerpSlerp (192.7 against 151.8), and `tf_tree.build`'s Python default moved to `sclerp` to close a divergence from Rust that D5 forbids — so the two bindings agree, and the choice is the caller's per plan, not the binding's.
-
-The third criterion is the one that actually decides the project. `tf2::BufferCore` serializes every lookup on one mutex, so it does not scale at all; if tf_tree scales cleanly, the value proposition is "your perception nodes stop contending," which is a much stronger and more durable claim than raw single-threaded speed. If single-threaded comes in at only 3–5× but scaling is clean, **the project is still justified and the internal pitch should change accordingly.**
-
-**That conditional has resolved, and it resolved the way this paragraph hoped — via its weaker branch, and then some.** Single-threaded is **2.7×** against native C++ tf2, which is *below* the 3–5× this paragraph names as the disappointing case, not inside it. The scaling half is what redeems it, and it is not merely clean but one-sided: tf2 measures 0.50× at 2 threads, 0.36× at 4 and 0.31× at 8, so more threads make it slower than one thread. The tail is where it shows most: at 8 threads tf_tree's p99.9 is 331 ns against tf2's 83 µs, a factor of 252, and that ratio does not depend on core count the way the throughput one does. This is why the re-cut criterion above gates the *ratio* rather than only tf_tree's own factor — the absolute is the weaker statement of the two.
-
----
-
-## 12. CLI (`tf_tree_cli`, build at the tail of Phase 1)
+## 12. CLI (`tf_tree_cli`, built at the tail of Phase 1)
 
 - `tf_tree tree` — live topology, per-edge rate, buffer occupancy, staleness, writer PID
 - `tf_tree echo <target> <source> [--rate]` — continuous lookup
 - `tf_tree doctor` — detects: cycles, unclaimed dynamic edges, multi-writer contention, buffers shorter than observed publish latency, frames published at inconsistent rates, unreachable frames, stamps arriving out of order
 - `tf_tree bench --gate` — runs §11 and exits non-zero if the gate fails
 
-`doctor` is not a nice-to-have. It is how you will debug Phase 2, and diagnostics are what actually drive tool adoption.
-
----
-
 ## 13. Definition of done
 
-- [x] All §10 tests pass, including loom and Miri, in CI on x86-64 **and aarch64** — **the aarch64 half landed 2026-09-09 and had never held.** The `loom` and `miri` jobs were `runs-on: ubuntu-latest` with no matrix for the life of the project, while `test` and `shm` have carried `ubuntu-24.04-arm` since aarch64 CI became real; both are matrixed now. So §10.1's property tests, §10.4's zero-allocation gate and §10.5's naive-Rust differential ran on both architectures all along, and §10.2 and §10.3 ran on one — **the one `PROJECT.md` §6's design smell names.** §10.5's `tf2` arm stays x86-64 because it is the container job. **Both rows ran green on their first execution** (PR #307: `loom (ubuntu-24.04-arm)` 41 s, `miri (ubuntu-24.04-arm)` 7m47s), so the box is ticked. Loom remains the *argument* — it explores schedules under a memory model rather than measuring a CPU — and aarch64 is corroboration, not a weak-memory proof.
-- [ ] §11 benchmark suite runs via `cargo xtask bench-gate` and reports the full table — **the runner reports §11.3's gate criteria, not §11.2's seven-row table.** The distinction is not pedantry: §11.2's **cold-cache row is measured by nothing in this repository** (`grep -rni 'cold.cache\|clflush'` over `crates/` finds only unrelated prose), so a runner that "reports the full table" cannot exist until that row has an artifact or the row is withdrawn. The other six rows have benches; `benches/lookup.rs`, `read_scaling.rs` and `push.rs` are executed by no recipe, which is a separate gap.
-- [x] The gate in §11.3 is met, or a written explanation of which criterion failed and by how much — **the written explanation exists and is [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)'s *Resolution***, which re-cut the criteria this host cannot decide (1→8 ≥ 6× became 1→4 ≥ 2.5×, on the physical-core argument) and records what each remaining one reads. The box asks for "met **or** a written explanation"; this is the second arm, and it was satisfied before this box was ever read. `0013` plan step 6 (which that record's `**Status:**` line still calls "item 3", a spelling it now disambiguates) — the re-baseline on a `Fitness`-passing host — is the outstanding work and is not this box.
-- [x] `#![forbid(unsafe_code)]` holds on `tf_tree_math`, `tf_tree_cli`; `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]` (`OwnedWriter`) — measured: the attribute is on both library roots, and `rg -c 'allow\(unsafe_code\)' crates/tf_tree/src` returns exactly one line, in `tree.rs`. **The scope is the crate ROOT, not the package** ([`0048`](./decisions/0048-a-kind-is-not-a-crate-name.md)): a `forbid` on a `src/lib.rs` governs no bin, test, bench or example of the same package, and several claims in this repository rested on the wrong scope until `0048` measured it.
-- [~] Every `unsafe` block has a `// SAFETY:` comment naming a §2 invariant — **the comment half is gated; the "naming a §2 invariant" half is not, and cannot be as written.** This box read *"the comment half holds"* on the strength of 449 `unsafe {` blocks against 463 `// SAFETY:` comments — a count, which cannot say that each block has its *own* comment, and for ten blocks in library code it was false — two or three blocks under one shared comment, or a comment a statement above the block or above the `match` that holds it. Since 2026-09-14 `clippy::undocumented_unsafe_blocks` is `deny` in the root `[workspace.lints.clippy]` and in `tf_tree_py`'s and `tf_tree_tf2_sys`' own manifests, so every `clippy -D warnings` pass fails a block with no comment of its own. The lint checks where a comment sits and nothing about what it says, and it reaches only the configurations some clippy line compiles — `scripts/unsafe-budget.sh`'s *What it does NOT prove* names them. `scripts/unsafe-budget.txt` is the separate, per-file index `just lint` checks. But §2's invariants are about the **arena**, while most of these blocks are the OS, a foreign runtime, a foreign caller or our own C ABI — `0007`'s kinds, as amended by `0048`. A block that mentions no §2 invariant because it is not about the arena is correct, not undocumented. Closing this box means restating it against `0007`'s kinds, which is an edit to the box rather than to the code.
-- [x] `tf_tree doctor` detects all seven listed conditions, each with a test — satisfied, with a **positive and a negative** test per check in `crates/tf_tree_cli/src/doctor.rs`'s test module. The negative arm is the load-bearing half: a check that fires on its own fixture and never on a healthy one is the only form that distinguishes detection from an unconditional finding.
-- [x] Public API documented with `#![deny(missing_docs)]` — **landed 2026-09-09 on the four publishable roots that lacked it** (`tf_tree`, `tf_tree_core`, `tf_tree_math`, `tf_tree_arena`; `tf_tree_ipc` already carried it). The workspace has set `missing_docs = "warn"` and `just lint`'s `-D warnings` has promoted it all along, so the *gate* was effective — but only inside that recipe, and the box asks for the attribute at the root a published consumer reads. It now says so under a plain `cargo build` of this repository too. **It does not bind a downstream consumer**: cargo builds registry dependencies with `--cap-lints allow`, which caps an attribute-level `deny` as well, so for somebody building `tf_tree` from crates.io the attribute has no effect. What it binds is this repository and its path dependents, which is where a missing doc would be introduced.
-- [x] Crate-level docs state the five conventions from §3.1 explicitly — `crates/tf_tree_math/src/lib.rs`'s header enumerates them.
-- [x] A `PHASE2.md` listing every place a `MappedArena` will need to differ — ideally the list has one entry — `docs/PHASE2.md` exists, its §1 carries amendments A1–A8, and §4 states the read-path claim the "ideally one entry" clause is about. The eight amendments are the honest answer to "ideally one": the multi-process crash matrix found eight, and they are enumerated rather than averaged away.
-
----
+- [x] All §10 tests pass, including loom and Miri, in CI on x86-64 **and aarch64** (landed 2026-09-09; first runs green, PR #307). §10.5's `tf2` arm stays x86-64 (container job). Loom remains the argument; aarch64 is corroboration, not a weak-memory proof.
+- [ ] §11 benchmark suite runs via `cargo xtask bench-gate` and reports the full table — the runner reports §11.3's criteria, not §11.2's seven rows. §11.2's **cold-cache row is measured by nothing in this repository**, so the box cannot close until that row has an artifact or is withdrawn. `benches/lookup.rs`, `read_scaling.rs` and `push.rs` are executed by no recipe.
+- [x] The gate in §11.3 is met, or a written explanation exists — [`0013`](./decisions/0013-the-benchmark-gate-never-interpolated.md)'s *Resolution* is the second arm. Its plan step 6 (re-baseline on a `Fitness`-passing host) is outstanding and is not this box.
+- [x] `#![forbid(unsafe_code)]` holds on `tf_tree_math`, `tf_tree_cli`; `tf_tree` is `#![deny(unsafe_code)]` with exactly one `#[allow]` (`OwnedWriter`): `rg -c 'allow\(unsafe_code\)' crates/tf_tree/src` returns one line, in `tree.rs`. The scope is the crate ROOT, not the package ([`0048`](./decisions/0048-a-kind-is-not-a-crate-name.md)).
+- [~] Every `unsafe` block has a `// SAFETY:` comment naming a §2 invariant — the comment half is gated (`clippy::undocumented_unsafe_blocks` is `deny`; `scripts/unsafe-budget.txt` is the per-file index) and checks placement, not content. The "naming a §2 invariant" half is not gated and cannot be as written: §2's invariants concern the **arena**, while most blocks are the OS, a foreign runtime, a foreign caller or the C ABI (`0007`'s kinds). Closing this box means restating it against those kinds.
+- [x] `tf_tree doctor` detects all seven listed conditions — a **positive and a negative** test per check in `crates/tf_tree_cli/src/doctor.rs`. The negative arm is the load-bearing half.
+- [x] Public API and the five §3.1 conventions documented (`crates/tf_tree_math/src/lib.rs`), with `#![deny(missing_docs)]` on the publishable roots (landed 2026-09-09). It binds this repository and its path dependents, not a crates.io consumer (`--cap-lints allow`).
+- [x] A `PHASE2.md` lists every place a `MappedArena` must differ — its §1 carries amendments A1–A8 and §4 states the read-path claim.
 
 ## Appendix: suggested implementation order
 
-1. `tf_tree_math` types, `exp`/`log`, the numerical test sweep from §3.3. Get this exactly right before anything else — everything downstream inherits its accuracy.
+1. `tf_tree_math` types, `exp`/`log`, the numerical test sweep from §3.3.
 2. `tf_tree_math` interpolation, both `ScLerp` implementations, the invariance tests.
 3. `tf_tree_arena` layout computation and `HeapArena`, with layout assertion tests.
 4. `tf_tree_core` frame interning and the topology block, with loom tests.
-5. `tf_tree_core` edge records, claims, `PoseSlot`, publish/read protocols, loom tests, the wrapped-ring test.
+5. `tf_tree_core` edge records, claims, `PoseSlot`, publish/read protocols, loom tests, the wrapped-ring test. Do not proceed past this step until its loom tests pass.
 6. Plan compilation, static folding, evaluation.
 7. Public API and the convenience path.
 8. `at_many` and `at_adaptive`.
 9. Benchmarks and the tf2 differential harness.
 10. CLI.
-
-Do not proceed past step 5 until its loom tests pass. Everything after it assumes the buffer protocol is sound, and a bug there will present as a mysterious numerical error somewhere in step 6.

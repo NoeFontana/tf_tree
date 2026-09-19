@@ -1,58 +1,20 @@
 //! What the diagnostic counters cost — `docs/PHASE5.md` §5.7.
 //!
-//! §5.7 asks for two numbers and does not accept either on argument:
+//! Measures §5.7's two questions: the cost of the non-atomic `Guard` increment,
+//! and whether flush-on-drop contends under sixteen concurrent readers.
 //!
-//! 1. **the cost of the non-atomic `Guard` increment**, and
-//! 2. **whether the flush-on-drop pattern shows measurable contention under
-//!    sixteen concurrent readers.**
+//! Result on a 4-core + SMT host: no measurable contention at or below the CPU
+//! count (ranges of three runs overlap with the counters-off control), so §5.7's
+//! sharding fallback is not justified. Rows past the CPU count are scheduler
+//! artifacts and are not quoted.
 //!
-//! It also says what to do if the answer to (2) is bad — shard by participant
-//! slot — and, importantly, *"measure before adding that complexity"*. This
-//! binary is that measurement.
+//! The `counters` feature is compile-time, so the control is a loop in the same
+//! build that drops a `Guard` every iteration (one flush per lookup, not per
+//! batch). §5.4's requirement for a long-lived `Guard` is withdrawn; the batched
+//! arm prices the flush only.
 //!
-//! # The answer, on this host (4 physical cores + SMT, 8 logical)
-//!
-//! **No measurable contention at or below the CPU count**, so §5.7's sharding
-//! fallback is not justified. Three runs each, `ns/lookup/thread`:
-//!
-//! ```text
-//!   threads      1       2       4       8
-//!   counters on  21.7-22.5  22.0-23.1  22.4-25.5  38.0-39.2
-//!   counters off 22.4-22.9  22.8-23.2  22.8-24.3  38.4-39.2
-//! ```
-//!
-//! The ranges overlap at every row. A single earlier run showed 27.6 against
-//! 23.7 at four threads and looked like a 16 % contention cost; repeating it
-//! three times showed that number sitting inside the control's own spread. It
-//! is recorded here because "measured once" and "measured" are different
-//! claims, and the first one is how a scheduling artifact becomes a design
-//! decision.
-//!
-//! The 16-thread row is omitted from that table on purpose: it is 2x
-//! oversubscribed on this host, the two configurations disagree by more than
-//! either differs from itself (82.7 with counters against 114.1 without — i.e.
-//! *faster* with the extra work, which is not a thing), and a number that
-//! incoherent should not be quoted in either direction.
-//!
-//! # How the comparison is made honest
-//!
-//! The `counters` feature is a compile-time switch, so "with" and "without"
-//! cannot both exist in one binary. Rather than compare two builds — whose code
-//! layout differs for reasons that have nothing to do with counting — this
-//! measures the **same build** against a control loop that performs the
-//! identical lookups through a `Guard` that is dropped every iteration, so the
-//! flush happens N times instead of once. The difference between one flush per
-//! batch and one per lookup is what §5.4 weighed.
-//!
-//! **§5.4's NORMATIVE requirement for a long-lived per-thread `Guard` was
-//! WITHDRAWN on 2026-09-09** — read its amendment before reading these numbers
-//! as an argument for one. The batched arm below is what a caller gets from
-//! `Plan::at` with a hoisted `Guard`; it is **not** what the convenience path
-//! ships, and after the withdrawal `Tree::lookup` builds a `Guard` per call
-//! deliberately. What the difference prices is the flush, which is still worth
-//! knowing; what it no longer argues for is a guard that never ends.
-//!
-//! Run pinned and on an idle machine:
+//! Run pinned on an idle machine:
+//!   `taskset -c 0-7 cargo run --release -p tf_tree_bench --bin counter_cost`
 //!   `taskset -c 0-7 cargo run --release -p tf_tree_bench --bin counter_cost`
 #![allow(clippy::unwrap_used, clippy::print_stdout, clippy::expect_used)]
 
@@ -167,11 +129,7 @@ fn main() {
     println!("  in there too — and `just guard-cost` is the registered artifact");
     println!("  for that decomposition.");
 
-    // --- §5.7's second question: contention across sixteen readers ---
-    //
-    // Sixteen threads on the *same* edge, which is the worst case: they all
-    // flush into one cache line. If the flush-on-drop pattern contends at all,
-    // it contends here.
+    // §5.7's second question: sixteen threads on the same edge, the worst case.
     println!("\nconcurrent readers on ONE edge — the worst case for the flush");
     let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
     println!("  (this host reports {cores} logical CPUs)");
@@ -223,9 +181,7 @@ fn concurrent(tree: &Tree, threads: usize, stamps: &[i64]) -> f64 {
                     }
                     let t0 = Instant::now();
                     let mut n = 0u64;
-                    // A fixed wall-clock window, so every thread contends for
-                    // the same interval rather than the fast ones finishing
-                    // early and leaving the slow ones uncontended.
+                    // A fixed window so every thread contends for the same interval.
                     while t0.elapsed() < Duration::from_millis(300) {
                         let g = tree.guard();
                         let mut acc = 0.0;

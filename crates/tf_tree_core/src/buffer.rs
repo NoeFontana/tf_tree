@@ -20,19 +20,10 @@
 //! All *interior mutation* of the reinterpreted memory happens through the
 //! atomics, so aliasing the region as `&PoseSlot` from multiple threads is sound.
 //!
-//! The `push`/`read_slot` protocol carries **normative** ordering annotations
-//! (`docs/PHASE1.md` §6.2–§6.3). Every ordering below is load-bearing and is exercised by
-//! the loom tests; do not weaken any to `Relaxed` because an x86 test passes.
-//!
-//! **Measured, not asserted**, which is `docs/PHASE1.md` §10.2's mutation test:
-//! weakening any one of the five to `Relaxed` makes a loom model fail. Four die
-//! against `writer_three_pushes_reader_never_torn` and
-//! `writer_wraps_reader_gets_valid_or_recycled`. The fifth — the `head` store
-//! at the end of [`SampleRing::push`] — dies only against
-//! `head_publishes_every_stamp_below_it`, **which exists because it survived
-//! both of the others**: this sentence was true of four orderings and asserted
-//! of five until 2026-09-08, and the survivor is why the third model is
-//! shaped as an invariant rather than as another `sample` fixture.
+//! The `push`/`read_slot` orderings are **normative** (`docs/PHASE1.md` §6.2–§6.3)
+//! and loom-checked (§10.2 mutation test); never weaken one to `Relaxed` because
+//! an x86 test passes. The `head` store at the end of [`SampleRing::push`] dies
+//! only against `head_publishes_every_stamp_below_it`.
 #![allow(unsafe_code)]
 
 use tf_tree_math::Iso3;
@@ -66,19 +57,8 @@ pub struct PoseSlot {
     data: [AtomicU64; 7],
 }
 
-// `PoseSlot` is a wire record too — it is what a peer process reads out of the
-// ring and what `write_frozen` copies into a `.tft` — so `size_of` is not a
-// layout here either (`edge.rs`'s `EdgeRecord` block carries the argument).
-//
-// **This is a strictly weaker improvement than the sibling pins**: unlike
-// `ClaimRecord`'s two diagnostics-only fields, a swap of `seq` and `data` here
-// already HAS a guard — the committed fixture test
-// `tf_tree::frozen::the_committed_sensor_domain_fixture_reads_and_is_still_tag_one`
-// fails with `SlotContended`, measured. That test runs only under
-// `just shm-check` (its target carries `required-features = ["shm"]`), catches
-// it by a property rather than by the layout, and its own doc says so. These two
-// lines replace an accidental runtime guard two recipes away with a
-// compile-time one; they do not close a hole.
+// `PoseSlot` is a wire record (peers read it; `write_frozen` copies it), so pin
+// its layout, not just its size.
 #[cfg(not(loom))]
 const _: () = {
     assert!(core::mem::size_of::<PoseSlot>() == 64);
@@ -87,10 +67,8 @@ const _: () = {
     assert!(core::mem::offset_of!(PoseSlot, data) == 8);
 };
 
-/// Under `loom`, `PoseSlot` holds loom's instrumented atomics and lives on the
-/// heap (loom atomics are neither `repr(C)` nor constructible from zeroed bytes),
-/// so it carries no `repr`/size guarantee. The `push`/`read_slot` algorithm is
-/// byte-for-byte identical across the two definitions.
+/// Under `loom`, `PoseSlot` holds loom's atomics on the heap and carries no
+/// `repr`/size guarantee; the algorithm is identical.
 #[cfg(loom)]
 pub struct PoseSlot {
     seq: AtomicU32,
@@ -98,28 +76,20 @@ pub struct PoseSlot {
 }
 
 impl PoseSlot {
-    /// Test-only access to the slot's sequence number.
-    ///
-    /// `seq` stays private because nothing outside the seqlock protocol may
-    /// touch it; these exist so a test can *simulate a writer killed
-    /// mid-publish*, which is the one state the protocol has to recover from and
-    /// which no in-process API can otherwise produce (see
+    /// Test-only: set `seq` to simulate a writer killed mid-publish (see
     /// `stale_odd_seq_from_a_dead_writer_is_healed_by_the_next_push`).
     #[cfg(test)]
     pub(crate) fn set_seq_for_test(&self, v: u32) {
         self.seq.store(v, Ordering::Relaxed);
     }
 
-    /// Read the slot's sequence number. Test-only; see
-    /// [`PoseSlot::set_seq_for_test`].
+    /// Test-only: read `seq`.
     #[cfg(test)]
     pub(crate) fn seq_for_test(&self) -> u32 {
         self.seq.load(Ordering::Relaxed)
     }
 
-    /// A fresh, stable (`seq == 0`), identity-ish slot. Used to build heap rings
-    /// for the loom tests and the wrapped-ring property test; the production
-    /// arena views zeroed bytes instead of constructing.
+    /// A fresh, stable (`seq == 0`) slot, for heap rings in tests.
     #[must_use]
     pub fn new() -> PoseSlot {
         #[cfg(not(loom))]
@@ -146,31 +116,16 @@ impl Default for PoseSlot {
     }
 }
 
-/// A borrowed view of one edge's sample ring: its monotone head, its writer
-/// heartbeat, and the parallel stamp/pose arrays.
-///
-/// The same struct backs both worlds. In production the slices are reinterpreted
-/// arena bytes (via [`crate::arena_view`]); in the loom tests they borrow
-/// heap-allocated arrays. All fields are shared references because every mutation
-/// goes through the contained atomics.
+/// A borrowed view of one edge's sample ring: monotone head, writer heartbeat,
+/// and the parallel stamp/pose arrays. Backed by arena bytes in production and
+/// heap arrays in loom tests; every mutation goes through the atomics.
 ///
 /// # INVARIANT
 ///
-/// `stamps.len() == poses.len()`, and that length is a power of two equal to the
-/// edge's ring capacity.
-///
-/// **The capacity used to be spelled twice** — as `poses.len()` and as a `pub
-/// mask: u64` field this comment then had to assert was `capacity - 1`. Nothing
-/// enforced it, on a `pub` field of a `pub` struct in a published crate, and a
-/// ring built with `mask = 3` over 8-slot arrays returned a **silently wrong
-/// pose**: [`Self::capacity`] and [`Self::retained`] compute a 7-sample window
-/// while `stamp_at` masks into 4 slots, so `oldest_stamp` reports a
-/// sample it excludes and the sampler interpolates the wrong pair. No error, no
-/// panic, and the `debug_assert` inside `push` does not fire. [`Self::mask`] is
-/// derived from `poses.len()` now, so the two cannot disagree.
+/// `stamps.len() == poses.len()`, a power of two equal to the ring capacity.
+/// [`Self::mask`] is derived from `poses.len()` so the two cannot disagree.
 pub struct SampleRing<'a> {
-    /// Monotone count of samples ever published (invariant 5). Never masked in
-    /// storage, only at access.
+    /// Monotone count of samples ever published (invariant 5); masked only at access.
     pub head: &'a AtomicU64,
     /// Bumped by the writer on every successful push (Phase 2 liveness input).
     pub heartbeat: &'a AtomicU64,
@@ -192,19 +147,9 @@ impl SampleRing<'_> {
 
     /// `capacity - 1`; AND a logical index with this to get a physical index.
     ///
-    /// Derived rather than stored — see the struct's `INVARIANT` for what the
-    /// stored version cost.
-    ///
-    /// **`wrapping_sub` and not `- 1`: the guarantee is narrower than it looks.**
-    /// For a ring this crate builds the capacity is a power of two and therefore
-    /// non-zero: `ArenaView::ring_bytes` is the one place that is established,
-    /// and it returns `None` when `!cap.is_power_of_two()`, which also rejects
-    /// `0`. That is a property of the *constructor*, not of the type — every
-    /// remaining field of [`SampleRing`] is `pub`, `poses` included, so a caller
-    /// outside this crate can build one over an empty or non-power-of-two slice
-    /// and no guarantee here applies to it. `wrapping_sub` is what keeps such a
-    /// ring failing the way it always has, at the slice bounds check, instead of
-    /// adding a second debug-only panic site on the read path.
+    /// `wrapping_sub`: only `ArenaView::ring_bytes` guarantees a non-zero
+    /// power-of-two capacity, and the fields are `pub`; a bad ring must fail at
+    /// the slice bounds check, not at a second panic site.
     #[inline]
     #[must_use]
     pub fn mask(&self) -> u64 {
@@ -213,18 +158,11 @@ impl SampleRing<'_> {
 
     /// How many of the most recent logical indices a reader may safely touch.
     ///
-    /// **Not** `capacity`. [`Self::push`] writes logical index `head` into
-    /// physical slot `head & mask`; logical index `head - capacity` maps to that
-    /// same physical slot, so it is the slot currently being overwritten, not a
-    /// retained sample. The readable window is therefore
-    /// `[head - capacity + 1, head - 1]` — `capacity - 1` samples. Reading the
-    /// lapped slot is what made an in-window query race a `push` and come back
-    /// with a fabricated `Extrapolation`.
-    ///
-    /// A one-slot ring is degenerate (its readable window is empty). It keeps a
-    /// window of `1` so a quiescent ring is still readable at all; concurrent
-    /// reads of one are guarded only by the per-slot seqlock, which is why
-    /// `Capacity` should never be configured that small.
+    /// **Not** `capacity`: logical index `head - capacity` maps to the slot
+    /// [`Self::push`] is overwriting, so the window is
+    /// `[head - capacity + 1, head - 1]`, `capacity - 1` samples. A one-slot ring
+    /// keeps a window of `1` and is guarded only by the seqlock; never configure
+    /// `Capacity` that small.
     #[inline]
     #[must_use]
     pub fn retained(&self) -> u64 {
@@ -236,9 +174,7 @@ impl SampleRing<'_> {
 
     /// The newest published stamp, or `None` if the ring is empty.
     ///
-    /// Reads `head` with `Acquire` (matching [`Self::sample`]) so the stamp of the
-    /// most recently published sample is ordered into view. Used by the plan layer
-    /// to resolve `Latest` and `LatestCommon` queries.
+    /// Reads `head` with `Acquire` so the newest stamp is ordered into view.
     #[inline]
     #[must_use]
     pub fn newest_stamp(&self) -> Option<i64> {
@@ -252,14 +188,8 @@ impl SampleRing<'_> {
     /// The oldest stamp a reader may still touch, or `None` if the ring is
     /// empty.
     ///
-    /// The mirror of [`Self::newest_stamp`], and it lives here for the same
-    /// reason [`Self::retained`] does: the readable window's lower end is
-    /// `head - retained()` clamped at zero, and that arithmetic **changed once
-    /// already**. A copy of it in another crate would not move when this one
-    /// moves next.
-    ///
-    /// Note the asymmetry with `newest_stamp`: this is the oldest sample still
-    /// *in the ring*, not the oldest ever pushed. A lapped ring dropped those.
+    /// The lower end of the readable window (`head - retained()`, clamped at
+    /// zero): the oldest sample still *in the ring*, not the oldest ever pushed.
     #[inline]
     #[must_use]
     pub fn oldest_stamp(&self) -> Option<i64> {
@@ -273,10 +203,8 @@ impl SampleRing<'_> {
 
     /// How many samples this ring currently holds — `min(head, retained())`.
     ///
-    /// **Not** the number ever pushed: that is `head`, which keeps counting
-    /// after the ring laps. The two answer different questions ("how big is this
-    /// file" vs. "how many did the source produce") and a caller that wants a
-    /// rate wants this one over the span [`Self::oldest_stamp`] describes.
+    /// **Not** the number ever pushed; that is `head`, which keeps counting after
+    /// the ring laps.
     #[inline]
     #[must_use]
     pub fn stored(&self) -> u64 {
@@ -307,32 +235,16 @@ impl SampleRing<'_> {
         let idx = (h & self.mask()) as usize;
         let slot = &self.poses[idx];
 
-        // Flip the slot's seqlock to odd (write in progress). The Release fence
-        // that follows keeps the payload stores below from being hoisted above
-        // this point on a weakly-ordered target.
-        //
-        // **Force the parity; do not increment** (`docs/PHASE2.md` §1, A5). A
-        // writer killed between the two stores below leaves the slot odd
-        // forever. Within one process that was unobservable — the crash took the
-        // readers with it — but across processes the readers survive, and when
-        // the ring laps, an incrementing writer would read the stale odd `s` and
-        // land its `s+1` on an *even* value, inverting the protocol for that slot
-        // from then on: readers would accept mid-write payloads as published.
-        //
-        // `s | 1` is idempotent on a stale odd value, so this self-heals. Any
-        // reader that saw the stale odd retried without reading, so none can be
-        // mid-read holding it.
+        // Force the seq odd; do not increment (`docs/PHASE2.md` §1, A5). A writer
+        // killed mid-publish leaves the slot odd, and an incrementing writer would
+        // then land on even and invert the protocol. `s | 1` is idempotent, so
+        // this self-heals. The Release fence keeps the payload stores below from
+        // hoisting above it.
         let odd = slot.seq.load(Ordering::Relaxed) | 1;
         slot.seq.store(odd, Ordering::Relaxed); // -> odd (idempotent if already)
         fence(Ordering::Release);
 
-        // §11.3 `push.after_seq_odd`: "slot odd, `head` unbumped -> A5 self-heals
-        // on next claim". The parity is flipped and its Release fence has run;
-        // not one byte of payload has been written. This is A5's own pseudo-code
-        // boundary — its snippet has `// ...write stamp and pose data...` on the
-        // line after the fence — and it is what separates this site from
-        // `after_data_before_seq_even`, which leaves the same seq and head with
-        // the payload written.
+        // §11.3 `push.after_seq_odd`: slot odd, no payload written, `head` unbumped.
         crash_point!("push.after_seq_odd");
 
         self.stamps[idx].store(stamp, Ordering::Relaxed);
@@ -341,57 +253,21 @@ impl SampleRing<'_> {
             slot.data[i].store(*w, Ordering::Relaxed);
         }
 
-        // §11.3 `push.after_data_before_seq_even`: "as above; sample invisible
-        // because `head` never moved". Stamp and all seven payload words are in
-        // the slot, the seq is still odd, and `head` is untouched — the last
-        // instant at which the slot is *torn* as far as a reader is concerned.
+        // §11.3 `push.after_data_before_seq_even`: payload written, seq odd, `head` unmoved.
         crash_point!("push.after_data_before_seq_even");
 
         // Back to even publishes the payload; the head store publishes the
         // sample to the bracket search.
         slot.seq.store(odd.wrapping_add(1), Ordering::Release); // -> even
 
-        // §11.3 `push.after_seq_even_before_head`: "sample fully written but
-        // unpublished -> invisible, then overwritten". Between the two publishing
-        // stores: the slot is consistent and readable under its seqlock, and
-        // `head` has not moved, so no correct reader addresses it (the bracket
-        // search only ever looks below `head`) and the next push lands on the
-        // same physical slot.
+        // §11.3 `push.after_seq_even_before_head`: slot consistent but below no `head`.
         crash_point!("push.after_seq_even_before_head");
 
         self.head.store(h + 1, Ordering::Release);
 
-        // **A store, not a locked read-modify-write.** The heartbeat counts
-        // pushes, and the post-push count is `h + 1`, already in a register:
-        // `head` is written here and nowhere else in the workspace and is never
-        // reset, and this line is the only writer of `ClaimRecord::heartbeat`,
-        // so the two are equal at every quiescent point.
-        //
-        // The ordering is unchanged — `Relaxed` before and after. What goes away
-        // is the atomicity, which bought nothing: the ring is single-writer by
-        // construction (invariant 4 / D7), the same guarantee the plain `head`
-        // store immediately above already rests on. On x86 `fetch_add` lowers to
-        // a `lock`-prefixed instruction whose implicit full barrier drains the
-        // store buffer right behind the eight relaxed payload stores above.
-        // Measured on `push/single_writer`; the figure and the host are in
-        // `0014`. *No number is written
-        // here: this line carried an earlier run's figure, contradicting the
-        // record it names as authoritative. `docs/decisions/README.md`'s `0014`
-        // row carries the erratum, and it is the only place the superseded pair
-        // appears.*
-        //
-        // This is the cost `counters.rs`'s module doc already rules out for
-        // publish-side diagnostics — "a relaxed `fetch_add` on the push path
-        // costs ~5-10 ns ... to store something the arena already holds" —
-        // applied to the last such `fetch_add` left on the push path.
-        //
-        // The equality this rests on is asserted rather than left to the prose
-        // (`0014` open question 1). Free in release, and it runs under `just
-        // loom`, `just miri` and the whole debug test suite — which is where a
-        // second writer to `head` or `heartbeat`, or a path that resets one
-        // without the other, would first show up. `fetch_add` tolerated such a
-        // divergence silently; a store cannot, so the invariant stops being a
-        // comment somebody has to re-derive.
+        // A store, not `fetch_add`: the ring is single-writer (invariant 4 / D7) and
+        // `head` and the heartbeat are equal at every quiescent point (`0014`),
+        // asserted below; the lock-prefixed RMW cost is measured in `0014`.
         debug_assert_eq!(
             self.heartbeat.load(Ordering::Relaxed),
             h,
@@ -406,8 +282,8 @@ impl SampleRing<'_> {
     /// [`LookupError::SlotContended`] if the slot stayed odd for
     /// [`SEQ_RETRY_LIMIT`] attempts.
     ///
-    /// This does **not** check whether the ring has since lapped the reader — the
-    /// bracket search does that revalidation once, after reading both endpoints.
+    /// Does **not** check whether the ring has lapped the reader; the bracket
+    /// search revalidates once after reading both endpoints.
     ///
     /// # Errors
     ///
@@ -424,9 +300,7 @@ impl SampleRing<'_> {
             for (i, b) in bits.iter_mut().enumerate() {
                 *b = slot.data[i].load(Ordering::Relaxed);
             }
-            // The Acquire fence stops the payload loads above from being reordered
-            // after the re-read of `seq` on a weakly-ordered target. If `seq` is
-            // unchanged and even, the payload we read is exactly this version.
+            // Acquire fence: keeps the payload loads before the `seq` re-read.
             fence(Ordering::Acquire);
             if slot.seq.load(Ordering::Relaxed) == s1 {
                 return Ok(Iso3::from_bits(&bits));

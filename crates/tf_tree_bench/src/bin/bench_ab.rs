@@ -1,24 +1,12 @@
 //! `bench_ab a.json b.json` — did that change help?
 //!
-//! Reads two run files written by any harness in this suite
-//! ([`tf_tree_bench::runstore`]) and prints a verdict per metric: `better`,
-//! `worse`, `noise`, `info` or `unmeasured`. Exits non-zero if anything
-//! regressed past the tolerance the **baseline** recorded, so it drops into a
-//! bisect script without further wrapping.
+//! Reads two run files ([`tf_tree_bench::runstore`]) and prints a verdict per
+//! metric: `better`, `worse`, `noise`, `info` or `unmeasured`. Exits non-zero if
+//! anything regressed past the tolerance the **baseline** recorded.
 //!
-//! # What it will not do
-//!
-//! Guess. The direction a metric is allowed to move and the slack below which a
-//! move is not news both travel in the file, next to the number; nothing here
-//! infers either from a key name. That is the whole reason
-//! `docs/PHASE5.md` §10's `results.json` went to schema `/2`, and the same
-//! reasoning applies one level down.
-//!
-//! It also will not quietly drop a row. A workload that stopped running appears
-//! under "Rows only in a" rather than as an absence, because an absence reads
-//! as "unchanged".
-//!
-//! Usage:
+//! It infers nothing from a key name: direction and slack travel in the file
+//! (`docs/PHASE5.md` §10, schema `/2`). A workload that stopped running appears
+//! under "Rows only in a", never as an absence.
 //!
 //! ```text
 //! just bench-ab target/bench-runs/before.json target/bench-runs/after.json
@@ -76,12 +64,7 @@ fn main() -> ExitCode {
     let d = runstore::diff(&a, &b);
     print!("{}", runstore::render(&d));
 
-    // Checked before `deltas.is_empty()`, and before the regression verdict.
-    // Both of those are statements *about the numbers*, and the point of this
-    // branch is that there are no numbers here to make a statement about.
-    // Exit 2 rather than 1: "this comparison could not be made" is a different
-    // answer from "this comparison found a regression", and collapsing the two
-    // is how a gate ends up being read as flaky.
+    // Exit 2, not 1: "could not compare" differs from "found a regression".
     if !d.comparable() {
         eprintln!(
             "\nbench_ab: refusing to compare two runs built differently (see above). \
@@ -91,9 +74,7 @@ fn main() -> ExitCode {
     }
 
     if d.deltas.is_empty() {
-        // Not a pass. Two files with no metric in common is the shape a typo in
-        // a harness name produces, and reporting it as "no regressions" is the
-        // failure mode this whole tool exists to avoid.
+        // Not a pass: no shared metric is what a harness-name typo produces.
         eprintln!(
             "\nbench_ab: the two runs share no comparable metric. Check that both \
              were produced by the same harness and workload."
@@ -110,8 +91,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// The commit and build a run came from — the two facts a reader needs to know
-/// *what* is being compared, as opposed to how it did.
+/// The commit and build a run came from.
 fn describe(run: &Run) -> String {
     let commit = run.fact("git_commit").unwrap_or("unknown commit");
     let short: String = commit.chars().take(12).collect();

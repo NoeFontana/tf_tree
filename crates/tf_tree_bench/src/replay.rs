@@ -1,52 +1,26 @@
-//! Replay of a **real** recorded `/tf` stream through the engine.
-//!
-//! The synthetic [`crate::fixture`] is a good correctness oracle but it is not a
-//! real load: its rates are exact, its motion is a smooth analytic function, and
-//! nothing ever arrives late or out of order. A recorded bag has none of those
-//! conveniences — irregular periods, duplicated stamps, frames that appear
-//! partway through, and quaternions that are only approximately normalised.
+//! Replay of a real recorded `/tf` stream through the engine: irregular
+//! periods, duplicated stamps, late frames, approximately normalised
+//! quaternions, none of which [`crate::fixture`] has.
 //!
 //! # The `.tfstream` format
 //!
-//! Bags are converted **once**, offline, by `scripts/bag_to_tfstream.py` (which
-//! runs in the ROS container) into a line-oriented ASCII format:
+//! `scripts/bag_to_tfstream.py` (ROS container) converts a bag once into a
+//! line-oriented ASCII format, so this module has no ROS dependency:
 //!
 //! ```text
 //! S <parent> <child> <qw> <qx> <qy> <qz> <tx> <ty> <tz>
 //! D <parent> <child> <stamp_ns> <qw> <qx> <qy> <qz> <tx> <ty> <tz>
 //! ```
 //!
-//! That indirection is deliberate: this module — and therefore the whole replay
-//! harness — has **no ROS dependency**, so it builds and runs on any host, and
-//! any bag from any distro reduces to one format we control. Quaternions are
-//! stored w-first (matching [`Iso3`]), so the ROS w-last transposition happens
-//! once, in the converter.
-//!
-//! Stamps are rebased so the earliest sample is 0. Real bags carry wall-clock
-//! epochs around 1.8e18 ns; rebasing keeps dumps readable and keeps every stamp
-//! comfortably inside the unsigned time ROS requires.
+//! Quaternions are w-first (matching [`Iso3`]). Stamps are rebased so the
+//! earliest sample is 0.
 //!
 //! # There is exactly one clock in this format, and it is the header stamp
 //!
-//! A `D` line carries `<stamp_ns>` and nothing else — no MCAP log time, no
-//! arrival time, no receipt time. The converter discards them, and this replay
-//! harness has never needed one: it drives the engine, whose only notion of time
-//! *is* the stamp.
-//!
-//! It is worth saying out loud because a consumer downstream does need one.
-//! `tf_tree_bridge`'s §5.5 clock rules judge a publisher's stamps against a
-//! reference clock that is independent of them — a local steady clock online,
-//! `RawRecord::log_time_ns` offline — precisely because a stamp cannot check
-//! itself. A caller feeding this format into that machinery (`tf_tree_cli`'s
-//! `topology --discover` is the one in this workspace) must pass
-//! `SteadyNanos::UNKNOWN` and accept that the common-mode layer is absent for
-//! this corpus. **What it must not do is pass `stamp_ns` as the receipt time**,
-//! which would make every publisher's measured offset identically zero and turn
-//! the detector back into the circular one it replaced.
-//!
-//! Adding a log-time column here would fix that, and would also invalidate every
-//! recorded `.tfstream` in `testdata/` — so it is a change to make when something
-//! actually needs it, not on speculation.
+//! A `D` line carries `<stamp_ns>` and no log or arrival time. A caller feeding
+//! it to `tf_tree_bridge`'s §5.5 clock rules (`tf_tree_cli`'s
+//! `topology --discover`) must pass `SteadyNanos::UNKNOWN`, and **must not pass
+//! `stamp_ns` as the receipt time**, which would zero every measured offset.
 
 use std::collections::BTreeMap;
 
@@ -83,8 +57,7 @@ impl TfStream {
     ///
     /// # Errors
     ///
-    /// On a malformed line, naming the line number — a truncated or
-    /// hand-edited stream should fail loudly, not silently replay less data.
+    /// On a malformed line, naming the line number.
     pub fn parse(text: &str) -> Result<TfStream> {
         let mut out = TfStream::default();
         let mut dyn_index: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -179,11 +152,8 @@ impl TfStream {
         counts
     }
 
-    /// The stamp window in which **every** dynamic edge has data.
-    ///
-    /// Queries outside it are legitimately extrapolation for at least one edge,
-    /// so a differential must stay inside it or it is comparing error paths
-    /// rather than transforms. `None` if some edge has no samples at all.
+    /// The stamp window in which every dynamic edge has data, or `None` if some
+    /// edge has no samples. Queries outside it extrapolate on some edge.
     #[must_use]
     pub fn common_window(&self) -> Option<(i64, i64)> {
         if self.dynamic_edges.is_empty() {
@@ -204,17 +174,11 @@ impl TfStream {
     }
 
     /// Build a [`Tree`] with this recording's topology and replay its history
-    /// into it.
-    ///
-    /// Ring capacities are sized to each edge's actual sample count (plus the
-    /// one slot a ring cannot hand back), which is what the recording demands
-    /// rather than a guess: every sample stays readable, so a query anywhere in
-    /// [`Self::common_window`] is answered rather than declined.
+    /// into it, with each ring sized so every sample stays readable.
     ///
     /// # Errors
     ///
-    /// If the topology cannot be built (a frame with two parents, a cycle), or a
-    /// push is rejected.
+    /// If the topology cannot be built, or a push is rejected.
     pub fn build_tree(&self, interp: InterpPolicy) -> Result<Tree> {
         let mut b = TreeBuilder::new().default_interp(interp);
         for (p, c, pose) in &self.static_edges {
@@ -222,13 +186,9 @@ impl TfStream {
         }
         let counts = self.samples_per_edge();
         for (i, (p, c)) in self.dynamic_edges.iter().enumerate() {
-            // `slots` rounds up to a power of two, but a ring of `cap` slots
-            // *retains* only `cap - 1` samples (`SampleRing::retained`): the slot
-            // the writer is about to overwrite is not readable. Sizing for
-            // `count` alone therefore loses the oldest sample whenever `count` is
-            // an exact power of two — and the oldest sample is precisely the one
-            // `common_window`'s lower bound points at, so every query at `lo`
-            // would be declined. Ask for one more than the recording holds.
+            // A ring of `cap` slots retains only `cap - 1` samples, so ask for
+            // one more than the recording holds or `common_window`'s lower bound
+            // is declined whenever `count` is a power of two.
             let want = u32::try_from(counts[i])
                 .unwrap_or(u32::MAX)
                 .saturating_add(1);
@@ -270,10 +230,8 @@ fn parse_pose(f: &[&str], lineno: usize) -> Result<Iso3> {
 }
 
 /// A deterministic query set over a recording: random frame pairs at random
-/// stamps inside the common window.
-///
-/// Shared by the replay differential and the replay benchmarks so both measure
-/// the same thing.
+/// stamps inside the common window, shared by the replay differential and
+/// benchmarks.
 pub struct QuerySet {
     /// `(target, source, stamp_ns)` triples.
     pub queries: Vec<(String, String, i64)>,
@@ -309,18 +267,9 @@ impl QuerySet {
     }
 }
 
-/// Synthesise a [`TfStream`] shaped like a real robot description, at a chosen
-/// scale.
-///
-/// Real URDFs produce a characteristic frame tree: one kinematic spine of
-/// dynamic joints, with mostly-static sensor and link subtrees hanging off it.
-/// `chain_depth` sets the spine length (the thing lookup cost is sensitive to)
-/// and `branches_per_link` the fan-out (the thing tree *size* is sensitive to),
-/// so the two can be varied independently — which is exactly what a scaling
-/// comparison needs and what a single fixed robot cannot give.
-///
-/// Only the spine is dynamic, matching how real robots publish: a handful of
-/// moving joints and a large static skeleton from `robot_state_publisher`.
+/// Synthesise a [`TfStream`] shaped like a real robot description: a dynamic
+/// spine of `chain_depth` joints with `branches_per_link` static fan-out, so
+/// lookup cost and tree size vary independently.
 #[must_use]
 pub fn synth_robot(
     chain_depth: usize,
@@ -380,12 +329,7 @@ impl Rng {
 }
 
 /// Evaluate a query set against a replayed [`Tree`], returning the poses it
-/// resolved and how many it declined.
-///
-/// Declines are expected and legitimate: a recorded tree is often disconnected
-/// (a frame published on `/tf` whose parent chain never reaches the queried
-/// root), and a stamp can fall in a gap on one edge. The count is returned so a
-/// caller can tell "engines agree" from "nothing was compared".
+/// resolved and how many it declined (a recorded tree is often disconnected).
 ///
 /// # Errors
 ///

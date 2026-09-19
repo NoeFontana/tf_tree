@@ -1,63 +1,31 @@
 //! Safe Rust bindings to ROS 2's `tf2::BufferCore`, for the `tf_tree`
 //! differential and benchmark harnesses.
 //!
-//! # Why this crate exists separately
-//!
-//! `tf_tree_bench`'s **library** crate root is `#![forbid(unsafe_code)]`, and
-//! FFI is irreducibly `unsafe`, so it is isolated here in a dedicated `-sys`
-//! crate — the idiomatic Rust split, and the one that leaves every existing
-//! crate's guarantee exactly as documented. This crate is `publish = false`, is
-//! reached only through `tf_tree_bench --features tf2`, and is never part of the
-//! shipped library.
-//!
-//! **This paragraph read that the budget "permits `unsafe` only in
-//! `tf_tree_arena` and `tf_tree_core::{buffer, arena_view}`" until 2026-09-05,
-//! and that is the PRE-[`0007`] enumeration** — the rule has named four
-//! boundaries since, and [`0048`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0048-a-kind-is-not-a-crate-name.md)
-//! has since made them properties rather than crate names. This crate is **kind
-//! 3**: a foreign runtime or library that owns its own objects. `tf2::BufferCore`
-//! owns its frame table exactly as CPython owns its `PyObject`s, which is the
-//! kind `tf_tree_py` was named for. It was never a fifth kind and it never
-//! needed one.
-//!
-//! The clause about `tf_tree_bench` is also narrower than it reads and was
-//! load-bearing for the wrong reason: `forbid` sits on that crate's
-//! `src/lib.rs`, and a bin, test, bench or example is a **separate crate root**
-//! that it does not govern. Bins of that package carry `unsafe`;
-//! `scripts/unsafe-budget.txt` is the list and no count of it is kept here.
-//! The split is still right; the reason is the *kind*, not the attribute.
+//! Isolated in a `-sys` crate because FFI is `unsafe` and `tf_tree_bench`'s library root
+//! forbids it. `publish = false`; reached only through `tf_tree_bench --features tf2`. Unsafe
+//! budget kind 3 (a foreign runtime that owns its objects; `0007`, `0048`).
 //!
 //! # SAFETY (module invariant)
 //!
 //! Every `unsafe` call below crosses into `src/shim.cpp`. The bridge is sound
 //! because:
 //!
-//! * [`Tf2Buffer`] owns its handle. It is created by exactly one `tft2_new`,
-//!   passed to no other owner, and freed by exactly one `tft2_free` in [`Drop`].
-//!   The handle is never null (checked at construction) and never dangling (it
-//!   outlives every borrow, being a private field).
+//! * [`Tf2Buffer`] owns its handle: one `tft2_new`, one `tft2_free` in [`Drop`]; never null,
+//!   never dangling (private field).
 //! * The C++ side catches **all** exceptions at the boundary and converts them
 //!   to return codes. No unwinding crosses the FFI edge.
 //! * Every `*const c_char` passed in is a [`CString`] that outlives the call.
 //!   Frame names are validated to be NUL-free before conversion.
-//! * Every `const void*` name handle passed in is a live `std::string` owned by
-//!   a borrowed [`FrameName`], so it outlives the call, and the shim only reads
-//!   it (`lookupTransform` takes it by const reference; `tft2_set_pre` copies it
-//!   into the message).
-//! * Every pose buffer passed in or out is exactly `[f64; 7]`, matching the
-//!   `double[7]` the shim reads and writes. The layout is
-//!   `{qw, qx, qy, qz, tx, ty, tz}` on both sides — the same order as
-//!   [`Iso3::to_bits`], so no reordering happens in Rust.
+//! * Every `const void*` name handle is a live `std::string` owned by a borrowed
+//!   [`FrameName`]; the shim only reads it.
+//! * Every pose buffer is `[f64; 7]` = `double[7]`, `{qw, qx, qy, qz, tx, ty, tz}` on both
+//!   sides, the order of [`Iso3::to_bits`].
 //!
-//! `Tf2Buffer` is `Send + Sync`. `tf2::BufferCore` guards its frame table with
-//! an internal mutex and is documented as thread-safe, and the shim's only other
-//! mutable state — the last-error message — is `thread_local`, so no shared
-//! mutable state crosses the boundary unsynchronised.
+//! `Tf2Buffer` is `Send + Sync`: `BufferCore` locks internally and the shim's last-error
+//! slot is `thread_local`.
 //!
-//! Sharing **one** buffer across reader threads is not incidental: it is how tf2
-//! is used, and its per-lookup mutex is precisely what the concurrent read
-//! benchmark exists to measure against tf_tree's lock-free readers. Giving each
-//! thread a private buffer would erase the contention being studied.
+//! Sharing **one** buffer across reader threads is deliberate: tf2's per-lookup mutex is what
+//! the concurrent read benchmark measures.
 
 use std::ffi::{c_char, c_double, c_int, CStr, CString};
 
@@ -112,8 +80,7 @@ pub enum Tf2Error {
     Alloc,
     /// A frame name contained an interior NUL and cannot cross into C.
     FrameNameHasNul(String),
-    /// A negative stamp. ROS time is unsigned; the caller must rebase its
-    /// timeline so the earliest sample is at or after zero.
+    /// A negative stamp (ROS time is unsigned); rebase the timeline to start at zero.
     NegativeStamp(i64),
     /// `setTransform` rejected the transform (tf2's own validation).
     SetRejected(String),
@@ -142,20 +109,13 @@ impl std::error::Error for Tf2Error {}
 
 /// An owned `tf2::BufferCore`.
 ///
-/// Mirrors the operations `tf_tree` exposes, so the differential harness can
-/// drive both engines from one loop: insert transforms, then look them up.
+/// Mirrors `tf_tree`'s insert and lookup so the differential harness drives both engines.
 pub struct Tf2Buffer {
     handle: *mut std::ffi::c_void,
 }
 
-// SAFETY: the handle is uniquely owned by this value, and everything reachable
-// through it is either mutex-guarded by `tf2::BufferCore` itself or
-// `thread_local` in the shim. There is therefore no unsynchronised shared
-// mutable state behind the pointer, so the handle may both be moved between
-// threads and shared by reference across them.
-//
-// The raw pointer field is what suppresses the automatic impls; these restore
-// exactly what the C++ side actually guarantees, no more.
+// SAFETY: the handle is uniquely owned; everything behind it is mutex-guarded by
+// `BufferCore` or `thread_local` in the shim, so it may be moved and shared across threads.
 unsafe impl Send for Tf2Buffer {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for Tf2Buffer {}
@@ -163,8 +123,7 @@ unsafe impl Sync for Tf2Buffer {}
 impl Tf2Buffer {
     /// Create a buffer whose cache spans `cache_secs` of history.
     ///
-    /// Size this to at least the span the harness will query; tf2 silently drops
-    /// transforms older than the cache and then reports extrapolation.
+    /// Size it to the queried span; tf2 silently drops older transforms.
     ///
     /// # Errors
     ///
@@ -183,10 +142,7 @@ impl Tf2Buffer {
     ///
     /// `is_static` mirrors `/tf_static`: one entry, valid at any query time.
     ///
-    /// **Not for benchmarks.** Like [`Self::lookup`], this converts both names
-    /// on every call — here into the `std::string`s the message wants — which a
-    /// benchmark would charge to tf2. Use [`Self::set_transform_by_name`] with
-    /// names converted once up front.
+    /// **Not for benchmarks:** converts both names per call; use [`Self::set_transform_by_name`].
     ///
     /// # Errors
     ///
@@ -211,14 +167,7 @@ impl Tf2Buffer {
 
     /// Insert `T_parent_child` with pre-converted frame names.
     ///
-    /// The allocation-free publish path, and the one a benchmark must use:
-    /// `tf_tree`'s `Publisher::push` takes no strings and allocates nothing, so
-    /// converting names per call would charge this bridge's marshalling to tf2.
-    ///
-    /// The names cross as the `std::string`s a [`FrameName`] already owns and
-    /// are assigned into the message, exactly as a native C++ publisher fills a
-    /// `TransformStamped` — no `CString`, no per-call heap traffic on either
-    /// side of the boundary.
+    /// The allocation-free publish path; benchmarks must use it.
     ///
     /// # Errors
     ///
@@ -260,11 +209,7 @@ impl Tf2Buffer {
 
     /// Look up `T_target_source` at `stamp_ns`, taking `&str` frame names.
     ///
-    /// **Not for benchmarks.** Converting a `&str` to a NUL-terminated C string
-    /// costs a heap allocation *per name, per call* — so timing this against
-    /// `tf_tree`'s `Plan::at`, which takes no strings and allocates nothing,
-    /// measures this crate's marshalling as if it were tf2's cost. Use
-    /// [`Self::lookup_by_name`] with names converted once up front.
+    /// **Not for benchmarks:** allocates per name per call; use [`Self::lookup_by_name`].
     ///
     /// # Errors
     ///
@@ -276,9 +221,7 @@ impl Tf2Buffer {
 
     /// Look up `T_target_source` at `stamp_ns` with pre-converted frame names.
     ///
-    /// The allocation-free hot path, and the only one a benchmark should use:
-    /// the C++ side receives the same `const char*` a native tf2 caller would
-    /// hand `lookupTransform`, so what is timed is tf2, not this bridge.
+    /// The allocation-free hot path; benchmarks should use only this.
     ///
     /// # Errors
     ///
@@ -315,8 +258,7 @@ impl Tf2Buffer {
 
     /// Whether tf2 believes the lookup would succeed. Never throws.
     ///
-    /// The differential uses this to compare only the queries *both* engines can
-    /// answer, so a tf2 cache-horizon miss is not scored as a disagreement.
+    /// The differential compares only queries both engines can answer.
     #[must_use]
     pub fn can_transform(&self, target: &str, source: &str, stamp_ns: i64) -> bool {
         let (Ok(t), Ok(s)) = (cstr(target), cstr(source)) else {
@@ -338,9 +280,8 @@ impl Tf2Buffer {
 
     /// The most recent failure message from the C++ side.
     fn last_error(&self) -> String {
-        // SAFETY: module invariant — `tft2_last_error` returns a NUL-terminated
-        // pointer into a `std::string` owned by the live handle. It is copied
-        // into an owned `String` before any further call can invalidate it.
+        // SAFETY: module invariant — a NUL-terminated pointer into the live handle's
+        // `std::string`, copied before any further call.
         unsafe {
             let p: *const c_char = ffi::tft2_last_error(self.handle);
             if p.is_null() {
@@ -361,14 +302,8 @@ impl Drop for Tf2Buffer {
 
 /// A frame name prepared **once** for the FFI boundary, as a C++ `std::string`.
 ///
-/// `BufferCore::lookupTransform` takes `const std::string&`. Passing it a
-/// `const char*` constructs a temporary on every call — measurably, about 20 ns
-/// for a target/source pair — which a benchmark would charge to tf2 rather than
-/// to this bridge. A native C++ caller holds its frame names as `std::string`
-/// and pays nothing per call; owning the `std::string` here lets the bridge make
-/// byte-for-byte the same call.
-///
-/// The underlying string is immutable after construction, hence `Send + Sync`.
+/// `lookupTransform` takes `const std::string&`; owning one avoids a per-call temporary.
+/// Immutable after construction, hence `Send + Sync`.
 #[derive(Debug)]
 pub struct FrameName {
     /// Owning pointer to a heap `std::string` from `tft2_name_new`.
@@ -377,11 +312,8 @@ pub struct FrameName {
     text: String,
 }
 
-// SAFETY: `cpp` points to a `std::string` that is written once at construction
-// and only ever read afterwards (`lookupTransform` takes it by const reference).
-// There is no interior mutability and no aliasing writer, so sharing a
-// `&FrameName` across threads — which the concurrent benchmark requires — is
-// sound, as is moving one.
+// SAFETY: `cpp` is written once at construction and only read afterwards; no interior
+// mutability, so moving and sharing are sound.
 unsafe impl Send for FrameName {}
 // SAFETY: see the `Send` impl above.
 unsafe impl Sync for FrameName {}
@@ -428,12 +360,8 @@ fn cstr(s: &str) -> Result<CString, Tf2Error> {
     CString::new(s).map_err(|_| Tf2Error::FrameNameHasNul(s.to_owned()))
 }
 
-/// Time the bridge's own overhead: everything [`Tf2Buffer::lookup_by_name`] does
-/// except the `BufferCore` call.
-///
-/// Lets a benchmark state how much of a reported tf2 latency is this crate
-/// rather than tf2 — the difference between an honest comparison and a
-/// flattering one.
+/// Everything [`Tf2Buffer::lookup_by_name`] does except the `BufferCore` call, so a benchmark
+/// can subtract the bridge's own overhead.
 ///
 /// # Errors
 ///
@@ -481,10 +409,8 @@ mod tests {
         ])
     }
 
-    /// The single most dangerous line in the shim is the quaternion
-    /// transposition: tf2 stores `w` last, `Iso3` stores it first, and getting it
-    /// wrong produces a *plausible* rotation rather than an obvious failure. A
-    /// single-edge round trip at an exact stamp must return the pose bit-for-bit.
+    /// tf2 stores `w` last, `Iso3` first; a wrong transposition gives a plausible rotation.
+    /// A single-edge round trip must return the pose bit-for-bit.
     #[test]
     fn quaternion_convention_round_trips_exactly() {
         let buf = Tf2Buffer::new(60.0).unwrap();
@@ -493,15 +419,12 @@ mod tests {
             let stamp = k as i64 * 1_000_000_000;
             buf.set_transform("map", "odom", stamp, &p, false).unwrap();
             let got = buf.lookup("map", "odom", stamp).unwrap();
-            // tf2 stores doubles verbatim, so an exact-stamp lookup of a
-            // single edge is a pure round trip through the two conventions.
             let (a, b) = (got.to_bits(), p.to_bits());
             assert_eq!(a, b, "round trip differs at k={k}: {got:?} vs {p:?}");
         }
     }
 
-    /// tf2 must interpolate between samples, not hold the previous one — this is
-    /// what makes it comparable to tf_tree's `LerpSlerp` policy at all.
+    /// tf2 must interpolate, not hold: that is what makes it comparable to `LerpSlerp`.
     #[test]
     fn interpolates_between_samples() {
         let buf = Tf2Buffer::new(60.0).unwrap();
@@ -521,8 +444,7 @@ mod tests {
         );
     }
 
-    /// A static transform answers at any stamp; that is the `/tf_static`
-    /// contract the bag replay depends on.
+    /// A static transform answers at any stamp (`/tf_static`).
     #[test]
     fn static_transforms_answer_at_any_stamp() {
         let buf = Tf2Buffer::new(10.0).unwrap();
@@ -535,8 +457,7 @@ mod tests {
         }
     }
 
-    /// Failures must arrive as errors carrying tf2's reason, never as an
-    /// exception crossing the FFI boundary.
+    /// Failures arrive as errors, never as an exception crossing FFI.
     #[test]
     fn failures_are_errors_not_unwinds() {
         let buf = Tf2Buffer::new(10.0).unwrap();
@@ -550,8 +471,7 @@ mod tests {
         );
     }
 
-    /// A composed chain must match manual composition, confirming tf2's frame
-    /// direction matches tf_tree's `T_parent_child` convention.
+    /// A composed chain matches manual composition (`T_parent_child` direction).
     #[test]
     fn chain_composition_matches_manual() {
         let buf = Tf2Buffer::new(60.0).unwrap();
@@ -567,18 +487,15 @@ mod tests {
         assert!(dt < 1e-12, "chain differs by {dt}: {got:?} vs {want:?}");
     }
 
-    /// One buffer, many reader threads — the sharing the concurrent benchmark
-    /// depends on, and the reason the shim's error slot is `thread_local`.
+    /// One buffer, many reader threads.
     #[test]
     fn buffer_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Tf2Buffer>();
     }
 
-    /// Concurrent readers against one shared buffer must all get the right
-    /// answer. `BufferCore` locks internally; this pins that we are allowed to
-    /// rely on it, and that a failing lookup on one thread cannot corrupt
-    /// another thread's error reporting.
+    /// Concurrent readers of one buffer all get the right answer; a failing lookup on one
+    /// thread cannot corrupt another's error.
     #[test]
     fn concurrent_readers_share_one_buffer() {
         let buf = Tf2Buffer::new(60.0).unwrap();
@@ -594,8 +511,6 @@ mod tests {
                     for _ in 0..2_000 {
                         let got = buf.lookup("map", "odom", 500_000_000).unwrap();
                         assert_eq!(got.to_bits(), p.to_bits(), "thread {t}");
-                        // Interleave a failing lookup: with a shared error slot
-                        // this would race; with thread_local it cannot.
                         assert!(buf.lookup("nope", "nah", 0).is_err());
                     }
                 });

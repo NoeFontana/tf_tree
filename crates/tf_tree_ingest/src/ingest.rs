@@ -1,113 +1,39 @@
 //! The two passes — `docs/PHASE5.md` §3.1, NORMATIVE.
 //!
-//! # Why there are two, and why it is not a performance question
+//! # Why two
 //!
-//! `TreeBuilder::build()` needs every frame, every edge kind and every ring
-//! capacity *before* it allocates, because the arena has fixed capacity and does
-//! not grow (`docs/PROJECT.md` §5 D4). A recording tells you none of that until
-//! you have read it. So pass one discovers the topology and the counts and pass
-//! two fills — not to be fast, but because one pass cannot be done at all.
-//! `docs/PHASE4.md` §5.8's amendment records the same constraint blocking the
-//! ROS bridge, from the other direction.
+//! `TreeBuilder::build()` needs every frame, edge kind and ring capacity before it
+//! allocates (`docs/PROJECT.md` §5 D4), and a recording tells you none of that
+//! until read. Pass one discovers topology and counts; pass two fills.
 //!
-//! # Where this diverges from the live bridge, deliberately
+//! # Divergence from the live bridge
 //!
-//! `tf_tree_bridge` is the ROS-independent decision half of the *online* path,
-//! and everything in it that is a pure decision is reused here — name
-//! normalization (§5.6), the static store (§5.7), the clock guard (§5.5) — so
-//! that a recording and a live system classify the same stream the same way.
+//! Pure decisions are reused from `tf_tree_bridge` — name normalization (§5.6),
+//! the static store (§5.7), the clock guard (§5.5) — so a recording and a live
+//! system classify a stream alike. **A backward stamp is dropped online and kept
+//! offline**: §3.1 sorts each edge before pushing, so the sample lands correctly.
 //!
-//! One rule is inverted, and it has to be: **a backward stamp is dropped online
-//! and kept offline.** Online, the ring cannot accept it — Phase 1 invariant 6
-//! makes a regressing push an error, and the sample is already unusable by the
-//! time the bridge sees it. Offline, §3.1 sorts each edge before pushing, so the
-//! same sample lands in the right place. Treating out-of-order as a drop here
-//! would discard exactly the samples §3.1's sort exists to recover, and a
-//! recording routinely has thousands of them.
+//! # The guard is per edge
 //!
-//! # And the guard is per **edge**, not per stream
+//! `/tf` interleaves publishers whose stamps differ by pipeline latency (hundreds
+//! of ms), so a guard over the merged stream reports a reset on an ordinary
+//! recording. One [`ClockGuard`] per edge matches §3.1's per-edge sort and Phase 1
+//! invariant 6, and still catches a real reset, where every edge regresses at once
+//! (`docs/decisions/0011`; `tf_tree_bridge` does the same).
 //!
-//! `/tf` carries every publisher on the robot interleaved into one stream, and
-//! they do not stamp at the same instant. A localization node stamps
-//! `map -> odom` at the scan it processed and publishes 200 ms later, while
-//! `odom -> base_link` is stamped as it is published. Both are correct; their
-//! stamps interleave by whatever the slower pipeline's latency is, which is
-//! hundreds of milliseconds and not the tens the 100 ms threshold assumes.
+//! The halves differ in promotion, not scope. **Offline, the first regressing edge
+//! halts**: the recording is closed and a human reads the answer. **Online, one
+//! witness never halts**: an authoritative time-source jump or a common-mode step
+//! across two or more publishers promotes; anything less is dropped and counted,
+//! because halting an unattended robot on one node's restart is an outage, and
+//! attribution must not be a correctness dependency (`docs/PHASE4.md` §5.3).
 //!
-//! A single guard over the merged stream therefore reports a *reset* — the whole
-//! ingest halting, at the default, on an ordinary recording — for something that
-//! is not a clock reset at all but two publishers. One guard per edge is the only
-//! monotonicity that means anything here anyway, because §3.1 sorts per edge and
-//! Phase 1 invariant 6 is a per-edge rule. It still catches what the check is
-//! for: a bag loop or a sim reset moves `/clock` itself, so **every** edge
-//! regresses at once and the first one to be observed halts.
+//! # The reference clock is not the one under test
 //!
-//! # The two halves agree about scope and diverge about promotion
-//!
-//! An earlier revision of the section above opened by contrasting this with the
-//! online bridge — *"the online bridge watches one clock, because it **is** one
-//! publisher"*. That was never true of `/tf`, which carries the same interleaved
-//! publishers live as it does in a recording, and
-//! `docs/decisions/0011` acted on it: `tf_tree_bridge` keeps one [`ClockGuard`]
-//! per edge too, for exactly the reasons above.
-//!
-//! What the two halves still differ about is deliberate, and it is not *scope*
-//! but **promotion** — what it takes to turn "this edge regressed" into "the
-//! clock moved":
-//!
-//! - **Offline, here, the first regressing edge halts.** A recording is a closed
-//!   artefact, either coherent or not, and a human is reading the answer.
-//!   Stopping to say *"`map -> odom` regresses at t"* costs a rerun and nothing
-//!   else, and the operator can look at the file.
-//! - **Online, one witness never halts, at any magnitude.** The bridge runs a
-//!   ladder: an authoritative jump reported by the time source itself, or a
-//!   *common-mode* step — two or more distinct publishers whose stamp-to-receipt
-//!   offsets moved inside the same window **by the same amount** — promotes to a
-//!   halt; anything less is dropped, counted and diagnosed. That bridge runs
-//!   unattended on a robot, where halting on one node's restart is an outage
-//!   caused by the diagnostic rather than by the fault, and nobody is there to
-//!   rerun anything.
-//!
-//! So the asymmetry is a difference in what a wrong answer costs, not a
-//! disagreement about what a clock reset is.
-//!
-//! **An earlier revision of this paragraph claimed the asymmetry closes** on a
-//! deployment that cannot supply a second publisher, because the online promotion
-//! rule was floored by what the topology declared. It no longer does, and the gap
-//! is wider than it was, on purpose: making a *diagnostic's* strength depend on
-//! attribution — which RMW implementations report unevenly — made attribution a
-//! correctness dependency, which `docs/PHASE4.md` §5.3 forbids outright. The
-//! online half now degrades to a drop when it cannot corroborate, so a single
-//! dynamic edge regressing there is *never* a halt, where here it always is.
-//! Nothing is lost by that: online, Phase 1 invariant 6 refuses the regressing
-//! sample anyway, so the arena is protected by the drop and the halt was only
-//! ever the *announcement*.
-//!
-//! # Both halves anchor on a clock that is not the one under test
-//!
-//! The rule the online redesign is built on is that a detector's reference clock
-//! must be independent of the signal it is judging — inferring "`/clock` was
-//! reset" from `/clock`-derived stamps alone is what produced three successive
-//! wrong rules. Online that reference is injected: a local **steady** clock read
-//! once per `TFMessage` and carried on every sample as `SteadyNanos`.
-//!
-//! **This half has had the same kind of reference all along**, and it is
-//! [`RawRecord::log_time_ns`] — when the recorder wrote the message, not when a
-//! publisher stamped it. Its own documentation states the reason in the same
-//! terms: §3.2's future-stamp check *"needs a reference clock that is not the
-//! header stamp, or the check is circular"*. It is the only reference a bag
-//! actually contains, and the two halves now use it for the same purpose rather
-//! than by coincidence:
-//!
-//! - the future-stamp anomaly is `stamp - log_time` against a horizon, which is
-//!   the same `stamp - received` quantity the online offset table smooths per
-//!   publisher; and
-//! - a reset is reported with **both** coordinates on
-//!   [`IngestError::ClockReset`], because after a rewind the stamp is the one
-//!   coordinate that no longer identifies a place in the file. `at_ns` occurs
-//!   twice in a looped recording; the log time occurs once, and it is what
-//!   `mcap` and `ros2 bag` cut on — which is what makes the message's own
-//!   advice, *split the recording*, an instruction rather than a suggestion.
+//! Offline, that reference is [`RawRecord::log_time_ns`], the recorder's clock.
+//! The future-stamp anomaly is `stamp - log_time` against a horizon, and
+//! [`IngestError::ClockReset`] reports both coordinates because after a rewind
+//! only the log time locates a place in the file.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -124,100 +50,49 @@ use crate::spill;
 use crate::{FrameId, IngestError};
 
 /// Bytes one buffered sample costs during pass two: an `i64` stamp beside the
-/// canonical `[f64; 7]` pose.
-///
-/// The pose is buffered in canonical order rather than as an [`Iso3`], and the
-/// reason it was written for has since gone away. It read: *"`Iso3` is
-/// `align(64)`, so a `(i64, Iso3)` pair occupies **128** bytes and would double
-/// the memory this module is trying to bound"* — true then, and
-/// [`0042`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0042-the-cacheline-the-arena-never-asked-for.md)
-/// dropped that alignment, so the pair is **64** bytes now and this constant
-/// would be right either way.
-///
-/// The buffer stays `[f64; 7]` regardless: it is the canonical order the push
-/// takes, so buffering it avoids a conversion per sample rather than a padding
-/// per sample. That this module had already paid to route *around* the
-/// alignment is part of why `0042` removed it.
+/// canonical `[f64; 7]` pose (the order the push takes, so no per-sample
+/// conversion).
 const SAMPLE_BYTES: u64 = 8 + 7 * 8;
 
 /// Default `--max-memory` (§3.1): 4 GiB.
 pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Default horizon past a message's own log time before its stamp counts as
-/// "far in the future" (§3.2): **10 seconds**.
-///
-/// Chosen against what a recorder actually produces: a message is written
-/// within milliseconds of being published, and a publisher stamping ahead by
-/// more than a few seconds is misconfigured rather than merely late. Below a
-/// second this would fire on ordinary sensor pipelines that stamp at capture
-/// and publish after processing.
+/// "far in the future" (§3.2): **10 seconds**. Below a second this fires on
+/// sensor pipelines that stamp at capture and publish after processing.
 pub const DEFAULT_FUTURE_HORIZON_NS: i64 = 10_000_000_000;
 
-/// Default ceiling on one chunk's declared `uncompressed_size`: **64 MiB**.
-///
-/// Chosen against what recorders write, not against what the format permits:
-/// rosbag2 and Foxglove chunk at 1–8 MiB, and `mcap`'s own writer defaults to
-/// 1 MiB. 64 MiB is an order of magnitude above any of them and two orders below
-/// a size that can exhaust a machine, which is the gap a bound wants to sit in.
+/// Default ceiling on one chunk's declared `uncompressed_size`: **64 MiB**,
+/// an order above what recorders write (1–8 MiB).
 pub const DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default ceiling on one chunk's `uncompressed_size / compressed_size`: **1024**.
 ///
-/// The absolute ceiling alone is not a bomb guard, because 64 MiB of output from
-/// 200 bytes of input fits under any ceiling generous enough for a real
-/// recording. Real MCAP chunks of CDR transforms compress at roughly 2–5×; zstd's
-/// theoretical maximum on a degenerate frame is far past this, so 1024 admits
-/// every plausible recording and refuses the shape whose only purpose is to
-/// allocate.
+/// The absolute ceiling alone is not a bomb guard; real CDR chunks compress at
+/// roughly 2–5×, so 1024 admits every plausible recording.
 pub const DEFAULT_MAX_CHUNK_EXPANSION_RATIO: u64 = 1024;
 
 /// Default ceiling on one top-level MCAP record's declared body length, in bytes.
 ///
-/// **256 MiB, unchanged from the private constant this replaces** — an order of
-/// magnitude above any real record, since a chunk is typically 1–8 MiB, so no
-/// existing caller's behaviour moves. What changed is that the person who meets
-/// it can now raise it. `source.rs` sized `body` against a `const` and
-/// `docs/decisions/0010`'s open question 1 asked whether it should be a knob;
-/// its own doc comment called the difference "a gap rather than a decision",
-/// which is what this closes.
-///
-/// **`0010`'s question 2 has since been measured** — 41 published SLAM recordings,
-/// largest single record 1.2 MiB and always a `Chunk`, zero attachments in any of
-/// them — so nothing in reach challenges the number. That measurement covers one
-/// converter's output and not "robotics recordings", which is why the knob exists.
-///
-/// **The sentence that used to end this comment is no longer true and is recorded
-/// rather than deleted.** It read: *"the reader has no opcode-based skip — it
-/// sizes and fills the body for every record before it looks at the opcode, so an
-/// oversized attachment aborts the whole ingest rather than being skipped past."*
-/// It does now: `source::read_tf` consults `source::reader_needs` first, steps over
-/// an oversized record it does not read, and counts it as
-/// [`Anomalies::oversized_records_skipped`]. A record the reader *does* need — a
-/// `Chunk`, `Schema`, `Channel` or `Message` — still refuses, because skipping one
-/// of those loses transforms silently.
-///
-/// **The skip is bounded by a length nothing validated**, so `source` checks that
-/// it lands on something shaped like a record boundary and refuses with
-/// `RecordTooLarge` when it does not. That check cannot see a length that lands on
-/// a *real* boundary, so the ceiling is no longer the corrupt-header detector it
-/// incidentally was for these opcodes; what replaces the guarantee is that neither
-/// the report row nor [`Anomalies::oversized_records_skipped`] claims the transform
-/// stream past a skip is intact.
+/// **256 MiB.** An oversized record the reader does not need is stepped over and
+/// counted in [`Anomalies::oversized_records_skipped`]; one it does need (`Chunk`,
+/// `Schema`, `Channel`, `Message`) refuses, since skipping loses transforms
+/// silently. The skip length is unvalidated, so `source` requires it to land on a
+/// plausible record boundary (else `RecordTooLarge`), and no report row claims the
+/// stream past a skip is intact (`docs/decisions/0010`).
 pub const DEFAULT_MAX_RECORD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// How ingest should handle a backward clock jump (§3.2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClockResetPolicy {
-    /// Stop, naming the timestamp. **The default here**, and it is the default
-    /// for a reason `tf_tree_bridge::clock::OnClockReset` states as well: an
-    /// index that silently merges two recordings' clocks answers every query
-    /// wrongly and says nothing about it.
+    /// Stop, naming the timestamp. The default, as in
+    /// `tf_tree_bridge::clock::OnClockReset`: silently merged clocks answer every
+    /// query wrongly.
     #[default]
     Halt,
-    /// §3.2's `split`, which is **not implemented** — see
-    /// [`IngestError::ClockResetSplitUnsupported`]. It is spelled out as a
-    /// variant rather than omitted so the CLI can refuse it with the reason
-    /// instead of rejecting an argument the specification lists.
+    /// §3.2's `split`, **not implemented** — see
+    /// [`IngestError::ClockResetSplitUnsupported`]. A variant so the CLI can refuse
+    /// it with the reason.
     Split,
 }
 
@@ -233,8 +108,7 @@ pub struct IngestOptions {
     /// What to do about a chunk that does not decompress or does not check out.
     pub on_bad_chunk: OnBadChunk,
     /// How far backwards a stamp must jump to count as a reset rather than
-    /// ordinary interleaving. Defaults to the bridge's own threshold, so a
-    /// recording and a live system draw the line in the same place.
+    /// ordinary interleaving. Defaults to the bridge's own threshold.
     pub clock_reset_threshold_ns: i64,
     /// How far ahead of its log time a stamp may be before it is reported.
     pub future_horizon_ns: i64,
@@ -242,46 +116,24 @@ pub struct IngestOptions {
     pub tf_prefix: Option<String>,
     /// Ceiling on one chunk's declared `uncompressed_size`, in bytes.
     ///
-    /// **A knob and not a constant, because the person who meets a limit is the
-    /// person who cannot patch the crate.** A recording written with 128 MiB
-    /// chunks is unusual and is not corrupt; a reader that refuses it with no
-    /// number to raise is a reader that has to be forked. Defaults to
-    /// [`DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES`].
-    ///
-    /// It bounds the compressed path only. The uncompressed path returns the
-    /// records **by borrow** and allocates nothing, so there is no allocation for
-    /// a ceiling to bound — see `crate::decompress::chunk_records`.
+    /// Defaults to [`DEFAULT_MAX_CHUNK_UNCOMPRESSED_BYTES`]. Bounds the compressed
+    /// path only; the uncompressed path borrows and allocates nothing
+    /// (`crate::decompress::chunk_records`).
     pub max_chunk_uncompressed_bytes: u64,
     /// Ceiling on one top-level record's declared body length, in bytes.
-    /// Defaults to [`DEFAULT_MAX_RECORD_BYTES`].
-    ///
-    /// **A knob for the same reason [`max_chunk_uncompressed_bytes`] is one:
-    /// the person who meets a limit is the person who cannot patch the crate.**
-    /// This bounds the allocation the reader makes from a length read straight
-    /// off disk, before anything has validated it — so it is a guard against a
-    /// corrupt or hostile file, not a statement about what a legitimate
-    /// recording may contain. A recording with a 400 MiB attachment is unusual
-    /// and is not corrupt.
-    ///
-    /// It is unrelated to [`max_chunk_uncompressed_bytes`], which bounds a
-    /// *decompressed chunk*: the two buffers are sized by different numbers and
-    /// the reader's resident cost is their sum, not twice either.
-    ///
-    /// [`max_chunk_uncompressed_bytes`]: IngestOptions::max_chunk_uncompressed_bytes
+    /// Defaults to [`DEFAULT_MAX_RECORD_BYTES`]. Guards the allocation made from a
+    /// length read off disk; independent of `max_chunk_uncompressed_bytes`, which
+    /// bounds a decompressed chunk.
     pub max_record_bytes: u64,
     /// Ceiling on one chunk's `uncompressed_size / compressed_size` — the second
     /// half of the decompression-bomb guard. Defaults to
-    /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`], whose doc says why the absolute
-    /// ceiling cannot do the job alone.
+    /// [`DEFAULT_MAX_CHUNK_EXPANSION_RATIO`].
     pub max_chunk_expansion_ratio: u64,
     /// Where §3.1's spill file goes when one edge alone exceeds
     /// [`max_memory_bytes`](IngestOptions::max_memory_bytes). `None` means
     /// `std::env::temp_dir()`.
     ///
-    /// A knob rather than a hardcoded `/tmp` because the user this exists for —
-    /// §3.1's "4-hour recording", tens of gigabytes on one edge — is exactly the
-    /// user whose `/tmp` is a small tmpfs *in RAM*, where spilling would defeat
-    /// the cap it is enforcing.
+    /// A knob because `/tmp` may be a RAM tmpfs, defeating the cap.
     pub spill_dir: Option<PathBuf>,
 }
 
@@ -305,11 +157,6 @@ impl Default for IngestOptions {
 
 impl IngestOptions {
     /// The two chunk bounds as the reader wants them.
-    ///
-    /// A method rather than a field holding a [`ChunkLimits`], because the options
-    /// are a flat struct every caller builds with `..Default::default()` and a
-    /// nested struct would make the two numbers reachable two ways. This is the
-    /// join, done once.
     #[must_use]
     pub fn chunk_limits(&self) -> ChunkLimits {
         ChunkLimits {
@@ -329,13 +176,8 @@ impl IngestOptions {
     }
 }
 
-/// The interned frame names, owned by the caller so that a failed pass still
-/// has names to put in its error message.
-///
-/// This is why [`survey`] takes `&mut Frames` rather than returning them inside
-/// the `Survey`: [`IngestError`] is `Copy` and `String`-free like every other
-/// error in this workspace (`docs/PROJECT.md` §5), so it names the offending
-/// edge by index — and an index is only useful next to the table it indexes.
+/// The interned frame names, owned by the caller so a failed pass still has names
+/// for its error (`IngestError` names edges by index; `docs/PROJECT.md` §5).
 #[derive(Clone, Debug, Default)]
 pub struct Frames {
     names: Vec<String>,
@@ -356,9 +198,8 @@ impl Frames {
 
     /// The index of an already-interned name, or `None`.
     ///
-    /// The read-only half of [`intern`](Frames::intern), for pass two: pass one
-    /// interned every name the recording contains, so a miss here means the
-    /// transform was dropped in pass one and has no buffer to go in.
+    /// Read-only half of [`intern`](Frames::intern); a miss in pass two means the
+    /// transform was dropped in pass one.
     #[must_use]
     pub fn id(&self, name: &str) -> Option<FrameId> {
         self.index.get(name).copied().map(FrameId)
@@ -402,8 +243,7 @@ pub struct EdgeSurvey {
     pub static_pose: Option<[f64; 7]>,
     /// Dynamic samples that survived pass one's drops.
     pub samples: u64,
-    /// Oldest surviving stamp — the **true** oldest in the source, which is what
-    /// §2.3's amendment says the manifest's `oldest_ns` is not.
+    /// Oldest surviving stamp — the true oldest in the source (§2.3's amendment).
     pub source_oldest_ns: Option<i64>,
     /// Newest stamp in the source.
     pub source_newest_ns: Option<i64>,
@@ -420,53 +260,31 @@ impl EdgeSurvey {
 /// One `/tf_static` contradiction, with **both** values (§3.2 — "report both
 /// values"; `docs/PHASE4.md` §5.7).
 ///
-/// # Why a count was not enough
-///
-/// [`Anomalies::static_conflicts`] says *that* a contradiction happened. §3.2's
-/// row asks for something else: two `robot_state_publisher` instances with
-/// different URDFs is the misconfiguration this row exists for, and the operator's
-/// question is *which URDF is installed* — which only the two poses answer. A bare
-/// count sends them to diff two files that the report never named.
-///
-/// **Not in [`Anomalies`], for a reason the type system enforces**: `Anomalies`
-/// derives `Eq`, and a `[f64; 7]` does not implement it. It lives on [`Survey`]
-/// beside the counts rather than inside them.
-///
-/// # One row per edge, not one per message
-///
-/// `/tf_static` is latched, so a contradicting publisher re-delivers to every late
-/// joiner and the same two values arrive many times. `StaticStore` already
-/// rate-limits by identity (`StaticVerdict::Conflict::first_time`), and only the
-/// first occurrence is recorded here — so this vector is bounded by the number of
-/// edges, while the count keeps counting every message.
+/// On [`Survey`], not [`Anomalies`], because `Anomalies` derives `Eq` and
+/// `[f64; 7]` has none. One row per edge: only the first occurrence
+/// (`StaticVerdict::Conflict::first_time`) is recorded, while
+/// [`Anomalies::static_conflicts`] counts every message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StaticConflict {
     /// Parent frame of the contradicted edge.
     pub parent: FrameId,
     /// Child frame of the contradicted edge.
     pub child: FrameId,
-    /// The value on file — the one that wins, under the first-writer authority
-    /// policy this crate applies.
+    /// The value on file — the winner under the first-writer policy.
     pub existing: [f64; 7],
     /// The value that was offered and refused.
     pub offered: [f64; 7],
     /// Which topic declared [`existing`](StaticConflict::existing).
     ///
-    /// **A topic and not a node name**, because a recording has neither a GID nor
-    /// a graph: `Publisher::Topic` is what the offline half of
-    /// `tf_tree_bridge::statics` is given, and its own documentation says a topic
-    /// is a stable identity for the length of a recording. Two publishers on one
-    /// topic are therefore indistinguishable here, and the two *values* are what
-    /// separate them.
+    /// A topic, not a node name: a recording has no GID or graph
+    /// (`Publisher::Topic`), so two publishers on one topic are told apart only by
+    /// their values.
     pub declared_by: String,
     /// Which topic offered [`offered`](StaticConflict::offered).
     pub contradicted_by: String,
 }
 
-/// Everything §3.2 asks to be counted and reported.
-///
-/// Every field is a count of something that happens in real recordings; none of
-/// them is an error on its own.
+/// Everything §3.2 asks to be counted and reported; none is an error on its own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Anomalies {
     /// Samples with `stamp == 0`, dropped (§3.2 — "extremely common").
@@ -482,14 +300,8 @@ pub struct Anomalies {
     pub clock_resets: u64,
     /// Where the first one was **in stamp space**, if any.
     ///
-    /// **Structurally always `None` today, and deliberately left that way here.**
-    /// Both [`ClockResetPolicy`] arms return an error on the first reset, so this
-    /// is written and then discarded with the rest of the [`Survey`]; the
-    /// coordinates a caller can actually read are the ones on
-    /// [`IngestError::ClockReset`], which is why the log-time coordinate was
-    /// added *there* and not given a dead twin beside this. It stays as the
-    /// field a non-halting policy would fill (§3.2's unimplemented `split`)
-    /// rather than being removed and re-added.
+    /// Never observable today: both [`ClockResetPolicy`] arms error on the first
+    /// reset, so read [`IngestError::ClockReset`]. Reserved for `split`.
     pub first_reset_at_ns: Option<i64>,
     /// `/tf_static` samples offering a different value for an already-declared
     /// static edge (§5.7's tolerance).
@@ -502,79 +314,39 @@ pub struct Anomalies {
     /// Transforms whose parent or child name was empty, dropped.
     pub empty_names: u64,
     /// **Channels** carrying the TF schema that the operator's own
-    /// `--tf-topic`/`--tf-static-topic` narrowing excluded — one per channel id,
-    /// not one per message.
-    ///
-    /// **Nothing is wrong with the recording when this is non-zero**, which is
-    /// why it is its own number. Until 2026-09-06 it was the *sum* of this and
-    /// [`Self::non_cdr_channels`], documented as "messages on a TF channel this
-    /// build could not decode" and rendered into the JSON under the key
-    /// `undecodable_channels` — so a consumer pinning the schema read an
-    /// operator's own `--tf-topic` as a broken publisher, and the field doc was
-    /// wrong about the unit as well as about the cause.
+    /// `--tf-topic`/`--tf-static-topic` narrowing excluded — one per channel id.
+    /// Nothing is wrong with the recording when this is non-zero.
     pub filtered_channels: u64,
     /// **Channels** carrying the TF schema whose encoding this build cannot
     /// decode — a `json` or `protobuf` channel under the TF schema name. One per
-    /// channel id.
-    ///
-    /// Separate from [`Self::filtered_channels`] because the two have different
-    /// remedies — nothing, against `--tf-topic` — exactly as
-    /// [`Self::chunks_over_limit`] is separate from [`Self::bad_chunks`].
+    /// channel id; separate from [`Self::filtered_channels`] (different remedies).
     pub non_cdr_channels: u64,
-    /// The recording stopped mid-record: everything before the cut was read.
-    ///
-    /// Not a count, because it is not a quantity — the recording either ends
-    /// where it says it does or it does not. It is in `Anomalies` rather than
-    /// beside it because §3.2's report is where a user finds out, and finding
-    /// out matters: every number in this report is then a number about a
-    /// *prefix* of the run they recorded.
+    /// The recording stopped mid-record: everything before the cut was read, so
+    /// every number in the report describes a prefix.
     pub truncated: bool,
     /// Top-level records the reader does not need that were larger than
     /// `--max-record-size`, and were stepped over rather than refusing the file.
     ///
-    /// **An attachment is a top-level record**, so a recording carrying a
-    /// calibration dump or a bag of images larger than the ceiling used to abort an
-    /// ingest whose transforms were entirely intact. `source::reader_needs` is the
-    /// line: a `Chunk`, `Schema`, `Channel` or `Message` over the ceiling still
-    /// refuses with [`crate::IngestError::RecordTooLarge`], because skipping one of
-    /// those loses transforms and reads exactly like a recording that never had
-    /// them.
+    /// `source::reader_needs` is the line: a `Chunk`, `Schema`, `Channel` or
+    /// `Message` over the ceiling still refuses with
+    /// [`crate::IngestError::RecordTooLarge`].
     ///
-    /// Reported rather than silent for the reason every other row here is: the
-    /// skipped record is data this run declined to look at, and `--max-record-size`
-    /// is the flag that would have read it.
-    ///
-    /// **It says nothing about what the record was, or about the records after
-    /// it.** The reader steps over the length on disk without parsing anything, so
-    /// "an attachment" is the motivating case and never a finding; and a corrupt
-    /// length that lands on a later record boundary takes everything in between
-    /// with it while every check `source` can make still passes. The report row
-    /// used to end "no transform was lost" and that is withdrawn — the count is a
-    /// statement that this run declined to look, not that there was nothing there.
+    /// It says nothing about what the record was or about records after it: the
+    /// reader steps over the on-disk length unparsed, and a corrupt length landing
+    /// on a later boundary passes every check. It means this run declined to look.
     pub oversized_records_skipped: u64,
     /// Chunks that were unreadable and skipped (`OnBadChunk::Skip`).
     ///
-    /// Reported next to [`truncated`](Anomalies::truncated), and for the same
-    /// reason: both mean the counts below cover only part of the recording. A
-    /// skipped chunk also takes its `Schema` and `Channel` records with it, so a
-    /// later message on a channel that was only ever declared there is dropped
-    /// with no counter of its own — which is why this row is not merely a tally.
-    ///
-    /// **Truncation does not count here.** A cut chunk's last record necessarily
-    /// runs past the end of the file; calling that corruption would tell an
-    /// operator their recording is damaged when it is only incomplete.
+    /// Like [`truncated`](Anomalies::truncated), the counts cover only part of the
+    /// recording. A skipped chunk takes its `Schema` and `Channel` records with it,
+    /// so later messages on a channel declared only there drop uncounted.
+    /// Truncation does not count here.
     pub bad_chunks: u64,
     /// Of [`bad_chunks`](Anomalies::bad_chunks), how many were refused by one of
-    /// this reader's limits rather than found damaged.
-    ///
-    /// Reported separately because the remedy differs and only this one has a
-    /// remedy at all: a flag. See [`crate::IngestError::AllChunksOverLimit`], which
-    /// is what the same condition becomes when it takes *every* chunk.
+    /// this reader's limits rather than found damaged; the remedy is a flag. See
+    /// [`crate::IngestError::AllChunksOverLimit`].
     pub chunks_over_limit: u64,
     /// The span the skipped chunks covered, from their own declared message times.
-    ///
-    /// "Three chunks were unreadable" is not actionable; "the transforms between
-    /// 14:22:07 and 14:22:19 are missing" is.
     pub bad_chunk_span_ns: Option<(u64, u64)>,
 }
 
@@ -585,17 +357,9 @@ pub struct Survey {
     pub edges: Vec<EdgeSurvey>,
     /// What was odd about the recording.
     pub anomalies: Anomalies,
-    /// §3.2's "report both values": one row per contradicted static edge.
-    ///
-    /// Carries what [`Anomalies::static_conflicts`] cannot — see
-    /// [`StaticConflict`] for why it is here and not there.
-    ///
-    /// **`_details` because the count next door is already `static_conflicts`.**
-    /// This field shipped under that same name for a day, which put a `u64` at
-    /// `survey.anomalies.static_conflicts` and a `Vec` at
-    /// `survey.static_conflicts` — and, in the JSON, one key meaning two things
-    /// at two nesting depths, so a consumer grepping for it got a number or an
-    /// array depending on where it looked.
+    /// §3.2's "report both values": one row per contradicted static edge. Named
+    /// `_details` so the JSON key differs from the count
+    /// [`Anomalies::static_conflicts`].
     pub static_conflict_details: Vec<StaticConflict>,
     /// Transforms read, before any drop.
     pub transforms_read: u64,
@@ -604,10 +368,8 @@ pub struct Survey {
 }
 
 impl Survey {
-    /// Dynamic edges that ended pass one with no samples at all — §3.2's
-    /// "frame declared, never published", in the only form a recording can show
-    /// it: the edge is in the topology because something announced it, and every
-    /// sample it carried was dropped.
+    /// Dynamic edges that ended pass one with no samples — §3.2's "frame declared,
+    /// never published": every sample it carried was dropped.
     #[must_use]
     pub fn edges_without_samples(&self) -> Vec<usize> {
         self.edges
@@ -648,17 +410,10 @@ pub fn survey(
         None => NameNormalizer::new(),
     };
     let mut statics = StaticStore::new();
-    // One guard per edge — see the module docs. `clocks[i]` belongs to
-    // `out.edges[i]`; the two vectors are grown together and never separately.
+    // One guard per edge; `clocks[i]` and `dynamic_seen[i]` grow with `out.edges[i]`.
     let mut clocks: Vec<ClockGuard> = Vec::new();
-    // **The dynamic half of the edge-kind check, as one bit per slot.**
-    //
-    // `StaticStore` can answer "has this edge been seen as dynamic?", but only by
-    // name: `observe_dynamic` is two `BTreeMap<String, _>` descents, and asking it
-    // per transform costs ~ten `str` comparisons to re-derive something the slot
-    // lookup above already resolved. The static direction is read straight off
-    // `out.edges[slot].static_pose`; this vector is the other direction, and it is
-    // grown with `clocks` and `out.edges`, never separately.
+    // Dynamic half of the edge-kind check, one bit per slot: asking `StaticStore`
+    // by name per transform re-derives what the slot lookup already resolved.
     let mut dynamic_seen: Vec<bool> = Vec::new();
     let mut index: BTreeMap<EdgeKey, usize> = BTreeMap::new();
     let mut out = Survey {
@@ -689,9 +444,7 @@ pub fn survey(
                     source_newest_ns: None,
                 });
                 clocks.push(ClockGuard::with_threshold(
-                    // The guard's own policy is not consulted: this crate applies
-                    // `ClockResetPolicy` itself, because `split` has no online
-                    // counterpart to borrow a meaning from.
+                    // The guard's own policy is unused; `ClockResetPolicy` applies.
                     OnClockReset::Halt,
                     opts.clock_reset_threshold_ns,
                 ));
@@ -703,13 +456,7 @@ pub fn survey(
         };
 
         if rec.is_static {
-            // **The dynamic-then-static direction, checked here rather than by
-            // `StaticStore`.** It used to fall out of `observe_static`'s
-            // `KindChanged` arm, which fires on the `Dynamic` kind that
-            // `observe_dynamic` inserted — and that call is gone from the dynamic
-            // branch below, because it re-probed by name what the slot already
-            // knows. So the bit is kept here instead. The arm below stays as a
-            // match arm; it is simply no longer the thing that catches this.
+            // Dynamic-then-static is caught by `dynamic_seen`, not `StaticStore`.
             if dynamic_seen[slot] {
                 return Err(IngestError::EdgeKindChanged {
                     parent,
@@ -717,9 +464,8 @@ pub fn survey(
                     stamp_ns: rec.stamp_ns,
                 });
             }
-            // §5.7's order, which `docs/PHASE4.md` §0.0 records getting wrong
-            // once: compare values *first*, and report both, before any policy
-            // decides which one survives.
+            // §5.7's order: compare values first and report both, before any policy
+            // picks a survivor.
             match statics.observe_static(
                 frames.name(parent),
                 frames.name(child),
@@ -736,10 +482,7 @@ pub fn survey(
                     first_time,
                 } => {
                     out.anomalies.static_conflicts += 1;
-                    // **And both values are kept, which the count cannot carry**
-                    // (§3.2 "report both values", §5.7). `first_time` is
-                    // `StaticStore`'s own rate limit; see `StaticConflict` for why
-                    // both the pair and the filter are needed.
+                    // `first_time` is `StaticStore`'s own rate limit.
                     if first_time {
                         out.static_conflict_details.push(StaticConflict {
                             parent,
@@ -759,18 +502,14 @@ pub fn survey(
                     })
                 }
             }
-            // **A static's stamp never touches the clock** (`docs/PHASE4.md`
-            // §5.5's third ordering note): `robot_state_publisher` stamps
-            // statics with zero, and feeding that to the reset detector drags
-            // the high-water mark to the epoch and halts on a correct robot.
+            // A static's stamp never touches the clock (`docs/PHASE4.md` §5.5):
+            // statics are stamped zero, which would drag the high-water mark to
+            // the epoch.
             return Ok(());
         }
 
-        // **The edge kind is a property of the slot the lookup above already
-        // resolved**, so it is read from there rather than re-probed by name (see
-        // `dynamic_seen`). `static_pose` is `Some` exactly when the store holds
-        // `Static` for this edge: `observe_static` inserts `Static` only on its
-        // `Declare` path, and `Declare` is the only arm that sets `static_pose`.
+        // `static_pose` is `Some` exactly when the store holds `Static` for this
+        // edge (only `Declare` sets both).
         if out.edges[slot].static_pose.is_some() {
             return Err(IngestError::EdgeKindChanged {
                 parent,
@@ -784,9 +523,7 @@ pub fn survey(
             out.anomalies.zero_stamp_drops += 1;
             return Ok(());
         }
-        // `stamp - log_time`: the recorder's clock is the reference, because the
-        // header stamp cannot check itself — see the module docs' section on the
-        // reference clock. It is the reason `log_time_ns` exists on `RawRecord`.
+        // The recorder's clock is the reference; the header stamp cannot check itself.
         let ahead = rec.stamp_ns.saturating_sub(rec.log_time_ns);
         if ahead > opts.future_horizon_ns {
             out.anomalies.future_stamps += 1;
@@ -794,7 +531,7 @@ pub fn survey(
         }
         match clocks[slot].observe(rec.stamp_ns) {
             ClockVerdict::Forward => {}
-            // Kept, unlike online. See the module docs.
+            // Kept, unlike online (module docs).
             ClockVerdict::Jitter { .. } => out.anomalies.out_of_order += 1,
             ClockVerdict::Reset { by_nanos, .. } => {
                 out.anomalies.clock_resets += 1;
@@ -829,10 +566,6 @@ pub fn survey(
         Ok(())
     })?;
 
-    // **Two fields, and the summary's single line is the sum of them.** The two
-    // are skipped for different reasons, so that one "channels were skipped" line
-    // has to account for either or it under-reports silently — that argument
-    // lives in `IngestReport::summary`.
     out.anomalies.filtered_channels = skips.filtered_channels;
     out.anomalies.non_cdr_channels = skips.non_cdr;
     out.anomalies.truncated = skips.truncated;
@@ -843,19 +576,8 @@ pub fn survey(
     out.anomalies.stripped_slash_names = normalizer.stripped_count();
     out.remaps = normalizer.remaps().to_vec();
     if out.edges.is_empty() {
-        // **Which of the two "nothing here" cases this is, is the whole value of
-        // the message.** Reading is record-granular, even inside a chunk (see
-        // `source::read_tf`), so a recording cut before its first complete *record*
-        // yields zero transforms for a reason that has nothing to do with what was
-        // published — and `NoTransforms` would send the user looking for a publisher
-        // instead of at their file.
-        //
-        // **The limit case is tested first, ahead of truncation.** It is the only
-        // one of the three with a remedy the operator can act on — a flag — and a
-        // recording can be both truncated and written with chunks over the ceiling,
-        // in which case naming the knob is strictly more useful than naming the cut.
-        // `Anomalies::truncated` still says the file is a prefix, so nothing is lost
-        // by ordering it second.
+        // Limit case first: it is the only one with an actionable remedy (a flag);
+        // `Anomalies::truncated` still says the file is a prefix.
         return Err(if out.anomalies.chunks_over_limit > 0 {
             IngestError::AllChunksOverLimit {
                 skipped: out.anomalies.chunks_over_limit,
@@ -869,13 +591,8 @@ pub fn survey(
     Ok(out)
 }
 
-/// How a [`Publisher`] is named in a report.
-///
-/// Offline there is exactly one shape — `Publisher::Topic`, because a recording
-/// carries no GID and no graph — but the enum is the bridge's and has four
-/// variants, so this matches rather than assuming. Every other variant renders as
-/// its `Debug` form, which is honest about being a shape this path does not
-/// produce instead of silently printing an empty string.
+/// How a [`Publisher`] is named in a report. Offline only `Publisher::Topic`
+/// occurs; other variants render as `Debug`.
 fn publisher_label(p: &Publisher) -> String {
     match p {
         Publisher::Topic(t) => t.clone(),
@@ -901,43 +618,24 @@ pub struct FillStats {
     /// How many times the recording had to be re-read to stay under
     /// `--max-memory`. `1` is the ordinary case.
     pub passes: u32,
-    /// Peak bytes of buffered **samples** across those passes — the sort
-    /// buffers, **the stable sort's own scratch**, the spill path's merge
-    /// windows and its encode/decode staging. This is the number `--max-memory`
-    /// bounds.
-    ///
-    /// The scratch term is an upper bound (one full extra copy of the buffer
-    /// being sorted) rather than a measurement of what the standard library
-    /// allocated, because that is not a contract. It is the same bound
-    /// `plan_groups` packs against, so the reported number and
-    /// the enforced one cannot drift. Until 2026-09-06 the term was in neither:
-    /// this field was computed from `buf.len() * SAMPLE_BYTES` before the sort
-    /// ran, so it read exactly the cap on runs that used 1.95× of it.
+    /// Peak bytes of buffered **samples** across those passes — the sort buffers,
+    /// the stable sort's own scratch (an upper bound: one extra copy of the buffer
+    /// sorted, the bound `plan_groups` packs against), the spill path's merge
+    /// windows and staging. This is the number `--max-memory` bounds.
     pub peak_buffer_bytes: u64,
-    /// Peak bytes of the spill path's *run index* — sixteen bytes per sorted
-    /// run, live for as long as the file that holds them. `0` unless an edge
-    /// spilled.
-    ///
-    /// Its own field, and not folded into
-    /// [`peak_buffer_bytes`](FillStats::peak_buffer_bytes), because
-    /// `--max-memory` does **not** bound it: the run count is
-    /// `samples / (cap / 64)`, so the index crosses the cap itself at roughly
-    /// `cap² / 2048` samples — 512 samples at a 1 KiB cap, and past any real
-    /// recording at the 4 GiB default. Adding it to the capped number would make
-    /// that number a lie; leaving it unreported would make the report one.
+    /// Peak bytes of the spill path's *run index* — sixteen bytes per sorted run.
+    /// `0` unless an edge spilled. Not bounded by `--max-memory` (it crosses the
+    /// cap near `cap² / 2048` samples), so kept apart from
+    /// [`peak_buffer_bytes`](FillStats::peak_buffer_bytes).
     pub peak_run_index_bytes: u64,
     /// Samples pushed into the arena.
     pub pushed: u64,
     /// Duplicate `(edge, stamp)` pairs collapsed, last-wins.
     pub duplicates: u64,
     /// Sorted runs written to a temporary spill file (§3.1), summed over every
-    /// edge that needed one **and every reduce pass** — so it can exceed the
-    /// number of runs that existed at any one instant. `0` is the ordinary case.
+    /// edge and every reduce pass. `0` is the ordinary case.
     pub spilled_runs: u32,
-    /// Bytes written to those files. Disk, not memory — it is reported separately
-    /// from [`peak_buffer_bytes`](FillStats::peak_buffer_bytes) because
-    /// `--max-memory` does not bound it and conflating the two is how a cap
-    /// starts meaning nothing.
+    /// Bytes written to those files. Disk, not memory; not bounded by `--max-memory`.
     pub spilled_bytes: u64,
 }
 
@@ -945,62 +643,26 @@ pub struct FillStats {
 ///
 /// Groups by edge, sorts by stamp within each edge, then pushes in order.
 ///
-/// # What `--max-memory` bounds, and what it does not
+/// # What `--max-memory` bounds
 ///
-/// **It bounds the sort buffers, not the process.** Saying otherwise would be
-/// the more flattering claim and it is false, so it is worth being exact about
-/// which half is capped:
+/// It bounds the sort buffers, not the process:
 ///
 /// | Allocation | Size | Bounded by `--max-memory`? |
 /// |---|---|---|
 /// | The arena, from `builder.build()` | 78 B per sample, measured | **No** |
 /// | Pass two's sort buffers | `SAMPLE_BYTES` = 64 B per sample | Yes |
-/// | The **stable sort's own scratch** | up to another 64 B per sample of the largest buffer in the group | Yes, since 2026-09-06 — see `plan_groups` |
+/// | The **stable sort's own scratch** | up to another 64 B per sample of the largest buffer in the group | Yes — see `plan_groups` |
 /// | The spill path's run index | 16 B per sorted run | **No** — reported as [`FillStats::peak_run_index_bytes`] |
 ///
-/// The third row is the one that was missing, and it was missing from the
-/// *budget* as well as from this table — `plan_groups`'s reserve section has the
-/// mechanism. The cap was overrun by up to 1.95× — measured, with a counting
-/// allocator, at every cap including the 4 GiB default. `plan_groups` reserves
-/// for it now and [`FillStats::peak_buffer_bytes`] reports it; the cost is that
-/// a group holds one edge fewer, and that an edge over half the cap takes the
-/// spill path.
+/// The arena is the output and cannot be capped (`docs/PROJECT.md` §5 D4;
+/// `Capacity::slots` rounds each ring up to a power of two); budget for it
+/// separately. The cap removes the *second* copy: `tests/memory.rs` measures
+/// **164 B/sample** peak in one pass against **121 B/sample** at a 4 MiB cap, for
+/// two extra sequential re-reads.
 ///
-/// The arena is not capped because it *cannot* be: it is the output. Every
-/// sample the recording contains has to be resident in it for the index to
-/// answer, the arena has fixed capacity and does not grow
-/// (`docs/PROJECT.md` §5 D4), and `Capacity::slots` rounds each ring up to a
-/// power of two on top of that. A user sizing a machine for a large recording
-/// must budget for the arena separately, and there is no flag that changes it —
-/// only fewer samples would.
-///
-/// What the cap removes is the *second* copy. Buffering the whole recording
-/// before sorting costs another 64 B per sample on top of the arena, plus the
-/// sort's scratch for the largest edge; splitting into groups replaces that with
-/// the cap. Measured here on a 90 000-sample, three-edge fixture
-/// (`tests/memory.rs`): 7 096 704 B of arena either way, and a peak of
-/// **164 B/sample** in one pass against **121 B/sample** at a 4 MiB cap. The
-/// saving is bounded by how finely the edges divide — three equal edges are one
-/// per group under the reserve, so this is close to the worst case — and it is
-/// paid for with two extra sequential re-reads. That is the trade §3.1 asks for,
-/// reached without a temporary run file.
-///
-/// **The 164 was 142 until the sort's scratch was counted**, and the capped 121
-/// did not move: two buffers of 1 920 000 B is the same peak as one buffer plus
-/// its own scratch. The uncapped figure is also where "the arena is the larger
-/// of the two" stops holding on *this* fixture — 85.3 B/sample of buffer against
-/// 78.9 of arena — because the scratch is a per-group term rather than a
-/// per-sample one and is largest exactly when the edges are few and equal. The
-/// per-sample rates in the table above are unchanged.
-///
-/// Grouping's smallest unit is an edge, so it cannot serve a **single** edge
-/// whose samples exceed the cap on their own — at the default 4 GiB, 67 million
-/// samples on one edge. That case, and only that case, takes §3.1's other route:
-/// `crate::spill` sorts the edge in cap-sized runs, writes them to one
-/// temporary file, and k-way merges them back. It is second choice rather than
-/// the general mechanism because a run file is a thing that can leak, fill a
-/// different filesystem, or outlive the process; re-reading the recording is
-/// none of those.
+/// A **single** edge over the cap on its own takes §3.1's other route:
+/// `crate::spill` sorts it in cap-sized runs in one temporary file and k-way
+/// merges them. Second choice because a run file can leak or fill a filesystem.
 ///
 /// # Errors
 ///
@@ -1014,20 +676,9 @@ pub fn fill(
     frames: &Frames,
 ) -> Result<(Tree, FillStats), IngestError> {
     let mut builder = TreeBuilder::new();
-    // **Declaration order is canonical, not first-seen, and §11 is the reason.**
-    //
-    // §11 requires that shuffling a recording's messages produce a byte-identical
-    // `.tft`. Declaring frames and edges as they are first encountered cannot
-    // satisfy that: `FrameId` and `EdgeId` are assigned in declaration order, so
-    // two ingests of the same transforms in a different order produce arenas
-    // whose ids — and therefore whose ring offsets, whose topology block and
-    // whose `LookupError::Extrapolation { edge }` — disagree. The values were
-    // identical; the identities were not, and the shuffle test caught exactly
-    // that.
-    //
-    // Sorting by name makes the arena a pure function of the *content* of the
-    // recording. It also makes the ingest report diffable between runs, which is
-    // worth having on its own.
+    // Canonical (name-sorted), not first-seen, declaration order: §11 requires a
+    // shuffled recording to yield a byte-identical `.tft`, and ids follow
+    // declaration order.
     let mut sorted_frames: Vec<&String> = frames.all().iter().collect();
     sorted_frames.sort_unstable();
     for name in sorted_frames {
@@ -1039,21 +690,15 @@ pub fn fill(
         let (p, c) = (frames.name(e.parent), frames.name(e.child));
         builder = match e.static_pose {
             Some(pose) => builder.static_edge(p, c, &iso_from_canonical(pose)),
-            // `Capacity::slots` rounds up to a power of two, so a ring is never
-            // *smaller* than the source's sample count and pass two cannot lap
-            // it. Duplicates only shrink the true count, so this stays an upper
-            // bound even after the last-wins collapse below.
+            // `Capacity::slots` rounds up, so pass two cannot lap the ring;
+            // duplicates only shrink the count.
             None => builder.dynamic_edge(p, c, EdgeCfg::new(Capacity::slots(clamp_u32(e.samples)))),
         };
     }
     let tree = builder.build().map_err(IngestError::Build)?;
 
     let groups = plan_groups(survey, &order, opts.max_memory_bytes);
-    // Re-derive the edge index the same way pass one did, **once**: it is a
-    // function of the survey alone and the survey does not change between
-    // groups. Building it from the survey rather than re-interning keeps the two
-    // passes agreeing about which edge is which even if a name normalizes
-    // differently.
+    // The edge index is a function of the survey alone; build it once.
     let index: BTreeMap<EdgeKey, usize> = survey
         .edges
         .iter()
@@ -1077,9 +722,7 @@ pub fn fill(
                 Vec::with_capacity(survey.edges[slot].samples as usize),
             );
         }
-        // The normalizer, by contrast, is *not* hoisted: it accumulates the
-        // remap and stripped-slash counts, and reusing one across groups would
-        // multiply them by the number of passes.
+        // Not hoisted: the normalizer accumulates counts that would multiply by passes.
         let mut normalizer = match &opts.tf_prefix {
             Some(p) => NameNormalizer::with_prefix(p),
             None => NameNormalizer::new(),
@@ -1104,13 +747,8 @@ pub fn fill(
             Ok(())
         })?;
 
-        // **The peak is inside the drain loop, not before it.** The number this
-        // line used to record was `sum(buffers)` computed here, which is every
-        // sample buffer and none of the sort's own scratch — so the report said
-        // 1 048 576 at a 1 048 576 B cap while the process used 2 046 121.
-        // `buffers` is drained by value, so at the k-th buffer the ones after it
-        // are still owned by the iterator: the peak is
-        // `remaining + scratch(k)`, and `plan_groups` reserves for exactly that.
+        // `buffers` drains by value, so at the k-th buffer the peak is
+        // `remaining + scratch(k)`, which `plan_groups` reserves for.
         let mut remaining: u64 = buffers
             .values()
             .map(|b| b.len() as u64 * SAMPLE_BYTES)
@@ -1118,14 +756,9 @@ pub fn fill(
 
         for (slot, mut buf) in buffers {
             let held = buf.len() as u64 * SAMPLE_BYTES;
-            // **The bound, not a measurement of the standard library** — see
-            // `FillStats::peak_buffer_bytes` and `plan_groups`. Reporting the
-            // bound is what makes this number safe to size a container against.
+            // The bound, not a measurement (`FillStats::peak_buffer_bytes`).
             stats.peak_buffer_bytes = stats.peak_buffer_bytes.max(remaining + held);
-            // **Stable** sort, and that is what makes "last wins" mean the last
-            // occurrence *in the recording*. An unstable sort would pick an
-            // arbitrary one of two duplicates, so ingesting the same bag twice
-            // could produce two different `.tft` files.
+            // Stable: "last wins" means last in the recording.
             buf.sort_by_key(|(s, _)| *s);
             let e = &survey.edges[slot];
             let parent = tree
@@ -1137,18 +770,9 @@ pub fn fill(
             let writer = tree.claim(child, parent).map_err(IngestError::Claim)?;
             for i in 0..buf.len() {
                 let (stamp, pose) = buf[i];
-                // Last wins: skip every duplicate but the final one, rather
-                // than pushing each and letting the ring absorb them. Pushing
-                // them all is *correct* — equal stamps are accepted and the
-                // newer value wins — but it burns ring slots the counting pass
-                // did not budget for and inflates the manifest's `samples`.
-                //
-                // **One lookahead is the whole rule**, and a trailing check
-                // against the previously pushed stamp would be dead code: `buf`
-                // is sorted, so a run of equal stamps is contiguous, and every
-                // element of that run except the last takes this `continue`
-                // *without* pushing. The stamp that does get pushed is therefore
-                // strictly greater than the one before it.
+                // Last wins: skip all but the final duplicate (pushing them would
+                // burn unbudgeted ring slots and inflate the manifest's `samples`).
+                // `buf` is sorted, so one lookahead suffices.
                 if buf.get(i + 1).is_some_and(|(next, _)| *next == stamp) {
                     stats.duplicates += 1;
                     continue;
@@ -1158,8 +782,6 @@ pub fn fill(
                     .map_err(IngestError::Push)?;
                 stats.pushed += 1;
             }
-            // `buf` is dropped here, so the next iteration's peak is over one
-            // buffer fewer.
             remaining -= held;
         }
     }
@@ -1179,61 +801,24 @@ enum Group {
 
 /// Partition edges into re-reads whose buffered samples each fit `cap`.
 ///
-/// Static edges take no buffer and are left out entirely. An edge too large for
-/// the cap on its own becomes a [`Group::Spilled`] of its own rather than
-/// joining a group it would blow — grouping cannot subdivide an edge, which is
-/// the whole reason the spill path exists.
+/// Static edges are left out. An edge too large on its own becomes a
+/// [`Group::Spilled`]; grouping cannot subdivide an edge.
 ///
-/// # The reserve, and why "fits" is not `sum <= cap`
+/// # The reserve
 ///
-/// `fill` sorts each buffer with [`slice::sort_by_key`], which is **stable** for
-/// the reason §3.2 needs it to be — and a stable sort allocates. The scratch is
-/// a *sample* buffer like the others, up to one full extra copy of the buffer
-/// being sorted, and it is live at the peak: `fill` drains a `BTreeMap` by
-/// value, so every buffer it has not reached yet is still owned by the iterator
-/// while the current one is sorted.
-///
-/// So the peak of one group is `sum(buffers) + max(scratch)`, and the largest
-/// scratch is the largest buffer's. Packing against `sum <= cap` therefore
-/// overran the cap by up to **1.95×** — measured on `tests/memory.rs`'s own
-/// fixture with a counting allocator, before this reserve existed: at
-/// `--max-memory 1048576` the report said exactly 1 048 576 and the process used
-/// 2 046 121 B. That is not an accounting error to be papered over in the
-/// report: §3.1's motivating user "will not accept an OOM", and a cap exceeded
-/// by a factor of two is not a cap.
-///
-/// **The reserve is the group's largest member, not half the cap.** Those are
-/// the same number only for a group of one; for the ordinary case of many edges
-/// it costs one edge's worth of a bin rather than half of it, and a bin is a
-/// whole re-read of the recording. What it does cost is real and is stated here
-/// rather than discovered: a recording whose edges are near the cap gets one
-/// more group than it used to, and an edge between `cap / 2` and `cap` now takes
-/// the spill path — it cannot be sorted in memory inside the cap on its own.
-///
-/// **The reserve is an upper bound rather than a contract.** The standard
-/// library does not promise how much a stable sort allocates; one full copy is
-/// the worst case for a merge-based one, and the current implementation stays
-/// inside it. Reserving the bound rather than any measurement of today's
-/// heuristic is what keeps this from depending on it — a formula for what std
-/// allocates would be a second thing to keep true across toolchains, and the
-/// reserve does not rest on one.
-///
-/// The other route — a sort that allocates nothing — would cost 4-8 B per sample
-/// of explicit arrival index instead of 64, and would move `spill::ENCODED`,
-/// which is a run-file width with its own `size_of` test. It is a decision
-/// record rather than a patch, and `CLAUDE.md`'s workflow says so.
+/// The stable sort allocates up to one extra copy of the buffer being sorted, and
+/// `fill` still owns the unreached buffers, so a group's peak is
+/// `sum(buffers) + max(scratch)`, not `sum <= cap` (which overran the cap by up to
+/// 1.95×; `tests/memory.rs`). The reserve is the group's largest member — an upper
+/// bound, since std promises nothing — so an edge over `cap / 2` takes the spill
+/// path. A sort that allocates nothing would be a decision record, not a patch.
 fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
-    // The *effective* cap, not the requested one: the spill path raises anything
-    // below `spill::MIN_CAP` to it, so deciding "does this edge fit?" against
-    // the raw request routes an edge that would have fit — four samples at
-    // `--max-memory 200` — to a run file that then runs on a 1 024 B budget
-    // anyway. One number, asked once.
+    // The effective cap: the spill path raises anything below `spill::MIN_CAP`.
     let cap = spill::cap_of(cap);
     let mut groups: Vec<Group> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_bytes = 0u64;
-    // The largest buffer in the group being packed — the sort scratch this
-    // group has to leave room for. See the reserve section above.
+    // The largest buffer in the group: the sort scratch to leave room for.
     let mut cur_max = 0u64;
     let flush =
         |cur: &mut Vec<usize>, cur_bytes: &mut u64, cur_max: &mut u64, groups: &mut Vec<Group>| {
@@ -1243,20 +828,10 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
             *cur_bytes = 0;
             *cur_max = 0;
         };
-    // **First-fit *decreasing*, and the bin is the expensive thing.** Every
-    // `Group::InMemory` is one whole re-read of the recording — reopen, re-walk,
-    // re-decompress, re-CDR-decode — so a bin saved is the largest saving
-    // available on this path. Packing in canonical *name* order is plain first
-    // fit, whose worst case is 17/10 of the optimal bin count; largest-first
-    // needs 11/9.
-    //
-    // This does **not** touch the canonical order. `fill` has already declared
-    // every frame and edge from `order` before it calls here, so `FrameId`,
-    // `EdgeId` and §11's byte-identical `.tft` are unaffected; what changes is
-    // only which re-read buffers which edge, and `fill`'s `buffers` is keyed by
-    // slot, so the per-edge push order is unchanged too. `rank` — position in the
-    // canonical order — is the tie break, which keeps the plan a pure function of
-    // the survey rather than of a sort's stability.
+    // First-fit decreasing: each group is a whole re-read, so fewer bins is the
+    // main saving (11/9 of optimal vs 17/10 for name order). Ids and §11's
+    // byte-identical `.tft` are unaffected — `fill` declared from `order` already.
+    // `rank` (canonical position) breaks ties so the plan is a function of the survey.
     let mut rank = vec![usize::MAX; survey.edges.len()];
     for (pos, &i) in order.iter().enumerate() {
         rank[i] = pos;
@@ -1269,25 +844,14 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
             continue;
         }
         let need = e.samples.saturating_mul(SAMPLE_BYTES);
-        // **`2 * need`, not `need`**: an edge alone in a group still pays for its
-        // own sort scratch, so one at `0.9 * cap` peaks at `1.8 * cap` in memory
-        // and belongs on the spill path, whose budget subdivides it.
+        // `2 * need`: an edge alone in a group still pays for its own sort scratch.
         if need.saturating_mul(2) > cap {
-            // Emitted in place in the **packing** order, not the canonical one —
-            // so the spilled edge still keeps a fixed position and the number of
-            // re-reads stays a function of the survey alone. `rank` is the tie
-            // break, which is what makes "fixed" mean deterministic here rather
-            // than merely stable.
             flush(&mut cur, &mut cur_bytes, &mut cur_max, &mut groups);
             groups.push(Group::Spilled(i));
             continue;
         }
-        // `sum + max(scratch)`, per the reserve section. `packing` is decreasing,
-        // so `cur_max` is this group's first member; the `max` is written out
-        // anyway, because the invariant is about the group's contents and not
-        // about the packing order. Saturating, for the same reason `need` is:
-        // `cap` is a caller knob that reaches `u64::MAX`, and this sum grew a
-        // term. Saturation flushes, which is the safe direction.
+        // `sum + max(scratch)`; saturating because `cap` can be `u64::MAX`
+        // (saturation flushes, the safe direction).
         if cur_bytes
             .saturating_add(need)
             .saturating_add(cur_max.max(need))
@@ -1307,8 +871,7 @@ fn plan_groups(survey: &Survey, order: &[usize], cap: u64) -> Vec<Group> {
 /// spill-to-run-file and k-way merge.
 ///
 /// Reads the recording once, keeping only this edge, in cap-sized sorted runs;
-/// then merges the runs back and pushes. See [`crate::spill`] for the memory
-/// budget and for why ties break by run index.
+/// then merges them back and pushes. See [`crate::spill`] for the budget.
 fn fill_spilled(
     path: &Path,
     opts: &IngestOptions,
@@ -1326,9 +889,7 @@ fn fill_spilled(
         None => std::env::temp_dir(),
     };
     let mut runs = spill::RunFile::create(&dir, staging)?;
-    // Allocated to its full capacity up front, so the peak recorded below is the
-    // resident amount for the whole pass rather than a high-water mark that a
-    // reallocation could briefly double.
+    // Full capacity up front, so the recorded peak is the resident amount.
     let mut buf: Vec<spill::Sample> = Vec::with_capacity(run_samples);
     let mut normalizer = match &opts.tf_prefix {
         Some(p) => NameNormalizer::with_prefix(p),
@@ -1354,10 +915,6 @@ fn fill_spilled(
         }
         buf.push((rec.stamp_ns, rec.pose));
         if buf.len() == run_samples {
-            // **Stable**, for the same reason the in-memory path is.
-            // `spill::sort_run` is the one spelling of that rule and carries the
-            // argument; see `spill`'s module docs for the other half — the tie
-            // break across runs.
             spill::sort_run(&mut buf);
             runs.write_run(&buf)?;
             buf.clear();
@@ -1368,25 +925,18 @@ fn fill_spilled(
         spill::sort_run(&mut buf);
         runs.write_run(&buf)?;
     }
-    // **Twice the run buffer.** `spill::sort_run` is stable and allocates, and it
-    // runs with `buf` at capacity and the staging buffer live, so the resident
-    // peak of the spill phase is the buffer, its scratch and the staging.
-    // `spill::spill_budget` sizes the run against the same arithmetic.
+    // Buffer, its sort scratch and the staging (`spill::spill_budget`'s arithmetic).
     stats.peak_buffer_bytes = stats
         .peak_buffer_bytes
         .max(2 * run_samples as u64 * SAMPLE_BYTES + staging as u64);
     stats.peak_run_index_bytes = stats.peak_run_index_bytes.max(runs.index_bytes());
     stats.spilled_runs = stats.spilled_runs.saturating_add(runs.runs() as u32);
     stats.spilled_bytes += runs.bytes();
-    // Released before the merge allocates its windows: holding both would double
-    // the peak, which is the number `--max-memory` is supposed to be about.
+    // Released before the merge allocates its windows.
     drop(buf);
 
-    // **Reduce until one merge can hold every remaining run.** A merge keeps at
-    // least one sample of each run resident, so beyond `fan_in` runs it exceeds
-    // the cap however the window is chosen — see `spill`'s module docs. Each
-    // pass merges a *contiguous* window of runs, which is what preserves the
-    // recording-order tie break that "last wins" depends on.
+    // Reduce until one merge can hold every run (`spill`'s module docs). Windows
+    // are contiguous, preserving the recording-order tie break.
     let fan_in = spill::fan_in(opts.max_memory_bytes);
     while runs.runs() > fan_in {
         let mut next = spill::RunFile::create(&dir, staging)?;
@@ -1394,10 +944,7 @@ fn fill_spilled(
         for chunk in spans.chunks(fan_in) {
             let window = spill::merge_window_samples(opts.max_memory_bytes, chunk.len());
             let mut m = runs.merge_runs(chunk, window)?;
-            // **Two** staging buffers, not one: `runs` and `next` are both open
-            // here, and `RunFile::staging` is allocated to capacity at `create`
-            // and never released. Counting one understates the pass by
-            // `staging` bytes, which at a small cap is an eighth of it.
+            // Two staging buffers: `runs` and `next` are both open.
             stats.peak_buffer_bytes = stats
                 .peak_buffer_bytes
                 .max(m.resident_bytes() + 2 * staging as u64);
@@ -1408,9 +955,7 @@ fn fill_spilled(
             drop(m);
             next.end_run()?;
         }
-        // Measured at the end of the pass, which is where it peaks: both files'
-        // run indices and the snapshot of the one being read are live at once,
-        // and `next`'s index is the only one of the three still growing.
+        // Measured at the end of the pass, where both indices and the span snapshot are live.
         stats.peak_run_index_bytes = stats.peak_run_index_bytes.max(
             runs.index_bytes()
                 + next.index_bytes()
@@ -1418,8 +963,7 @@ fn fill_spilled(
         );
         stats.spilled_runs = stats.spilled_runs.saturating_add(next.runs() as u32);
         stats.spilled_bytes += next.bytes();
-        // The previous file is dropped here, and with it the spill it held: disk
-        // use is bounded by two consecutive passes, not by their number.
+        // Dropping the previous file bounds disk use to two consecutive passes.
         runs = next;
     }
 
@@ -1442,31 +986,12 @@ fn fill_spilled(
     let child = tree
         .frame(frames.name(want_child))
         .map_err(|_| IngestError::FrameLost { frame: want_child })?;
-    // **These pushes record a clock offset, and it is measured against *ingest*
-    // time** (`docs/decisions/0036`). `EdgeWriter::push` samples
-    // `wall clock - stamp` into `ClaimRecord::clock_offset_nanos`, so replaying
-    // a 2024 recording in 2026 records an offset of about two years. That is
-    // arithmetically correct and diagnostically meaningless: the publisher's
-    // clock was fine, the recording is simply old. A bag-sourced tree is an
-    // ordinary live heap `Tree`, so neither `TFT004`'s frozen-source skip nor its
-    // epoch condition catches it. **`TFT004` skips a replayed source for exactly
-    // this reason** — `PushStream::no_live_receipt`, added by `0036` step 3 —
-    // which covers `doctor --from-bag` because that path knows it is reading a
-    // recording.
-    //
-    // **What it does not cover is `ros2 bag play` into a live stack**, where the
-    // same old stamps reach a shared arena through the §5 bridge and `doctor
-    // --attach` sees an ordinary live arena. Provenance is a property of the
-    // writer and the arena records none, so that gap is named in `tft004`'s doc
-    // and in the finding text rather than closed here.
-    //
-    // The cost is the sampler's ~1.1 ns per push plus one 38 ns clock read per
-    // interval, on a bulk load of millions of samples: single-digit
-    // milliseconds, against a run that parses a bag.
+    // These pushes record a clock offset against *ingest* time, so an old bag
+    // reads as a huge offset; `TFT004` skips replayed sources via
+    // `PushStream::no_live_receipt` (`docs/decisions/0036`). `ros2 bag play` into a
+    // live stack is not covered (`tft004`'s doc).
     let writer = tree.claim(child, parent).map_err(IngestError::Claim)?;
-    // The in-memory path's one-element lookahead, spelled as a one-element
-    // delay: a merged stream has no random access, so the sample is held back
-    // until the next one proves it is not a duplicate.
+    // One-element delay: hold a sample until the next proves it is not a duplicate.
     let mut pending: Option<spill::Sample> = None;
     while let Some(next) = merged.next_sample()? {
         if let Some(prev) = pending {
@@ -1492,12 +1017,8 @@ fn fill_spilled(
 
 /// Survey indices sorted by `(parent name, child name)`.
 ///
-/// The one ordering that does not depend on when a message happened to arrive.
-/// See [`fill`]'s comment for why that matters.
-///
-/// `pub(crate)` so [`crate::report`] calls *this* rather than keeping its own
-/// copy of the comparator. Two copies is how the report's row order and the
-/// arena's `EdgeId` order drift apart, and nothing would report the drift.
+/// Independent of arrival order. `pub(crate)` so [`crate::report`] shares the
+/// comparator and its row order cannot drift from the arena's `EdgeId` order.
 pub(crate) fn canonical_order(survey: &Survey, frames: &Frames) -> Vec<usize> {
     let mut order: Vec<usize> = (0..survey.edges.len()).collect();
     order.sort_by(|&a, &b| {
@@ -1510,11 +1031,8 @@ pub(crate) fn canonical_order(survey: &Survey, frames: &Frames) -> Vec<usize> {
 
 /// `[qw qx qy qz tx ty tz]` to an [`Iso3`].
 ///
-/// The quaternion is **normalized here and nowhere else**. A recording's
-/// quaternions are only approximately unit — a bag converted through YAML or
-/// float32 arrives off by ~1e-7 — and `Iso3::new` documents that it performs no
-/// normalization and that callers guarantee unitness. Skipping this puts a
-/// non-unit quaternion in the arena, where `slerp` between two of them drifts.
+/// The quaternion is normalized here and nowhere else: recordings are only
+/// approximately unit and `Iso3::new` does not normalize.
 fn iso_from_canonical(p: [f64; 7]) -> Iso3 {
     Iso3::new(
         Quat::new(p[0], p[1], p[2], p[3]).normalize(),
@@ -1522,9 +1040,7 @@ fn iso_from_canonical(p: [f64; 7]) -> Iso3 {
     )
 }
 
-/// Saturating `u64` to `u32` for a ring capacity. A single edge with more than
-/// 4 billion samples is not something the arena can hold anyway; `build()`
-/// rejects it with a layout error that names the real limit.
+/// Saturating `u64` to `u32` for a ring capacity; `build()` rejects the excess.
 fn clamp_u32(v: u64) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
@@ -1556,19 +1072,8 @@ mod tests {
         }
     }
 
-    /// A cap smaller than the dataset splits the edges across several passes,
-    /// and no group's **peak** exceeds the cap.
-    ///
-    /// The peak is `sum(buffers) + max(buffer)`, not `sum(buffers)`: `fill`
-    /// sorts each buffer with a stable sort, which allocates, while every
-    /// buffer it has not drained yet is still held. Asserting the sum alone is
-    /// what let the cap be overrun by up to 1.95× — this assertion was
-    /// `bytes <= cap` until 2026-09-06 and passed throughout.
-    ///
-    /// Mutant: change the flush condition to `cur_bytes + need > cap * 2` —
-    /// applied, and the per-group budget assertion failed at 2 × cap.
-    /// Mutant 2: drop the reserve (`cur_bytes + need > cap`) — applied, and this
-    /// failed with `group [0, 1] peaks at 1920 > 1600`.
+    /// A cap smaller than the dataset splits the edges across passes, and no
+    /// group's peak, `sum(buffers) + max(buffer)`, exceeds the cap.
     #[test]
     fn groups_respect_the_cap() {
         let s = survey_with(&[10, 10, 10, 10]);
@@ -1598,16 +1103,8 @@ mod tests {
     /// An edge over **half** the cap cannot be sorted in memory inside it, so it
     /// takes the spill path.
     ///
-    /// A group of one still pays for its own sort scratch: 15 samples is 960 B,
-    /// and sorting them peaks at 1 920 against a 1 600 B cap. The old threshold
-    /// was `need > cap`, which admitted exactly this edge and then overran by
-    /// 1.2× — and by up to 1.95× as the edge approaches the cap.
-    ///
-    /// **This is the visible cost of the reserve**, stated in `plan_groups`;
-    /// `spill`'s module docs say why a run file is second choice.
-    ///
-    /// Mutant: restore `if need > cap` — applied, and this failed with
-    /// `[InMemory([0])]`.
+    /// A group of one still pays for its own sort scratch: 15 samples is 960 B and
+    /// peaks at 1 920 against a 1 600 B cap.
     #[test]
     fn an_edge_over_half_the_cap_takes_the_spill_path() {
         let s = survey_with(&[15]);
@@ -1617,9 +1114,7 @@ mod tests {
             vec![Group::Spilled(0)],
             "a group of one peaks at twice its buffer"
         );
-        // The control: a hair under half the cap still sorts in memory, so the
-        // assertion above is about the threshold and not about a planner that
-        // spills everything.
+        // Control: a hair under half the cap still sorts in memory.
         let s = survey_with(&[12]);
         assert_eq!(
             plan_groups(&s, &order, 25 * SAMPLE_BYTES),
@@ -1627,13 +1122,7 @@ mod tests {
         );
     }
 
-    /// One edge larger than the whole cap becomes a spilled group of its own —
-    /// grouping cannot subdivide an edge, so this is the case §3.1's run file
-    /// exists for.
-    ///
-    /// Mutant: delete the over-cap arm — applied, and this failed with
-    /// `InMemory([0, 1])`, a group 3× over budget, instead of the two groups
-    /// asserted here.
+    /// One edge larger than the whole cap becomes a spilled group of its own.
     #[test]
     fn one_oversized_edge_spills_on_its_own() {
         let s = survey_with(&[100, 5]);
@@ -1646,16 +1135,8 @@ mod tests {
         );
     }
 
-    /// A cap below what the spill path can honour is planned against the value
-    /// it *will* be raised to, so a small edge is not spilled for nothing.
-    ///
-    /// Four samples are 256 B. At `--max-memory 200` they fit in memory —
-    /// because the spill path would raise 200 to `spill::MIN_CAP` = 1 024 and
-    /// buffer them anyway — so routing them to a temporary file buys a file, a
-    /// merge and a `Drop` and saves not one byte.
-    ///
-    /// Mutant: plan against `cap.max(SAMPLE_BYTES)` instead of
-    /// `spill::cap_of(cap)` — applied, and this failed with `[Spilled(0)]`.
+    /// A cap below `spill::MIN_CAP` (1 024) is planned at the floor: four samples
+    /// (256 B) at `--max-memory 200` stay in memory.
     #[test]
     fn a_cap_below_the_floor_is_planned_at_the_floor() {
         let s = survey_with(&[4]);
@@ -1667,11 +1148,8 @@ mod tests {
         );
     }
 
-    /// Static and empty edges reserve no buffer at all, so a recording that is
-    /// all statics needs no passes.
-    ///
-    /// Mutant: remove the `e.is_static() || e.samples == 0` skip — applied, and
-    /// this test failed with one group of two edges instead of none.
+    /// Static and empty edges reserve no buffer, so an all-static recording needs
+    /// no passes.
     #[test]
     fn statics_and_empty_edges_take_no_buffer() {
         let mut s = survey_with(&[0, 0]);
@@ -1680,11 +1158,7 @@ mod tests {
         assert!(plan_groups(&s, &order, 1024).is_empty());
     }
 
-    /// A quaternion that is off-unit by more than `slerp` tolerates is
-    /// normalized on the way into the arena.
-    ///
-    /// Mutant: drop the `.normalize()` in `iso_from_canonical` — applied, and
-    /// the norm assertion failed at 1.0198.
+    /// An off-unit quaternion is normalized on the way into the arena.
     #[test]
     fn poses_are_normalized_on_the_way_in() {
         let iso = iso_from_canonical([1.02, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);

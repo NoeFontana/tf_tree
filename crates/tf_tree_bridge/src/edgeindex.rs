@@ -1,48 +1,15 @@
 //! `(parent, child)` → a dense slot, in one hash and one comparison.
 //!
-//! # Why this and not [`crate::edgemap`]
-//!
-//! `edgemap`'s nesting solved the *allocation* problem — `Borrow` does not reach
-//! inside a tuple, so a flat `(String, String)` key cannot be probed by
-//! reference at all, and every probe had to build two owned `String`s to ask a
-//! question about memory the map already held. It did not solve the *work*
-//! problem. A two-level descent is two `BTreeMap<String, _>::get`s, each
-//! `O(log n)` with a full frame-name `memcmp` at every visited node, and
-//! `Ingest::offer` performed four of them per transform.
-//!
-//! Measured on this repository before the change, `cachegrind`, 20 dynamic edges,
-//! `N = 0` baseline subtracted (`just bridge-footprint`): **2 550 instructions and
-//! 2.80 D1 misses per accepted offer at 20 edges, against 1 453 instructions and
-//! 0.00 D1 misses at one edge.** The rise is the descents; at one edge a
-//! `BTreeMap` compares nothing. With ROS-shaped names — `robot1/arm/wrist_0_link`,
-//! fifteen shared bytes rather than four — the same 20-edge row costs **5.90** D1
-//! misses, because a longer shared prefix is a longer `memcmp` at every node.
-//!
-//! The declared edge set is fixed at construction: `Ingest::with_policies` takes a
-//! `&TopologyConfig` and no method on `Ingest` adds an edge or a frame. So the
-//! whole of that work is answerable once, at build time, by a table.
-//!
-//! `edgemap` survives for the one table whose key set is *not* fixed — see its own
-//! module docs.
-//!
-//! # Open addressing, not a perfect hash
-//!
-//! A perfect hash guarantees one probe, but its displacement array is a *second*
-//! array and therefore a second cache miss, which at a few dozen edges erases the
-//! difference against a quarter-loaded open table (expected probes ≈ 1.16). It is
-//! also ~150 lines with a construction failure path that cannot be exercised by
-//! any real config, and it cannot serve the growing case
-//! [`crate::statics::StaticStore`] needs when it is built unseeded. A sorted array
-//! and a binary search was the other candidate and is strictly worse than both:
-//! seven scattered dependent loads and seven `memcmp`s is a 40 % improvement where
-//! a table is a 90 % one.
+//! Replaces two-level `BTreeMap` descents (a frame-name `memcmp` per node, four
+//! per `Ingest::offer`) for the declared edge set, which is fixed at
+//! construction. `just bridge-footprint` measures the cost. Open addressing at
+//! quarter load: a perfect hash needs a second array (a second cache miss) and
+//! cannot serve the growing case of [`crate::statics::StaticStore`]. The one
+//! table with an unfixed key set stays in [`crate::edgemap`].
 
-/// A dense index into the declared-edge tables.
-///
-/// `EdgeSlot(i)` is the *first* declaration of a normalized `(parent, child)` in
-/// `TopologyConfig::edges`. Two declarations that collapse onto one pair after
-/// §5.6's rewrite share a slot and the later one wins, which is exactly what
-/// `edgemap::insert`'s last-write-wins did.
+/// A dense index into the declared-edge tables: the *first* declaration of a
+/// normalized `(parent, child)` in `TopologyConfig::edges`. Declarations that
+/// collapse onto one pair after §5.6's rewrite share a slot; the later wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct EdgeSlot(pub(crate) u32);
 
@@ -53,20 +20,13 @@ impl EdgeSlot {
     }
 }
 
-/// The multiplier from rustc's own `FxHasher`. Odd, so the multiply is a
-/// bijection on `u64` and destroys no entropy.
+/// The multiplier from rustc's `FxHasher`; odd, so the multiply is a bijection.
 const K: u64 = 0x517c_c1b7_2722_0a95;
 
-/// Marks an empty bucket. A slot index of `u32::MAX` is unrepresentable in any
-/// real topology, so this costs no expressiveness.
+/// Marks an empty bucket; `u32::MAX` is not a representable slot.
 const EMPTY: u32 = u32::MAX;
 
-/// Fold `bytes` into `h`, length included.
-///
-/// The length is mixed so a name whose tail is zero-extended into the final word
-/// cannot alias a shorter one — without it `"ab"` and `"ab\0"` would hash alike.
-/// That is a statement about the hash being well-formed, not about security; the
-/// comparison in [`EdgeIndex::find`] catches the collision either way.
+/// Fold `bytes` into `h`, length included so `"ab"` and `"ab\0"` differ.
 pub(crate) fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     let mut it = bytes.chunks_exact(8);
     for c in &mut it {
@@ -81,22 +41,12 @@ pub(crate) fn mix(mut h: u64, bytes: &[u8]) -> u64 {
     (h ^ bytes.len() as u64).wrapping_mul(K)
 }
 
-/// A 64-bit hash of the pair.
-///
-/// **Hand-rolled, and that is not a new dependency.** This crate's manifest says
-/// "One dependency, and it is not ROS"; ten lines of `wrapping_mul` keeps that
-/// true. `tf_tree_core::frame::blake3_64` is reachable but is a cryptographic
-/// hash whose compression function dwarfs a twenty-byte frame name, and `std`'s
-/// SipHash-1-3 is roughly three times this.
-///
-/// **Unkeyed, and that is not a hole.** Every key in the table comes from the
-/// *declared* topology; nothing the wire says can insert one. Someone who found a
-/// collision offline could make a probe walk one extra bucket and then miss,
-/// falling back to the slow path. They could not make a probe *hit*, because
-/// every hit is confirmed against both stored names.
+/// A 64-bit hash of the pair. Hand-rolled to keep the crate's one-dependency
+/// rule. Unkeyed by design: keys come only from the declared topology, and every
+/// hit is confirmed against both stored names, so a forged collision can cost a
+/// probe step but never a wrong hit.
 fn hash_pair(parent: &str, child: &str) -> u64 {
-    // A separator constant between the two names, so `("ab", "c")` and
-    // `("a", "bc")` differ by construction rather than by luck.
+    // Separator so `("ab", "c")` and `("a", "bc")` differ by construction.
     let h = mix(0xcbf2_9ce4_8422_2325, parent.as_bytes()) ^ 0x9e37_79b9_7f4a_7c15;
     let h = mix(h, child.as_bytes());
     // Avalanche: the multiply leaves entropy high and the table masks off low.
@@ -104,21 +54,10 @@ fn hash_pair(parent: &str, child: &str) -> u64 {
     h ^ (h >> 29)
 }
 
-/// How many buckets a table holding `n` entries gets: a power of two, at least
-/// `4n + 4`, never below 16.
-///
-/// **One function, because four copies of the same arithmetic is how a load
-/// factor drifts** — and this one is not a tuning knob that can be nudged in one
-/// place and left in another. [`EdgeIndex::find`] has **no bound of its own**:
-/// it walks buckets until it meets an empty one, and the only reason that
-/// terminates is that the table can never be full. If the sizing here and the
-/// growth check in [`EdgeIndex::insert`] ever disagreed in the direction that
-/// let the load reach 1.0, a probe for an absent key would spin forever on a
-/// bridge that is supposed to run unattended for a fortnight.
-///
-/// The quarter load factor is what keeps the expected probe count at ~1.16, and
-/// the `+ 4` is what keeps the invariant true at `n = 0`. `crate::interner` uses
-/// it too, so both tables in this crate share one definition of "full".
+/// Bucket count for `n` entries: a power of two, at least `4n + 4`, never below
+/// 16. [`EdgeIndex::find`] has no bound of its own and terminates only because
+/// the table is never full; this is the single definition of "full", shared with
+/// `crate::interner`.
 #[inline]
 pub(crate) fn buckets_for(n: usize) -> usize {
     (4 * n + 4).next_power_of_two().max(16)
@@ -133,14 +72,10 @@ struct Bucket {
 /// A `(parent, child)` → `V` table probed by reference, without allocating.
 #[derive(Debug)]
 pub(crate) struct EdgeIndex<V> {
-    /// Sized by [`buckets_for`], so the load factor is never above a quarter.
-    /// That bounds the probe walk and — the part that matters for termination —
-    /// guarantees there is always an empty bucket for [`EdgeIndex::find`]'s loop
-    /// to stop on.
+    /// Sized by [`buckets_for`]: always an empty bucket for `find` to stop on.
     buckets: Vec<Bucket>,
     mask: usize,
-    /// `keys[i]` is entry `i`'s key. Owned, because a hit is confirmed against
-    /// the stored name and not against a hash.
+    /// `keys[i]` is entry `i`'s key, owned so a hit is confirmed by name.
     keys: Vec<(Box<str>, Box<str>)>,
     values: Vec<V>,
 }
@@ -173,21 +108,14 @@ impl<V> EdgeIndex<V> {
         let h = hash_pair(parent, child);
         let mut i = (h as usize) & self.mask;
         loop {
-            // `get` rather than `[]`: `mask` keeps `i` in range, so this cannot
-            // fail, and writing it fallibly means a future invariant slip
-            // degrades to a miss instead of panicking on the hot path of a
-            // bridge that is meant to run unattended for a fortnight.
+            // Fallible `get`: an invariant slip degrades to a miss, not a panic.
             let b = *self.buckets.get(i)?;
             if b.entry == EMPTY {
                 return None;
             }
             if b.hash == h {
                 let (p, c) = &self.keys[b.entry as usize];
-                // **Confirmed, never assumed.** A 64-bit collision believed on
-                // faith would attribute one edge's transform to another — silent
-                // corruption of a transform tree, from an unkeyed hash anyone can
-                // evaluate offline. Two short `memcmp`s on a cache line that is
-                // already hot is not a price worth arguing about.
+                // Confirmed by name: a believed 64-bit collision would corrupt the tree.
                 if &**p == parent && &**c == child {
                     return Some(b.entry as usize);
                 }
@@ -197,9 +125,7 @@ impl<V> EdgeIndex<V> {
     }
 
     /// Insert, or overwrite an existing key's value. Returns the entry index.
-    ///
-    /// Allocates the two owned keys, so call it at construction for the declared
-    /// set and at most a bounded number of times thereafter — see `Ingest::raw`.
+    /// Allocates the two keys: call at construction, and boundedly after.
     pub(crate) fn insert(&mut self, parent: &str, child: &str, v: V) -> usize {
         if let Some(e) = self.find(parent, child) {
             self.values[e] = v;
@@ -247,21 +173,15 @@ impl<V> EdgeIndex<V> {
 }
 
 impl<V: Copy> EdgeIndex<V> {
-    /// Probe. Allocates nothing.
-    ///
-    /// `V: Copy` only here: every value this crate stores in one is a `u32` slot
-    /// or a small `Copy` record, and returning by value keeps the borrow of
-    /// `self` from outliving the probe — which is what lets `Ingest::offer` hold
-    /// the result while it goes on to mutate a different table.
+    /// Probe. Allocates nothing. Returns by value so the borrow ends with the
+    /// probe (`Ingest::offer` mutates another table meanwhile).
     pub(crate) fn get(&self, parent: &str, child: &str) -> Option<V> {
         self.find(parent, child).map(|e| self.values[e])
     }
 }
 
-/// Place `entry` at the first empty bucket at or after `h`'s home.
-///
-/// Free rather than a method so [`EdgeIndex::rehash`] can call it while holding a
-/// borrow of `self.keys`.
+/// Place `entry` at the first empty bucket at or after `h`'s home. Free so
+/// `rehash` can call it while borrowing `self.keys`.
 fn place(buckets: &mut [Bucket], mask: usize, h: u64, entry: u32) {
     let mut i = (h as usize) & mask;
     while buckets[i].entry != EMPTY {
@@ -277,10 +197,7 @@ mod tests {
 
     /// A key round-trips, and a key that was never inserted misses.
     ///
-    /// Mutant: return `Some(b.entry as usize)` from `find` as soon as
-    /// `b.entry != EMPTY`, without testing the hash or the names — applied, and
-    /// this failed on the `("odom", "nothing")` miss, which came back
-    /// `Some(0)`.
+    /// Mutant: return `Some(..)` from `find` on any non-empty bucket.
     #[test]
     fn a_key_round_trips_and_a_stranger_misses() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(4);
@@ -293,14 +210,9 @@ mod tests {
         assert_eq!(t.len(), 2);
     }
 
-    /// **The pair is hashed as a pair.** `("ab", "c")` and `("a", "bc")` are
-    /// different edges and must not collide by construction.
+    /// The pair is hashed as a pair: `("ab", "c")` and `("a", "bc")` differ.
     ///
-    /// Mutant: drop the `^ 0x9e37…` separator from `hash_pair`, so the two names
-    /// are folded into one stream — applied, and the two hashes became equal;
-    /// the assertion below on distinct values still passed (the name comparison
-    /// saves correctness) but `hashes_differ` failed, which is the point: the
-    /// separator is what keeps the *table* from degrading into a probe walk.
+    /// Mutant: drop the `hash_pair` separator; the hash assertion fails.
     #[test]
     fn the_pair_is_hashed_as_a_pair() {
         assert_ne!(hash_pair("ab", "c"), hash_pair("a", "bc"));
@@ -311,18 +223,10 @@ mod tests {
         assert_eq!(t.get("a", "bc"), Some(2));
     }
 
-    /// **A hash collision resolves to the right entry**, because every hit is
-    /// confirmed against the stored names.
+    /// A bucket collision resolves to the right entry: every hit is confirmed
+    /// by name.
     ///
-    /// Two keys are forced into the same *bucket* by masking to a 16-bucket
-    /// table, which is what linear probing has to survive. A full 64-bit hash
-    /// collision cannot be constructed here without inverting the hash, so the
-    /// bucket collision is the reachable form and the name comparison is what
-    /// both cases rely on.
-    ///
-    /// Mutant: `if b.hash == h { return Some(b.entry as usize); }` — dropping the
-    /// name comparison — applied, and this failed with one of the two keys
-    /// returning the other's value.
+    /// Mutant: drop the name comparison in `find`.
     #[test]
     fn a_bucket_collision_resolves_to_the_right_entry() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);
@@ -341,9 +245,7 @@ mod tests {
 
     /// Growth past the load factor rehashes and keeps every key findable.
     ///
-    /// Mutant: in `rehash`, place entries under `hash_pair(p, c) >> 1` so the
-    /// table is rebuilt with a different function than `find` probes with —
-    /// applied, and this failed at the first `get` after the first rehash.
+    /// Mutant: rehash under a different hash than `find` probes with.
     #[test]
     fn rehashing_preserves_every_key() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);
@@ -364,12 +266,9 @@ mod tests {
         );
     }
 
-    /// Re-inserting a key overwrites its value rather than adding a second entry
-    /// — the last-write-wins `edgemap::insert` had.
+    /// Re-inserting a key overwrites it (last write wins).
     ///
-    /// Mutant: delete the `if let Some(e) = self.find(..)` early return from
-    /// `insert` — applied, and `len()` came back 2 instead of 1 and `get`
-    /// returned the stale 1.
+    /// Mutant: delete `insert`'s early return on an existing key.
     #[test]
     fn reinserting_a_key_overwrites_it() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(4);
@@ -379,28 +278,16 @@ mod tests {
         assert_eq!(t.get("map", "odom"), Some(2));
     }
 
-    /// An entry's stored key is recoverable from its slot, which is what lets a
-    /// caller holding only an index still name the edge in an `Action`.
+    /// An entry's key is recoverable from its slot.
     #[test]
     fn a_slot_names_its_edge() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(2);
         let e = t.insert("map", "odom", 0);
         assert_eq!(t.key(e), ("map", "odom"));
     }
-    /// **The table is never full, at any size** — which is the only reason
-    /// [`EdgeIndex::find`] terminates.
+    /// The table is never full, at any size: `find` terminates only because of it.
     ///
-    /// `find` walks buckets until it meets an empty one and has no bound of its
-    /// own, so a load factor that reached 1.0 would make a probe for an absent
-    /// key spin forever. [`buckets_for`] is the single definition of "full" that
-    /// keeps that from happening, and this asserts it over the range where the
-    /// power-of-two rounding is doing the work.
-    ///
-    /// Mutant: `buckets_for` returning `(n + 1).next_power_of_two().max(16)` — a
-    /// load factor of 1 rather than a quarter — applied, and this failed at
-    /// `n = 5: load factor above a quarter (16 buckets)`. It also took
-    /// `rehashing_preserves_every_key` with it, at `256 buckets for 200 keys`,
-    /// which is the same invariant seen from the other side.
+    /// Mutant: `buckets_for` returning `(n + 1).next_power_of_two().max(16)`.
     #[test]
     fn the_table_is_never_full() {
         for n in 0..600usize {
@@ -417,8 +304,7 @@ mod tests {
         }
     }
 
-    /// A probe for a key that is not there **returns**, at every size — the
-    /// termination property stated as behaviour rather than as arithmetic.
+    /// A probe for an absent key returns, at every size.
     #[test]
     fn a_stranger_misses_at_every_size() {
         let mut t: EdgeIndex<u32> = EdgeIndex::with_capacity(0);

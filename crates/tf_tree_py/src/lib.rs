@@ -1,115 +1,32 @@
 //! PyO3 bindings for `tf_tree` — `docs/PHASE3.md`.
 //!
-//! # The declaration that matters most — and its default has flipped (§1.2)
+//! # Free-threading declaration (§1.2)
 //!
-//! `docs/PHASE3.md` §1.2 says an extension that does not declare itself
-//! free-threading-safe silently re-enables the GIL for the whole process. That
-//! was true of PyO3 <= 0.28. **In PyO3 0.29 the default is the opposite**:
-//! `pyo3-macros-backend-0.29.0/src/module.rs:394` reads
-//! `options.gil_used.is_some_and(|op| op.value.value)`, and `None` yields
-//! `false` — so an *absent* attribute declares the module free-threading-safe.
-//! Verified by experiment as well as by reading: removing the attribute below
-//! leaves `sys._is_gil_enabled()` false.
-//!
-//! The hazard is now worse, not better. Forgetting the declaration used to cost
-//! parallelism, loudly enough that somebody would eventually profile it.
-//! Forgetting to *audit* now costs correctness: the module claims a safety it
-//! may not have, and the failure is a data race rather than a slowdown.
-//!
-//! So the attribute stays — explicit beats inherited, and a future PyO3 could
-//! flip the default back — but **it is not what makes the claim true, and no
-//! test of the attribute can be non-vacuous.** What makes it true is that every
-//! `#[pyclass]` here is `Send + Sync` and that there is no global mutable
-//! state. `Tree` and `Plan` already are both in Rust; `tf_tree::Publisher` is
-//! `Send + !Sync` by design, so [`PyPublisher`] does not hold one directly —
-//! it holds an [`OwnedWriter`](tf_tree::OwnedWriter) behind a `Mutex`, which is
-//! `Sync` because the writer is `Send`. That is what makes exposing it as
-//! `tf_tree.Publisher` sound.
-//!
-//! **The `Send + Sync` half is the compiler's, not ours.** A `#[pyclass]`
-//! without `unsendable` expands to an `assert_pyclass_send_sync::<Self>()`
-//! (`pyo3-macros-backend-0.29.0/src/pyclass.rs:2932`), so a field that is not
-//! both stops the build at the attribute — verified by giving `PyPublisher` a
-//! `PhantomData<*const u8>`, which produces `error[E0277]: *const u8 cannot be
-//! shared between threads safely` pointing at its `#[pyclass]` line. **The
-//! no-global-mutable-state half is not checked by anything**, and that is the
-//! one the concurrent evaluation test on a `3.14t` interpreter and
-//! ThreadSanitizer (§7.3) are for.
+//! PyO3 0.29 treats an absent `gil_used` as free-threading-safe; the attribute
+//! stays explicit, but what makes the claim true is that every `#[pyclass]` is
+//! `Send + Sync` (the compiler asserts it) and there is no global mutable state
+//! (checked only by the `3.14t` concurrency test and ThreadSanitizer, §7.3).
+//! [`PyPublisher`] holds an [`OwnedWriter`](tf_tree::OwnedWriter) behind a
+//! `Mutex`, since `tf_tree::Publisher` is `Send + !Sync`.
 //!
 //! # Time is integer nanoseconds (§3)
 //!
-//! `float` stamps are rejected with a `TypeError` that states the measurement:
-//! at a 2026 epoch the ULP of `float64` seconds is 238 ns, so **every**
-//! consecutive-sample interval in a 1 kHz stream is wrong after a round trip.
-//! For a library whose purpose is sub-millisecond temporal accuracy, silently
-//! accepting that input would produce interpolation errors users would blame on
-//! the interpolator.
+//! `float` stamps are rejected with a `TypeError`: at a 2026 epoch the ULP of
+//! `float64` seconds is 238 ns, wrong for every interval of a 1 kHz stream.
 //!
-//! # Build identity: `__version__`, and two numbers that are not it
+//! # Build identity
 //!
-//! A benchmark number or a bug report has to name the build it came from, and
-//! nothing here answered that — `tf_tree.__version__` raised `AttributeError`.
-//! Three values answer it now, and they are three because they fail
-//! independently: a wheel can be exactly the version the reporter says it is
-//! and still refuse to attach, because the arena it was pointed at was written
-//! by a different *geometry*.
-//!
-//! * `__version__` is `env!("CARGO_PKG_VERSION")`, read from this crate's
-//!   manifest at compile time. Never a literal in this file: a hand-copied
-//!   string is wrong exactly once — on the release where somebody bumped the
-//!   manifest and not this line — and it is wrong *silently*, which is worse
-//!   than having no version at all, because a report carrying it is
-//!   mis-attributed rather than un-attributed.
-//! * `arena_format_version` and `arena_layout_hash` are the two words every
-//!   participant compares on attach (`docs/PHASE5.md` §1): the *set of fields*
-//!   and the *geometry*. They come from the facade's `arena_format_version` /
-//!   `arena_layout_hash`, under those same names — `tf_tree_arena` is not a
-//!   dependency of this crate and must not become one to answer a diagnostic,
-//!   and a second spelling of an existing path is what `docs/PROJECT.md` §6
-//!   forbids.
-//!
-//! The three names above are code spans and not intra-doc links on purpose.
-//! `#[pyfunction]` expands to a private item, so an intra-doc link to one
-//! resolves to nothing and `cargo doc` fails it as a broken link under this
-//! repository's `-D warnings` — measured, not predicted: linking all three is
-//! what this paragraph was added to stop happening twice. They are Python
-//! attributes anyway; the Rust function is an implementation detail of the
-//! module they are attached to.
-//!
-//! **The two are functions rather than module constants, and that was once
-//! forced.** `tests/python/test_stubs.py` is what keeps the hand-written `.pyi`
-//! from rotting, and it used to compare this module's public names against only
-//! the stub's `ClassDef`s and `FunctionDef`s. A module-level
-//! `FORMAT_VERSION: int` is an *assignment* in the stub, and was invisible to
-//! that comparison — it would have been the one name in the whole surface that
-//! nothing checked existed. `has_shared_memory` is the precedent: a
-//! compile-time-constant fact about the build, exposed as a nullary function.
-//!
-//! **`0038` needed four genuine constants, so that comparison grew instead**
-//! (see [`SYSTEM_DOMAIN`]): the stub check now collects module-level annotated
-//! assignments too, which is where `__version__` already lived. These three stay
-//! functions — a shape a caller has depended on since 0.0.1 is not worth
-//! churning for symmetry, and `arena_layout_hash` is a *fact about this build*
-//! rather than a name for a number in the format, which is what the four domain
-//! tags are.
-//!
-//! `__version__` is exempt because that check skips underscore-prefixed names
-//! on both sides, and it keeps the dunder spelling because it is what a user
-//! types and what a bug-report template asks for. It is **not** the canonical
-//! answer — `importlib.metadata.version("transform_tree")` is, and it reads
-//! `pyproject.toml`'s `[project] version` while this one reads the crate
-//! manifest. Two files, so they can disagree; `tests/python/test_version.py`
-//! asserts they do not.
+//! `__version__` is `env!("CARGO_PKG_VERSION")`, never a literal;
+//! `importlib.metadata.version("transform_tree")` is canonical and
+//! `tests/python/test_version.py` asserts they agree. `arena_format_version` and
+//! `arena_layout_hash` are the words compared on attach (`docs/PHASE5.md` §1),
+//! forwarded from the facade; they are functions, not constants, and are
+//! code spans here because `#[pyfunction]` items cannot be intra-doc linked.
 //!
 //! # No views into the arena (§5.1)
 //!
-//! Nothing here hands Python a buffer that aliases arena memory. An edge's
-//! sample storage is a ring being overwritten by another process, and correct
-//! reads go through the seqlock protocol; a NumPy array pointing into it would
-//! bypass that entirely — a data race by construction, producing torn poses
-//! that look like occasional impossible transforms. "Zero-copy" here means no
-//! *intermediate* allocation: results are computed by interpolation and written
-//! exactly once, into their final home.
+//! Nothing hands Python a buffer aliasing arena memory: a NumPy view would
+//! bypass the seqlock and race with the writer.
 #![allow(unsafe_code, clippy::needless_pass_by_value)]
 // `unsafe` boundary: a foreign runtime that owns its own objects.
 // See `docs/decisions/0007`.
@@ -127,16 +44,11 @@ pub use errors::*;
 pub use offline::open_file;
 pub use tree::*;
 
-/// Nanoseconds from float seconds, and the exact reason it is lossy.
+/// Nanoseconds from float seconds; lossy above ~10^7 s.
 ///
-/// The only sanctioned path from a wall-clock float. Documented as lossy above
-/// ~10^7 s rather than silently accepted, because the loss is invisible: the
-/// value still *looks* like a timestamp.
-///
-/// **It now has exact siblings to point at**, which is what turns the warning
-/// from true into actionable (`docs/API.md` §5.1): [`from_parts`] for a
-/// `(sec, nanosec)` pair and [`from_ros`] for a `builtin_interfaces/Time`.
-/// Neither takes a float and neither loses a bit.
+/// The only path from a wall-clock float. Prefer `from_parts` for a
+/// `(sec, nanosec)` pair and `from_ros` for a `builtin_interfaces/Time`, which
+/// lose nothing (`docs/API.md` §5.1).
 #[pyfunction]
 #[pyo3(signature = (seconds, /))]
 fn from_sec(seconds: f64) -> PyResult<i64> {
@@ -151,25 +63,9 @@ const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Exact nanoseconds from a `(sec, nanosec)` pair — `docs/API.md` §5.1.
 ///
-/// The Python spelling of `Stamp::from_parts`, and it refuses exactly what that
-/// refuses. **The refusals are the interesting half**, because both
-/// alternatives are the silent wrongness §5.1 exists to remove:
-///
-/// * a `nanosec` outside `[0, 1e9)` is **refused, not normalised** — carrying a
-///   malformed field into a plausible-looking stamp is how a wrong message
-///   becomes an unexplainable transform;
-/// * a sum outside `int64` is **refused, not wrapped** — a wrapped stamp lands
-///   on the other side of the epoch and then compares, interpolates and prints
-///   perfectly.
-///
-/// Note it is the *sum* that is range-checked and not the product: staging the
-/// check would refuse a one-second band of representable stamps at the negative
-/// end, exactly as the Rust side's comment records.
-///
-/// A negative `nanosec` is refused rather than being a type error, so that this
-/// and `Stamp::from_timespec` agree: POSIX permits a negative `tv_nsec` only in
-/// a *relative* interval, and converting one as an instant is a whole category
-/// of wrong.
+/// Refuses a `nanosec` outside `[0, 1e9)` (not normalised) and a total outside
+/// `int64` (not wrapped); the sum is range-checked, not the product. Agrees with
+/// `Stamp::from_parts`.
 #[pyfunction]
 #[pyo3(signature = (sec, nanosec, /))]
 fn from_parts(sec: i64, nanosec: i64) -> PyResult<i64> {
@@ -180,11 +76,7 @@ fn from_parts(sec: i64, nanosec: i64) -> PyResult<i64> {
              plausible-looking stamp is unrecoverable downstream"
         )));
     }
-    // `i128`, not a staged `checked_mul`/`checked_add`, for the reason the Rust
-    // side records: the staged form refuses a one-second band of *representable*
-    // stamps at the negative end. `i64 * 1e9 + u32` cannot overflow `i128`, so
-    // this arrives with the exact answer in hand and the only question left is
-    // whether it fits.
+    // `i128`: a staged checked_mul/add would refuse representable stamps at the negative end.
     let total = i128::from(sec) * i128::from(NANOS_PER_SEC) + i128::from(nanosec);
     i64::try_from(total).map_err(|_| {
         PyValueError::new_err(format!(
@@ -202,22 +94,9 @@ fn from_parts(sec: i64, nanosec: i64) -> PyResult<i64> {
 /// t = tf_tree.from_ros(msg.header.stamp)
 /// ```
 ///
-/// **Never via `to_sec()`** (`docs/PHASE3.md` §13, `docs/API.md` §5.1): the
-/// message is `{int32 sec, uint32 nanosec}` and converts exactly, so a float
-/// round trip would destroy precision this API exists to preserve — at a 2026
-/// epoch the ULP of `float64` seconds is 238 ns, which is every interval in a
-/// 1 kHz stream.
-///
-/// # Duck-typed, and deliberately
-///
-/// It reads `.sec` and `.nanosec` off whatever it is handed. **`rclpy` is not a
-/// dependency of this wheel and must not become one** — the package needs only
-/// NumPy, and a binding that imported `rclpy` to read two integers would be
-/// unusable in the notebook and the dataloader that are most of its users. Any
-/// object with those two fields works: the real message, a `dataclass`, a
-/// `SimpleNamespace` in a test.
-///
-/// Refusals are [`from_parts`]'s, unchanged.
+/// Never via `to_sec()` (`docs/PHASE3.md` §13): a float round trip destroys
+/// precision. Duck-typed on `.sec` and `.nanosec`, so `rclpy` is not a
+/// dependency. Refusals are those of `from_parts`.
 #[pyfunction]
 #[pyo3(signature = (stamp, /))]
 fn from_ros(stamp: &Bound<'_, PyAny>) -> PyResult<i64> {
@@ -236,24 +115,11 @@ fn from_ros(stamp: &Bound<'_, PyAny>) -> PyResult<i64> {
 
 /// The wall-clock domain: `CLOCK_REALTIME`, ROS `/clock` off, tag `0`.
 ///
-/// The first of the four names `docs/decisions/0038-the-domain-a-binding-cannot-name.md`
-/// exports so a caller writes a name rather than a magic number. Pass one to
-/// `tree.plan(target, source, domain=...)` or `tree.lookup(..., domain=...)`.
-///
-/// # Why these are `int`s and not an `enum`
-///
-/// `tf_tree::Domain` is an **open trait**: its tag is `u8` and tags from `4` up
-/// belong to whoever declares them (`docs/API.md` §2.5 — "a driver with a
-/// PTP-disciplined clock declares `struct PtpDomain;` rather than pretending to
-/// be one of these"). An `enum` — even an `IntEnum` — would be a closed set
-/// standing in for an open one, so the PTP driver's tag would either be
-/// unrepresentable or arrive as a bare `int` that does not compare equal to
-/// anything in it. Four names and a plain integer for the rest is the shape the
-/// trait actually has.
-///
-/// **Not [`open_arena`]'s `domain=`**, which is the `u32`
-/// rendezvous namespace — which arena to attach to, not which clock stamps the
-/// edges inside it. `tf_tree.Tree.plan`'s doc has the distinction in full.
+/// One of four names (`docs/decisions/0038-the-domain-a-binding-cannot-name.md`)
+/// for `domain=` on `tree.plan(...)` / `tree.lookup(...)`. They are `int`s
+/// because `tf_tree::Domain` is an open trait whose tags from `4` up belong to
+/// the caller (`docs/API.md` §2.5). Not `open_arena`'s `domain=`, the `u32`
+/// rendezvous namespace.
 pub const SYSTEM_DOMAIN: u8 = <tf_tree::SystemDomain as tf_tree::Domain>::TAG;
 
 /// A sensor's own clock — a lidar or camera stamping from its own oscillator,
@@ -261,11 +127,6 @@ pub const SYSTEM_DOMAIN: u8 = <tf_tree::SystemDomain as tf_tree::Domain>::TAG;
 pub const SENSOR_DOMAIN: u8 = <tf_tree::SensorDomain as tf_tree::Domain>::TAG;
 
 /// Simulated time — ROS `use_sim_time`, `/clock`. Tag `2`; see [`SYSTEM_DOMAIN`].
-///
-/// **This is the tag the record was written for.** `ros/tf_tree_ros` tells an
-/// operator to give a simulated tree its own domain, and until `0038` doing so
-/// made the arena unreadable from Python: every query here constructed a tag-`0`
-/// stamp and there was no argument that said otherwise.
 pub const SIM_DOMAIN: u8 = <tf_tree::SimDomain as tf_tree::Domain>::TAG;
 
 /// A monotonic clock — `CLOCK_MONOTONIC`, boot-relative and never stepped.
@@ -274,27 +135,17 @@ pub const STEADY_DOMAIN: u8 = <tf_tree::SteadyDomain as tf_tree::Domain>::TAG;
 
 /// Whether this build can share a tree between processes.
 ///
-/// Compile-time on the Rust side (`shm` + Linux), so a caller does not have to
-/// infer it from an error it was going to get anyway (§4.1).
+/// Compile-time (`shm` + Linux); elsewhere `open()` gives an in-process tree
+/// (§10, §4.1).
 #[pyfunction]
 fn has_shared_memory() -> bool {
-    // This crate always builds `tf_tree` with `shm`, so the only remaining
-    // question is the platform. On macOS and Windows `open()` gives an
-    // in-process tree with a documented one-process limitation (§10), and a
-    // caller should be able to branch on that rather than infer it from an
-    // error it was going to get.
     cfg!(target_os = "linux")
 }
 
 /// This build's arena format version — the *set of fields* in the header.
 ///
-/// [`tf_tree::arena_format_version`], unchanged and not recomputed. It is 3 as
-/// of `docs/PHASE5.md` §1, and a different one is never compatible: there is no
-/// conversion layer, so every participant is rebuilt from one commit and
-/// restarted together.
-///
-/// Costs no arena and takes no lock, which is the point — it answers on a
-/// machine where nothing is running and on one where everything is wedged.
+/// A different version is never compatible: no conversion layer
+/// (`docs/PHASE5.md` §1). Takes no lock and needs no arena.
 #[pyfunction]
 fn arena_format_version() -> u32 {
     tf_tree::arena_format_version()
@@ -303,16 +154,9 @@ fn arena_format_version() -> u32 {
 /// This build's arena layout hash — the *geometry*, as distinct from the
 /// format version's set of fields.
 ///
-/// [`tf_tree::arena_layout_hash`], unchanged. Both words are checked on attach
-/// and a mismatch on either is refused, but they mean different things: two
-/// builds agreeing on the version and disagreeing on the hash disagree about
-/// *where* things are, which is worse than disagreeing about what they are.
-///
-/// Returned as an `int`, not a hex string: it is compared, not read. A caller
-/// who wants it in a report writes `f"0x{tf_tree.arena_layout_hash():08X}"` —
-/// note the literal `0x`, because Python's `{:#010X}` produces `0X…` and would
-/// not match what `tft doctor --explain-version` prints, which is the string
-/// the report is going to be diffed against.
+/// A mismatch on either word is refused on attach. Returned as an `int`;
+/// format as `f"0x{tf_tree.arena_layout_hash():08X}"` to match
+/// `tft doctor --explain-version`.
 #[pyfunction]
 fn arena_layout_hash() -> u32 {
     tf_tree::arena_layout_hash()
@@ -321,8 +165,6 @@ fn arena_layout_hash() -> u32 {
 /// `tf_tree` — a transform tree engine.
 #[pymodule(gil_used = false)]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Compile-time, from this crate's manifest. See the module docs: the
-    // alternative is a literal that is silently wrong for one release.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_function(wrap_pyfunction!(arena_format_version, m)?)?;
     m.add_function(wrap_pyfunction!(arena_layout_hash, m)?)?;
@@ -330,9 +172,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(from_parts, m)?)?;
     m.add_function(wrap_pyfunction!(from_ros, m)?)?;
     m.add_function(wrap_pyfunction!(has_shared_memory, m)?)?;
-    // Plain module-level ints, not a class and not an enum: the trait they name
-    // tags in is open, so four names plus a bare integer for a fifth is the only
-    // shape that does not lie about it. See [`SYSTEM_DOMAIN`].
     m.add("SYSTEM_DOMAIN", SYSTEM_DOMAIN)?;
     m.add("SENSOR_DOMAIN", SENSOR_DOMAIN)?;
     m.add("SIM_DOMAIN", SIM_DOMAIN)?;
@@ -341,10 +180,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree::push, m)?)?;
     m.add_function(wrap_pyfunction!(tree::open_arena, m)?)?;
     m.add_function(wrap_pyfunction!(offline::open_file, m)?)?;
-    // One entry point, not two: `Tree.freeze` writes the digest `ingest_bag`
-    // recorded, so `ingest_bag(p).freeze(out)` is the whole bag-to-`.tft` path
-    // and a `freeze_bag` beside it would be a second spelling of it
-    // (`docs/decisions/0046`).
+    // No `freeze_bag`: `ingest_bag(p).freeze(out)` is the path (`docs/decisions/0046`).
     m.add_function(wrap_pyfunction!(ingest::ingest_bag, m)?)?;
     m.add_class::<PyTree>()?;
     m.add_class::<PyPlan>()?;

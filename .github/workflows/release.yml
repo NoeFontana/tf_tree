@@ -1,44 +1,19 @@
-# crates.io publication, by OIDC rather than by a stored token.
-#
-# **Why this is its own file and not a job in `wheels.yml`**, which is where the
-# PyPI publish lives and where a sibling project keeps both: a crates.io Trusted
-# Publisher is scoped to a *workflow filename*. Whatever runs in this file may
-# mint a token that can publish five crates. `wheels.yml` is a seven-row build
-# matrix that downloads artifacts produced by other jobs; this file checks out
-# the tag, runs the repository's own gates, and publishes. The smaller surface is
-# the one to hand the credential to.
-#
-# **This workflow has published.** It sat unexecuted for the whole of the
-# 2026-07-23 to 2026-08-16 Actions outage (`ci.yml`'s header), and then ran for
-# real: the `v0.0.2` tag push on 2026-08-17 completed successfully, after a
-# `v0.0.1` push the day before had failed. The `pull_request` trigger below is
-# what made that first tag push less of a leap and is still worth its minutes —
-# it exercises everything except the upload, so the gates and the tag-versus-
-# manifest assertion are checked on the branch rather than on the tag.
-#
-# **The first 0.0.1 publish could not come from here**, and that is why the
-# history above starts at 0.0.2. RFC 3691: "A Trusted Publisher Configuration can
-# only be created after an initial manual publishing of a crate" — crates.io has
-# no equivalent of PyPI's pending publisher. So each of the five crates was
-# published once by hand with a token and the Trusted Publisher configured per
-# crate afterwards. See `CONTRIBUTING.md` for that one-time sequence.
+# crates.io publication by OIDC, no stored token. Its own file because a crates.io
+# Trusted Publisher is scoped to a workflow filename, so this file, which checks
+# out the tag and runs the repository's gates, is the smaller surface to hand it.
+# The `pull_request` trigger exercises everything except the upload. The first
+# publish of each crate was manual (RFC 3691); see `CONTRIBUTING.md`.
 name: release
 
 on:
   # Tag pushes publish. `v*` matches `wheels.yml`, so one tag drives both.
   push:
     tags: ["v*"]
-  # Exercise the whole path except the upload whenever this file or the
-  # manifests it publishes change. A release workflow that is first run on the
-  # day it matters is a release workflow nobody has tested.
+  # Exercise the whole path except the upload when this file or what it publishes changes.
   pull_request:
     paths:
       - ".github/workflows/release.yml"
-      # **`justfile`, because all the packaging logic lives in
-      # `just release-archive`.** Without this line an edit to that recipe — a
-      # tar flag, the staging layout, the version check — matched nothing here,
-      # no other workflow invokes it, and the break was first met on the tag
-      # push. That is exactly the outcome the trigger above exists to prevent.
+      # `just release-archive` holds the packaging logic; no other workflow invokes it.
       - "justfile"
       - "**/Cargo.toml"
       - "Cargo.lock"
@@ -56,18 +31,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Refuse a tag whose number disagrees with the tree it points at. Neither
-  # crates.io nor PyPI permits re-uploading a version, so a mismatch caught after
-  # the upload costs a patch bump and leaves a wrong artifact in the index
-  # forever.
+  # Refuse a tag whose number disagrees with its tree; neither registry allows re-uploading a version.
   verify:
     name: verify tag, versions, and gates
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # Tags and full history, as `ci.yml`'s lint job takes them. On a tag push
-      # the answer is trivially clean, but reaching it by accident is not the
-      # same as reaching it.
+      # Tags and full history, as `ci.yml`'s lint job takes them.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -81,13 +51,8 @@ jobs:
           # `scripts/artifact-versions.py` needs `tomllib`, i.e. 3.11+.
           python-version: "3.13"
 
-      # **`just artifact-versions`, not a transcription of it.** That recipe
-      # already asserts that every version site in the repository agrees — the
-      # hand-kept copies and, since the tf2 lockfile sat four releases behind,
-      # the tracked lockfiles too — that the publishable set is exactly the five
-      # crates below, and that CHANGELOG.md carries a section for the current
-      # version. The count is the recipe's own output, not a number here. Re-spelling any of it here
-      # would be a second copy to drift (`docs/PROJECT.md` §6).
+      # `just artifact-versions` asserts every version site agrees, the publishable
+      # set is the five crates, and CHANGELOG.md has the current section.
       - name: just artifact-versions
         run: just artifact-versions
 
@@ -97,10 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/v}"
-          # `[workspace.package] version` is the one number every publishable
-          # crate inherits; `just artifact-versions` above has already asserted
-          # that every other site agrees with it, so reading it here is reading
-          # all of them.
+          # `[workspace.package] version` is inherited by every publishable crate.
           ws="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
           echo "tag=${tag} workspace=${ws}"
           if [[ "$tag" != "$ws" ]]; then
@@ -108,18 +70,8 @@ jobs:
             exit 1
           fi
 
-      # **A tag is the moment "unreleased" stops being true**, and it is the only
-      # moment this repository can know it — which is why the check is here and
-      # not in `just artifact-versions`. That recipe asserts a `## [x.y.z]`
-      # section *exists*; it cannot assert the section is honest, because on any
-      # ordinary commit "unreleased" is the correct thing for it to say.
-      #
-      # `0.0.2` shipped with its section still reading `## [0.0.2] — unreleased`
-      # while the five crates were live on crates.io and the wheel was on PyPI.
-      # Nothing was wrong with the release; the file describing it was wrong, and
-      # neither registry lets that be corrected in place afterwards. Keep a
-      # Changelog 1.1.0 — the format this file declares — puts the date in the
-      # release commit, and this is what makes that a rule rather than a habit.
+      # A tag is when "unreleased" stops being true, and neither registry lets the
+      # changelog be corrected afterwards; `just artifact-versions` cannot check this.
       - name: assert the changelog section for this tag carries a date
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -137,20 +89,9 @@ jobs:
             exit 1
           fi
 
-      # **Signed tags — `docs/PHASE5.md` §10's one genuinely open release item.**
-      # This warns rather than fails, and the split is deliberate: the gate has
-      # to exist before a key does, or it never gets written; and turning it into
-      # a hard failure today would block the next release on a key only the
-      # maintainer can create. Set the repository variable `REQUIRE_SIGNED_TAGS`
-      # to `true` once `git config user.signingkey` is set and the public key is
-      # on the GitHub account, and it becomes a refusal from that tag onward.
-      # `CONTRIBUTING.md` carries the one-time setup.
-      #
-      # `git verify-tag` needs the tag object, which a depth-1 checkout of a tag
-      # ref has, and the signer's public key, which the runner does not — so this
-      # asserts the tag is *signed*, not that the signature is trusted. GitHub's
-      # own "Verified" badge is what checks the latter, against the key on the
-      # account.
+      # Signed tags (`docs/PHASE5.md` §10): warns unless the repository variable
+      # `REQUIRE_SIGNED_TAGS` is `true`, then refuses (`CONTRIBUTING.md`). Asserts the
+      # tag is signed, not that the signature is trusted.
       - name: check the tag is signed
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -158,8 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
-          # An annotated tag's object carries the signature; a lightweight tag
-          # has no object at all and can never be signed.
+          # A lightweight tag has no object and can never be signed.
           if git cat-file -t "$tag" 2>/dev/null | grep -qx tag \
              && git cat-file tag "$tag" | grep -qE '^-----BEGIN (PGP|SSH) SIGNATURE-----'; then
             echo "tag ${tag} carries a signature"
@@ -171,15 +111,8 @@ jobs:
           fi
           echo "::warning::tag ${tag} is not signed (docs/PHASE5.md §10). Set the repository variable REQUIRE_SIGNED_TAGS=true to make this a refusal; CONTRIBUTING.md has the one-time key setup."
 
-      # A tag publishes irreversibly, so the gates run again here rather than
-      # being trusted from the pull request that produced the commit — a tag can
-      # be pushed at a commit no pull request ever gated, and nothing about a tag
-      # proves otherwise.
-      #
-      # Tag-only, deliberately: on a pull request `ci.yml` is already running
-      # exactly these two recipes against the same merge commit, and a second
-      # full run would buy nothing. What the pull-request path is for is the
-      # `dry-run` job below, which `ci.yml` does *not* cover.
+      # Tag-only: a tag can point at a commit no pull request gated. On a pull request
+      # `ci.yml` already runs these two recipes.
       - name: just lint
         if: startsWith(github.ref, 'refs/tags/v')
         run: just lint
@@ -187,52 +120,18 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: just test
 
-  # Prebuilt `tf_tree` binaries — `docs/PHASE5.md` §10's "release automation:
-  # cargo-dist or equivalent", and this is the equivalent.
-  #
-  # **§0.0 used to say this was not owed**, on the grounds that `tf_tree_cli` is
-  # `publish = false`. That argument does not hold: `publish = false` is about
-  # the crates.io *index*, and the manifest states its own reason is mechanical
-  # — three of its dependencies are path-only, so there is no version to publish
-  # against. Nothing in it says a user should not be handed a binary. Four tags
-  # have shipped to crates.io and PyPI with no GitHub Release at all, so the one
-  # audience the README puts first — somebody with a recording and no Rust
-  # toolchain — had `git clone && cargo install` as the only way in.
-  #
-  # **All four rows are native runners, and that is load-bearing.**
-  # `just release-archive` verifies an artifact by *executing* it, which a
-  # cross-build cannot do; `ubuntu-24.04-arm` is what makes the aarch64 rows
-  # checkable rather than merely built (`CLAUDE.md`: aarch64 CI became real on
-  # 2026-08-16).
-  #
-  # **Why gnu *and* musl.** Measured on the development host, the gnu build's
-  # floor is `GLIBC_2.34`: fine on ROS 2 Humble (22.04, glibc 2.35) and too high
-  # for 20.04 (2.31), a container built `FROM debian:bullseye`, or anything
-  # older. The musl rows are statically linked and have no floor at all.
-  #
-  # **The gnu rows earn their place on libc updates, not on speed.** A dynamic
-  # build picks up a glibc security fix from the distribution; a static one needs
-  # a new `tf_tree` release to carry it. An earlier revision of this comment said
-  # instead that musl's allocator is slower and that `tf_tree bench` therefore
-  # wants the gnu build — **both halves were wrong**. `cmd_bench` runs a
-  # correctness differential against a naive-Rust reference and prints
-  # `max_error` against a tolerance; it reports no timing at all and defers the
-  # perf gate to `cargo xtask bench-gate`, so there is nothing there for an
-  # allocator to distort. No performance difference between the two has been
-  # measured for this binary, and none is claimed.
-  #
-  # Not gated on the tag: this job runs on the pull-request trigger too, for the
-  # reason in this file's header — a release path first run on the day it
-  # matters is one nobody has tested. Only the upload below is tag-only.
+  # Prebuilt `tf_tree` binaries (`docs/PHASE5.md` §10). All four rows are native:
+  # `just release-archive` verifies by executing the artifact. gnu builds need
+  # glibc 2.34 and pick up distribution security fixes; musl is static with no
+  # floor. No performance difference is claimed (`cmd_bench` reports no timing).
+  # Runs on pull requests too; only the upload is tag-only.
   binaries:
     name: cli ${{ matrix.target }}
     needs: [verify]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
-      # Report every row. With `publish` gated behind this job, fail-fast would
-      # cancel three builds to tell us about one, and the whole point of running
-      # before the upload is to learn everything that is broken in one pass.
+      # Report every row rather than cancel three builds to tell us about one.
       fail-fast: false
       matrix:
         include:
@@ -252,22 +151,9 @@ jobs:
         with:
           tool: just
 
-      # **blake3 needs a C compiler on aarch64 and cannot find one for musl.**
-      # Its NEON path is C, and `cc-rs` looks for `aarch64-linux-musl-gcc`,
-      # which no runner image carries — so `cli aarch64-unknown-linux-musl`
-      # failed here with "failed to find tool" while both x86_64 rows passed.
-      # x86_64 is unaffected because blake3 has Rust intrinsics for SSE/AVX and
-      # only falls back to C on other architectures.
-      #
-      # **`musl-tools` rather than `tf_tree`'s own `pure-hash` feature**, which
-      # would also fix it by dropping to portable Rust. `blake3_64` hashes frame
-      # *names* — short strings, where BLAKE3's multi-block parallelism buys
-      # nothing — but `tf_tree_ingest::tft::digest_file` hashes an entire
-      # recording, and that is the README's first command. Taking a slower
-      # digest on one of four artifacts, to avoid a build-time-only dependency
-      # that never reaches the static binary, is the wrong trade. Installing it
-      # on both musl rows rather than only the failing one keeps the four
-      # artifacts built the same way.
+      # blake3's NEON path is C and `cc-rs` finds no `aarch64-linux-musl-gcc`; install
+      # `musl-tools` on both musl rows rather than `pure-hash`, which would slow
+      # `tf_tree_ingest::tft::digest_file` on one artifact.
       - name: musl C toolchain for blake3
         if: endsWith(matrix.target, '-musl')
         run: |
@@ -277,61 +163,33 @@ jobs:
           t="${{ matrix.target }}"
           # cc-rs reads `CC_<target with underscores>`.
           echo "CC_${t//-/_}=musl-gcc" >> "$GITHUB_ENV"
-          # Not `musl-gcc --version | head -1`: under `pipefail` a `head` that
-          # exits first sends SIGPIPE to the producer and the pipeline reports
-          # 141, which as the last command in this step would fail it. The
-          # `dry-run` job's comment below records that exact bug biting a
-          # `tar | grep -q`, so the pattern is one this repository has already
-          # decided against.
+          # No `| head -1`: under `pipefail` its SIGPIPE makes the step fail.
           musl-gcc --version 2>&1 | sed -n 1p
 
-      # One recipe, not a transcription of it (`CLAUDE.md`). It builds with
-      # `--features shm`, executes the result and compares `--version` against
-      # the workspace number, packages deterministically, unpacks what it packed
-      # and runs *that* through the `tft` symlink, and writes the checksum.
+      # One recipe: builds with `--features shm`, runs `--version`, packages
+      # deterministically, unpacks and runs that, writes the checksum.
       - name: just release-archive ${{ matrix.target }}
         run: just release-archive ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
-          # **Scoped to this row's target, not `*.tar.gz`.** The recipe already
-          # clears the whole staging directory before it builds, so this is the
-          # second of two guards against the same failure: an archive left by a
-          # previous run — a `target/` restored by the cache above, or a second
-          # target built locally — being uploaded as an asset for a version it
-          # does not belong to, which `github-release`'s count check would catch
-          # only *after* the irreversible crates.io publish.
+          # Scoped to this row's target so a stale archive from a cache is not uploaded.
           path: |
             target/release-staging/tf_tree-*-${{ matrix.target }}.tar.gz
             target/release-staging/tf_tree-*-${{ matrix.target }}.tar.gz.sha256
           # A release that silently ships nothing is worse than one that fails.
           if-no-files-found: error
 
-  # OIDC: no CARGO_REGISTRY_TOKEN in repository secrets. The token minted below
-  # lives ~30 minutes and is revoked by the action's post step.
-  #
-  # **Requires a Trusted Publisher configured per crate** at
-  # https://crates.io/me/trusted-publishers — crates.io scopes publishers per
-  # crate, unlike PyPI's per-project scope, so all five are configured
-  # separately with owner `NoeFontana`, repository `tf_tree`, workflow
-  # `release.yml`, environment `crates-io`.
-  #
-  # **The `environment:` gate is real here, and this diverges from the sibling
-  # project deliberately.** That repository omits it because GitHub enforces
-  # environment protection rules on private repositories only under paid tiers,
-  # so on a free-tier private repo the gate implies a checkpoint that does not
-  # exist — worse than no gate. `tf_tree` is public, where protection rules are
-  # enforced at no cost, which is the condition that comment names for revisiting
-  # it. Configure the environment to be reachable only from `v*` tags.
+  # OIDC: no CARGO_REGISTRY_TOKEN secret; the minted token lives ~30 minutes.
+  # Requires a Trusted Publisher per crate at https://crates.io/me/trusted-publishers
+  # (owner `NoeFontana`, repository `tf_tree`, workflow `release.yml`, environment
+  # `crates-io`, reachable only from `v*` tags). The `environment:` gate is enforced
+  # because the repository is public.
   publish:
     name: publish to crates.io
-    # **`binaries` is in here for an ordering reason, not a data one** — this
-    # job consumes nothing it produces. A crates.io upload is irreversible and a
-    # cross-target build is the likeliest thing in this file to fail, so the
-    # build runs first: a broken musl row then costs a re-run instead of a burnt
-    # version number. It also means a `v*` tag can never leave five crates on
-    # the index with no binaries to go with them.
+    # `binaries` is an ordering dependency: a crates.io upload is irreversible, so
+    # the likeliest failure (cross-build) runs first.
     needs: [verify, binaries]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -343,33 +201,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # No `Swatinem/rust-cache` on purpose: `cargo publish` packs each crate
-      # from a clean state into its own scratch directory, so a cached `target/`
-      # is dead weight.
+      # No rust-cache: `cargo publish` packs from a clean state.
 
       - name: mint a short-lived crates.io token
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      # Topological order over the workspace's internal graph. Three leaves,
-      # then the two that depend on them:
-      #
-      #   tf_tree_math   (leaf)
-      #   tf_tree_arena  (leaf)
-      #   tf_tree_ipc    (leaf)
-      #   tf_tree_core   -> math, arena
-      #   tf_tree        -> core, math, arena, ipc
-      #
-      # Sequential, and it has to be: each crate's intra-workspace requirement
-      # names the version being published, so `cargo publish -p tf_tree_core`
-      # cannot resolve until `tf_tree_math` and `tf_tree_arena` are live on the
-      # index. Modern cargo blocks until the index reflects each upload, so no
-      # sleep is needed. Measured locally: the single-crate form fails with "no
-      # matching package named `tf_tree_arena`" until its dependency lands, which
-      # is this ordering being enforced rather than a defect.
-      #
-      # `--locked` so the published tarball is built from the committed
-      # `Cargo.lock` and not from whatever the index resolved that morning.
+      # Topological order (math, arena, ipc are leaves; core; tf_tree). Sequential:
+      # each crate's workspace requirement needs its dependencies live on the index,
+      # and cargo blocks until it does. `--locked` publishes from the committed lockfile.
       - name: cargo publish tf_tree_math
         env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
         run: cargo publish --locked -p tf_tree_math
@@ -386,14 +226,8 @@ jobs:
         env: { CARGO_REGISTRY_TOKEN: "${{ steps.auth.outputs.token }}" }
         run: cargo publish --locked -p tf_tree
 
-  # On a pull request there is no tag and nothing to upload, so the same five
-  # crates are packaged and verified instead. This is what makes the `publish`
-  # job above something other than untested code on the day it first matters.
-  #
-  # The multi-package form is deliberate: the single-crate form cannot resolve
-  # `tf_tree_core` or `tf_tree` while their siblings are absent from the index,
-  # so `-p a -p b ...` — which builds one temporary registry for the set — is the
-  # only shape in which all five can be verified before the first publish.
+  # On a pull request, package and verify the same five crates. The multi-package
+  # form builds one temporary registry, the only shape where all five resolve.
   dry-run:
     name: package all five (no upload)
     needs: [verify]
@@ -404,34 +238,18 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # **`cargo package`, not `cargo publish --dry-run`, and the difference is
-      # not cosmetic.** Both build a temporary registry so the five resolve
-      # against each other, and both compile every crate from its own tarball —
-      # but `--dry-run` *removes the `.crate` files when it finishes*, leaving
-      # only the extracted directories. The step below asserts on the shipped
-      # artifact, so it needs the artifact to still exist. Measured: after
-      # `--dry-run`, `target/package/` holds `tf_tree-0.0.1/`, `tmp-crate` and
-      # `tmp-registry` and no `*.crate` at all; after `cargo package`, all five
-      # `.crate` files are there.
+      # `cargo package`, not `publish --dry-run`: the latter removes the `.crate`
+      # files the next step asserts on.
       - name: cargo package (builds and verifies all five)
         run: |
           cargo package --locked \
             -p tf_tree_math -p tf_tree_arena -p tf_tree_ipc \
             -p tf_tree_core -p tf_tree
-      # The licence texts reach a vendoring consumer only if they are inside the
-      # tarball; they are symlinks in the source tree and `cargo package`
-      # dereferences them. A Windows checkout without `core.symlinks` would ship
-      # a 17-byte file holding a path instead, so this asserts the bytes.
+      # Licences are symlinks in the source tree; assert the tarball holds real bytes.
       - name: assert every tarball carries its licences
         run: |
           set -euo pipefail
-          # **No `grep -q` on a pipe here, deliberately.** Under `pipefail`,
-          # `grep -q` exits the moment it matches, `tar` then dies of SIGPIPE,
-          # and the pipeline reports 141 — so `if ! …` reads a *successful*
-          # match as a failure and skips its own error message. The first
-          # revision of this step did exactly that and failed with no output at
-          # all, which is worse than the bug it was checking for. One listing
-          # into a variable, matched with `case`, has no pipe and no early exit.
+          # No `grep -q` on a pipe: under `pipefail` its early exit SIGPIPEs `tar`, giving 141.
           for c in tf_tree_math tf_tree_arena tf_tree_ipc tf_tree_core tf_tree; do
             crate=$(echo target/package/${c}-*.crate)
             if [ ! -f "$crate" ]; then
@@ -445,9 +263,7 @@ jobs:
                 *) echo "::error::${c} tarball is missing ${f}" >&2; exit 1 ;;
               esac
             done
-            # The licences are symlinks in the source tree and `cargo package`
-            # dereferences them; a Windows checkout without `core.symlinks`
-            # would ship a ~17-byte file holding a path instead. Assert bytes.
+            # A Windows checkout without `core.symlinks` would ship a ~17-byte path file.
             bytes=$(tar xzOf "$crate" --wildcards "*/LICENSE-MIT" | wc -c)
             if [ "$bytes" -lt 1000 ]; then
               echo "::error::${c}'s LICENSE-MIT is ${bytes} bytes, too small to be the licence text" >&2
@@ -457,21 +273,9 @@ jobs:
           done
           echo "all five tarballs carry LICENSE-MIT, LICENSE-APACHE, NOTICE and README.md"
 
-  # Create the GitHub Release and attach the binaries.
-  #
-  # **Nothing created a Release before this job existed.** A tag push creates a
-  # tag ref and nothing else; `v0.0.1` through `v0.0.4` are tags with no Release
-  # behind them, so the repository's Releases page has been empty for the whole
-  # of its published life. This is the job that changes that, and it is separate
-  # from `binaries` because the two answer to different permissions: that job
-  # needs none, this one needs `contents: write`.
-  #
-  # **It runs after `publish`, not beside it.** A Release advertising a version
-  # that is not on crates.io sends a user to `cargo add tf_tree` that fails. The
-  # ordering costs nothing — nobody is waiting on a release by the minute — and
-  # it means the Release page and the index cannot disagree in the direction
-  # that matters. The other direction (index ahead of Release) is recoverable by
-  # re-running this job; that is the asymmetry being bought.
+  # Create the GitHub Release and attach the binaries; needs `contents: write`, so
+  # separate from `binaries`. After `publish`, so the Release never advertises a
+  # version absent from crates.io; the reverse gap is fixed by re-running this job.
   github-release:
     name: attach binaries to the GitHub Release
     needs: [binaries, publish]
@@ -488,57 +292,29 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # **Verify what arrived, rather than trusting the transport.** Each row
-      # wrote its own `.sha256` beside its archive on the machine that built it,
-      # so checking them here covers the upload/download round trip. `-c` fails
-      # on a truncated or re-encoded artifact, which is the failure this catches
-      # and no other step would.
+      # Verify what arrived; `-c` fails on a truncated or re-encoded artifact.
       - name: verify every checksum, and that all four rows arrived
         run: |
           set -euo pipefail
           cd dist
           ls -la
-          # The count tracks the matrix above. Hard-coded on purpose: the
-          # failure being guarded is a row that silently stopped producing an
-          # artifact, and a check derived from whatever turned up cannot see it.
-          # **`find`, not `ls *.tar.gz`.** Under `set -euo pipefail` the glob
-          # form aborts the script at this assignment when the directory is
-          # empty — `ls` fails on the unexpanded pattern, `pipefail` propagates
-          # it, `set -e` exits — so the one case this check exists for, a row
-          # that silently produced nothing, was the case it reported nothing
-          # about. Verified: exit 2, no annotation.
+          # The count tracks the matrix, hard-coded so a silent row is caught. `find`,
+          # not `ls *.tar.gz`, which aborts under `set -e` on an empty directory.
           n=$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)
           if [ "$n" -ne 4 ]; then
             echo "::error::expected 4 archives from the binaries matrix, found ${n}" >&2
             exit 1
           fi
           sha256sum -c ./*.tar.gz.sha256
-          # One aggregate file, which is what a user checking a single download
-          # actually wants. The per-archive `.sha256` files are then removed so
-          # they are not uploaded beside it — `SHA256SUMS` carries every line
-          # they did.
+          # One aggregate file; the per-archive `.sha256` files are then removed.
           cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
           rm -f ./*.tar.gz.sha256
           cat SHA256SUMS
 
-      # **The SBOM `docs/PHASE5.md` §10 asks for.** Generated here rather than in
-      # the `binaries` matrix because it describes the release, not one target:
-      # the dependency graph is the same for all four archives, so producing it
-      # once beside them is the honest shape. It is deterministic — same graph,
-      # same bytes, same serial number — so two releases diff to their dependency
-      # change and nothing else.
-      #
-      # **This step spells the command out rather than invoking `just sbom`,
-      # and that is a known residual.** CLAUDE.md's rule is that CI mirrors the
-      # recipes by invoking them; this job installs a Rust toolchain and not
-      # `just`, so closing it costs an install step on the release path. What
-      # bounds the drift meanwhile is that both spellings call the same script
-      # with the same `--version` **value** — the tag with its `v` stripped,
-      # which is the workspace number `just sbom`'s default resolves to, so the
-      # documents are identical — and that `just lint` now runs the recipe on
-      # every pull request, so the generator is exercised even though this step,
-      # gated on a tag, still has not been. The two differ in the `-o` name
-      # only: the asset here keeps the `v` so it sorts with the archives.
+      # The SBOM (`docs/PHASE5.md` §10): once per release, deterministic. Spelled out
+      # rather than `just sbom` because this job has no `just`; both call the same
+      # script with the same version (`just lint` exercises the recipe). Only the `-o`
+      # name differs.
       - uses: dtolnay/rust-toolchain@stable
       - name: generate the SBOM
         run: |
@@ -547,17 +323,11 @@ jobs:
           python3 scripts/sbom.py --version "${tag#v}" -o "dist/tf_tree-${tag}-sbom.cdx.json"
           python3 -c "import json,sys; b=json.load(open(sys.argv[1])); print(f\"sbom: {len(b['components'])} shipped dependencies, serial {b['serialNumber']}\")" \
             "dist/tf_tree-${tag}-sbom.cdx.json"
-          # Into SHA256SUMS as well, so every asset on the release is covered by
-          # the one file a user checks. The archives' lines came from the
-          # machines that built them; this one is added here because the SBOM is
-          # produced here.
+          # Into SHA256SUMS too, so one file covers every asset.
           ( cd dist && sha256sum "tf_tree-${tag}-sbom.cdx.json" >> SHA256SUMS && sort -k2 -o SHA256SUMS SHA256SUMS )
           cat dist/SHA256SUMS
 
-      # Notes come from CHANGELOG.md, which the `verify` job has already
-      # asserted has a section for this tag carrying a real date. Deriving them
-      # here rather than hand-writing a release body is what keeps the two from
-      # drifting — the changelog is the maintained one.
+      # Notes come from CHANGELOG.md, which `verify` asserted has a dated section for this tag.
       - name: assemble the release notes
         run: |
           set -euo pipefail
@@ -603,21 +373,13 @@ jobs:
           EOF
           } | sed "s/<version>/${tag}/g" > NOTES.md
 
-          # **GitHub rejects a release body over 125 000 characters**, and this
-          # one is assembled from a changelog section that only grows — the
-          # section for `v0.0.5` rendered at 71 141 bytes, over half the cap, and
-          # a release section is only ever appended to before its tag. Meeting it
-          # would return HTTP 422 *after* the irreversible crates.io publish,
-          # and a re-run would rebuild the same oversized body every time — so
-          # the recoverability this job is ordered for would not exist. Truncate
-          # instead, and say so in the body rather than silently dropping half a
-          # changelog.
+          # GitHub rejects a release body over 125 000 characters (HTTP 422, after the
+          # irreversible publish), so truncate and say so in the body.
           limit=120000
           if [ "$(wc -c < NOTES.md)" -gt "$limit" ]; then
             head -c "$limit" NOTES.md > NOTES.trunc
             {
-              # Cut back to the last blank line so the truncation does not land
-              # mid-sentence or inside a fenced code block.
+              # Cut back to the last blank line, not mid-sentence or inside a fence.
               sed -e :a -e '$!{N;ba' -e '}' -e 's/\n[^\n]*$//' NOTES.trunc
               printf '\n\n---\n\n**This release body was truncated at %s bytes.** The full entry for this release is in [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
                 "$limit" "$GITHUB_REPOSITORY" "$tag"
@@ -627,15 +389,8 @@ jobs:
           fi
           wc -c NOTES.md
 
-      # `gh` is preinstalled on the runner, so this needs no action and no
-      # third-party token — `github.token` with `contents: write` is enough.
-      #
-      # **Written to be re-runnable.** `gh release create` fails on a release
-      # that already exists, which is precisely the state a re-run lands in when
-      # a first attempt created the release and then failed uploading an asset —
-      # and the reason `publish` runs *before* this job is that this is the half
-      # that should be recoverable. Creating when absent and clobbering when
-      # present makes a second click finish the job instead of jamming it.
+      # Re-runnable: `gh release create` fails on an existing release, the state a
+      # re-run lands in after a failed asset upload.
       - name: create the release, or complete a half-finished one
         env:
           GH_TOKEN: ${{ github.token }}
@@ -646,25 +401,12 @@ jobs:
             echo "release ${tag} exists; updating notes and re-uploading assets"
             gh release edit "$tag" --notes-file NOTES.md
             gh release upload "$tag" dist/*.tar.gz dist/SHA256SUMS dist/*-sbom.cdx.json --clobber
-            # **`--draft=false` here too, and its absence made this whole branch
-            # a trap.** The state a re-run actually lands in is the one the
-            # `else` arm creates and then fails to finish: a *draft* with some
-            # assets. Without this line the recovery path uploaded the rest,
-            # left the release invisible, and exited 0 — reporting success for a
-            # release nobody can see. Idempotent when it is already published.
+            # `--draft=false` here too: a re-run lands on a draft with some assets.
             gh release edit "$tag" --draft=false
           else
-            # **`--draft`, then publish once the assets are up.** `gh release
-            # create` creates a *published* release and then uploads the five
-            # assets sequentially; during that window `releases/latest` resolves
-            # the new tag while the download URL 404s — and that URL is exactly
-            # what `README.md`'s two-line install snippet curls. Creating as a
-            # draft and clearing the flag afterwards makes the release atomic
-            # from a reader's point of view.
-            #
-            # `--verify-tag` refuses to invent a release for a tag that is not
-            # on the remote, which is the one mistake this step could make
-            # silently.
+            # Draft first, published once the assets are up: otherwise
+            # `releases/latest` resolves the tag while the download URL (README's
+            # install snippet) 404s. `--verify-tag` refuses a tag not on the remote.
             gh release create "$tag" \
               --title "$tag" \
               --notes-file NOTES.md \

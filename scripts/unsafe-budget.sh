@@ -1,103 +1,43 @@
 #!/usr/bin/env bash
-# Every file carrying `unsafe` is one `docs/decisions/0007` rule 1 authorises.
+# Every file carrying `unsafe` is one `docs/decisions/0007` rule 1 authorises
+# (`just unsafe-budget`; see also `0048`).
 #
-# See `just unsafe-budget`, `docs/decisions/0007-the-unsafe-budget-and-the-c-abi.md`
-# and `docs/decisions/0048-a-kind-is-not-a-crate-name.md`.
-#
-# **What it pins is a FILE SET under `crates/` and `xtask/`, and that is the
-# whole of its claim.** The census
-# is taken with `RUSTFLAGS="--force-warn unsafe_code"`, and that lint's output is
-# `file:line: warning: usage of an `unsafe` block` — it carries **no kind**. So
-# the `kind` column in the register beside this script is bookkeeping a human
-# maintains, and 0007 rule 1's *criterion* stays a review rule. What this check
-# holds is that a **new file** cannot start carrying `unsafe` without somebody
-# writing down which kind it is, and that a register row cannot outlive the file
-# it names.
-#
-# **Why the compiler and not a grep.** Two greps over `crates/`, wrong in
-# opposite directions: a plain `grep -rn unsafe` over-counts, and dozens of its
-# hits are `unsafe_code` / `unsafe_op_in_unsafe_fn` **attributes** — the rule's
-# own enforcement mechanism, counted as violations of it. The word-boundary form
-# `grep -rn -E '\bunsafe\b'` drops those (there is no word boundary before `_`)
-# and still over-counts by more than a hundred lines, because this repository's
-# prose *about* `unsafe` is unusually dense and every `// SAFETY:` paragraph that
-# uses the word counts. `docs/decisions/0048` tabulates all of it with the
-# commands. `--force-warn` overrides `#![forbid(unsafe_code)]` rather than being
-# suppressed by it, so a crate root that forbids is still censused.
-#
-# **Why the matrix comes from the justfile.** `unsafe` behind a feature no
-# command builds is invisible to any census, and this repository has several:
-# `footprint` builds by default, `abi_attached` needs `abi-probe`, `fork_child`
-# needs `shm` and its fourth mode `bridge`. Re-spelling that list here would let
-# it drift from the clippy passes it is meant to mirror, so the selectors are
-# **read out of the justfile's own `cargo clippy … --all-targets` lines**. A new
-# feature-named pass therefore enters this census the day it is added —
-# **provided it is written on one physical line**, which the extractor requires
-# and which `continuation_blind_spots` below is what makes true rather than
-# hoped for. It reports, by name, a pass whose `--all-targets` sits past a
-# `\`; before it existed the sentence above was simply false for that shape,
-# and the file being read already contained one.
+# Pins a FILE SET under `crates/` and `xtask/`: a new file cannot start carrying
+# `unsafe` without a register row, and a row cannot outlive its file. The census
+# uses `RUSTFLAGS="--force-warn unsafe_code"` (overrides `forbid`), whose output
+# carries no kind, so the register's `kind` column is human bookkeeping. The
+# feature matrix is read out of the justfile's one-line `cargo clippy ...
+# --all-targets` passes so it cannot drift; `continuation_blind_spots` reports a
+# pass the extractor cannot see.
 #
 # ## What it does NOT prove
 #
-# * **Nothing about kinds.** See above. A file authorised as kind 2 that acquires
-#   a kind-4 block is green here.
-# * **Nothing about `crates/tf_tree_py` or `crates/tf_tree_tf2_sys`.** Both are
-#   excluded from the cargo workspace, so no `-p` selector reaches them. Their
-#   register rows are marked `out-of-reach` and are neither required nor
-#   forbidden in the census. What covers them is `just py-compile` and the
-#   container-only `just tf2-check`; the counts in `0048` were taken by running
-#   this same census against their own manifests, by hand.
-# * **Nothing about a path outside `crates/` and `xtask/`.** The census lines are
-#   filtered to those two roots, so a workspace member added anywhere else — or a
-#   `build.rs` whose diagnostics carry a different prefix — is invisible until the
-#   filter is widened with it. `xtask` was invisible for exactly this reason until
-#   2026-09-05, and it is a workspace member the `--workspace` selector compiles.
-# * **Nothing about a feature combination no justfile clippy line builds.** That
-#   is the same hole `just shm-check`'s own comments already name, and mirroring
-#   the justfile is how it stays exactly that hole and no larger.
-# * **Nothing about `// SAFETY:` comments or module blocks** — 0007 rules 3 and
-#   4 — and this script does not read them. **Per-block presence is not a review
-#   rule any more, but this script is not what holds it:** clippy's
-#   `undocumented_unsafe_blocks` is `deny` in the root `[workspace.lints.clippy]`
-#   and in `tf_tree_py`'s and `tf_tree_tf2_sys`' own `[lints.clippy]`, so every
-#   `clippy -D warnings` pass that compiles a block fails if the block has no
-#   comment of its own. That lint checks where a comment sits, not what it says:
-#   whether it names the invariant, and the module-level blocks, are still
-#   review. It reaches exactly what some clippy line compiles — `just
-#   py-compile` for `tf_tree_py`, the container-only `just tf2-check` for
-#   `tf_tree_tf2_sys` — so a `cfg` no clippy line builds (`--cfg loom`, a
-#   non-Linux target) is unlinted.
+# * Anything about kinds: a kind-2 file acquiring a kind-4 block stays green.
+# * `crates/tf_tree_py` and `crates/tf_tree_tf2_sys` (outside the workspace; rows
+#   are `out-of-reach`; covered by `just py-compile` and `just tf2-check`).
+# * Paths outside `crates/` and `xtask/`.
+# * Feature combinations no justfile clippy line builds.
+# * `// SAFETY:` comments or module blocks (0007 rules 3-4). Clippy's
+#   `undocumented_unsafe_blocks` (deny) checks placement only, and only on code
+#   some clippy line compiles; whether a comment names its invariant is review.
 #
 # ## The empty-subject question
 #
-# A violation inside the covered path set *adds* a row to the census, so one
-# failure mode is the census collapsing — a wrong feature set, a renamed recipe,
-# a filter typo, a cargo invocation that printed nothing. `census − register` is
-# then empty and a naive comparison is GREEN. So both floors below run **before**
-# any comparison, and an empty census is a FAILURE.
-# `bash scripts/unsafe-budget.sh --self-test` drives the comparison over
-# synthetic inputs and asserts each verdict. It is one failure mode and not the
-# only one: the disclosed holes above are the others, and they are holes in the
-# census's *reach* rather than in its comparison.
+# A collapsed census (wrong feature set, renamed recipe, filter typo) makes
+# `census - register` empty and a naive comparison green, so both floors run
+# before any comparison and an empty census FAILS. `--self-test` drives the
+# comparison over synthetic inputs.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 REG=scripts/unsafe-budget.txt
 
-# Anti-vacuity floors, not budgets. They exist to fail a *collapsed* census, so
-# they sit far below the real numbers and never need updating when a file gains
-# or loses a block. The real counts live in `0048` with the command that
-# produced them.
+# Anti-vacuity floors, not budgets: far below the real numbers (see `0048`), they only fail a collapsed census.
 MIN_SELECTORS=15
 MIN_SITES=100
 MIN_REGISTER=20
 
-# ---------------------------------------------------------------------------
-# The comparison, factored out so `--self-test` can drive it over fixtures.
-# `$1` = file holding the census file list; `$2` = register file.
-# Prints violations, returns 1 if any.
-# ---------------------------------------------------------------------------
+# The comparison, factored out for `--self-test`. `$1` = census file list; `$2` = register; returns 1 on a violation.
 compare() {
     local census_files="$1" register="$2" bad=0
     local allowed out_of_reach required
@@ -129,24 +69,10 @@ compare() {
     [ "$bad" -eq 0 ]
 }
 
-# ---------------------------------------------------------------------------
-# The matrix is extracted line by line, so a pass whose `--all-targets` sits on
-# a `\`-continued line contributes NOTHING to the census and nothing says so.
-#
-# That shape is not hypothetical: the file being read already contains one —
-# `py-compile`'s `cargo clippy \` / `--all-targets`. It is excluded for another
-# reason (`--manifest-path`), so today it costs nothing, and the floor cannot
-# cover for it either: a floor absorbs a drop, it does not report one.
-#
-# Joining continuations *before* extracting is the wrong repair — it merges
-# `tf2-check`'s three invocations into one line that the `--manifest-path`
-# filter then swallows whole. So the extractor is left alone and this reports,
-# by name, a clippy pass the matrix cannot see: one whose joined form carries
-# `--all-targets`, whose physical line does not, and which none of the three
-# exclusions would have dropped anyway.
-#
-# `$1` = the justfile to read. Prints each invisible pass; returns 1 if any.
-# ---------------------------------------------------------------------------
+# The matrix is extracted line by line, so a pass whose `--all-targets` sits past
+# a `\` continuation would silently contribute nothing. This reports, by name, a
+# clippy pass whose joined form carries `--all-targets` and whose physical line
+# does not (and which no exclusion would drop). `$1` = justfile; returns 1 if any.
 continuation_blind_spots() {
     awk '
         { sub(/#.*/, "") }
@@ -166,9 +92,7 @@ continuation_blind_spots() {
     ' "$1"
 }
 
-# ---------------------------------------------------------------------------
 # Self-test: the ways this check can be wrong, driven over fixtures.
-# ---------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
     d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
     printf '# kind path note\n1 a.rs\n2 b.rs\n3 far.rs out-of-reach\n' > "$d/reg"
@@ -236,9 +160,7 @@ if [ "${1:-}" = "--self-test" ]; then
     exit 0
 fi
 
-# ---------------------------------------------------------------------------
 # The matrix, read out of the justfile.
-# ---------------------------------------------------------------------------
 mapfile -t SELECTORS < <(
     grep -h 'cargo clippy' justfile \
         | sed 's/#.*//' \
@@ -270,17 +192,11 @@ if [ "${#SELECTORS[@]}" -lt "$MIN_SELECTORS" ]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
 # The census.
-# ---------------------------------------------------------------------------
 raw=$(mktemp); files=$(mktemp)
 trap 'rm -f "$raw" "$files"' EXIT
 
-# **A failing `cargo check` must fail this script, not quietly contribute zero
-# rows.** A selector that does not compile loses its whole contribution to the
-# census, and `census − register` then reports STALE rows rather than the build
-# error that caused them — which reads as a tidy-up job rather than as a broken
-# tree. The floors below catch a *total* collapse; this catches one selector's.
+# A failing `cargo check` must fail this script, not quietly contribute zero rows.
 for sel in "${SELECTORS[@]}"; do
     out=$(mktemp)
     # shellcheck disable=SC2086  # $sel is a deliberate word-split selector

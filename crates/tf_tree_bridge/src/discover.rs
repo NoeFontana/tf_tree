@@ -1,37 +1,16 @@
-//! `--discover`: watch a `/tf` stream, print the config file it implies.
+//! `--discover`: watch a `/tf` stream, print the config file it implies
+//! (`docs/PHASE4.md` §5.8). Runs against a live system or a recorded `.tfstream`.
 //!
-//! `docs/PHASE4.md` §5.8's amendment: *"A `--discover` mode that subscribes,
-//! collects and prints a config file is how an operator obtains that file."*
+//! Two findings are defects in the observed system and are reported, not encoded:
 //!
-//! It is the answer to the obvious objection to config-driven topology — that
-//! nobody wants to hand-write forty edges for a robot whose URDF already knows
-//! them. Run the bridge in discover mode against the running system (or, with
-//! no ROS at all, against a recorded `.tfstream`), read the file it prints,
-//! edit the ring sizes, ship it.
+//! * **A child with two parents** (D4/`0004`): first parent wins, the rest are
+//!   counted and named; [`TopologyConfig::parse`] refuses a duplicate child.
+//! * **An edge on both `/tf` and `/tf_static`** (§5.7): first topic wins, the
+//!   clash is counted.
 //!
-//! # What it is *not*
-//!
-//! It is not a substitute for reading the file. Two things it finds are
-//! **defects in the observed system**, not topology to encode, and it reports
-//! them rather than silently resolving them:
-//!
-//! * **A child with two parents.** `tf_tree` gives a frame exactly one parent
-//!   (D4/`0004`); `tf2` lets two publishers give it two and re-parents on every
-//!   message. First parent seen wins here, the rest are counted and named — and
-//!   because [`TopologyConfig::parse`] refuses a duplicate child outright, a
-//!   config that kept both would not even reparse.
-//! * **An edge on both `/tf` and `/tf_static`.** §5.7 calls a kind change a
-//!   hard error. First topic seen wins, the clash is counted.
-//!
-//! # Rates
-//!
-//! A dynamic edge's ring is sized from the rate actually observed —
-//! `(samples − 1) / span`, which is the mean interval and not the nominal rate
-//! the launch file claims. It is rounded **up** to two decimals so a recording
-//! that saw 4.29 Hz never produces a ring sized for 4.28, and then
-//! [`Capacity::history`](tf_tree::Capacity::history) rounds up to a power of two on top of that. An edge
-//! with fewer than two samples has no measurable rate at all and gets an
-//! explicit slot count instead of a fabricated one.
+//! A dynamic edge's ring is sized from the observed mean rate
+//! `(samples - 1) / span`, rounded **up** to two decimals; an edge with fewer
+//! than two samples gets an explicit slot count instead.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,10 +29,7 @@ struct Seen {
     count: u64,
     first_ns: i64,
     last_ns: i64,
-    /// The first pose observed, kept only for static edges. **First**, not
-    /// last, so discovery agrees with `FirstWriterWins` (§5.4): if two
-    /// publishers disagree about a static, the config records the one the
-    /// bridge would have kept.
+    /// The first pose observed (static edges only), matching `FirstWriterWins` (§5.4).
     pose: [f64; 7],
     /// Set when a later sample for this edge arrived on the other topic.
     kind_clash: bool,
@@ -66,9 +42,7 @@ pub struct Discovery {
     edges: BTreeMap<(String, String), Seen>,
     /// child -> the parent that owns it, so a second parent is detectable.
     parent_of: BTreeMap<String, String>,
-    /// child -> **every** parent rejected for it, not just the last one. A map
-    /// to a single `String` reported one parent for a child that had three,
-    /// which understates exactly the defect this collector exists to surface.
+    /// child -> every parent rejected for it.
     rejected_parents: BTreeMap<String, BTreeSet<String>>,
     dropped_multi_parent: u64,
     dropped_bad_name: u64,
@@ -76,12 +50,8 @@ pub struct Discovery {
     default_interp: InterpPolicy,
 }
 
-/// The fallback ring for an edge whose rate could not be measured.
-///
-/// Reached only when an edge produced fewer than two samples in the whole
-/// recording, so any rate would be invented. 64 slots is a placeholder loud
-/// enough to be noticed in the printed file and small enough that shipping it
-/// unedited wastes nothing.
+/// The fallback ring for an edge with fewer than two samples: a placeholder
+/// loud enough to notice and small enough to ship unedited.
 pub const UNMEASURABLE_RATE_SLOTS: u32 = 64;
 
 impl Discovery {
@@ -115,12 +85,8 @@ impl Discovery {
         self
     }
 
-    /// Record one transform.
-    ///
-    /// Names are normalized exactly as [`crate::Ingest`] normalizes them, so
-    /// the config this prints is keyed the way the bridge will look it up. A
-    /// discovered config keyed on `/base_link` while the running bridge keys on
-    /// `base_link` would declare every edge and match none.
+    /// Record one transform. Names are normalized as [`crate::Ingest`] does, so
+    /// the printed config is keyed the way the bridge looks edges up.
     pub fn observe(&mut self, topic: Topic, sample: &Sample) {
         let (Ok(parent), Ok(child)) = (
             self.names.normalize(&sample.frame_id),
@@ -134,22 +100,15 @@ impl Discovery {
             self.dropped_bad_name += 1;
             return;
         }
-        // `NameNormalizer` refuses only the empty name and a bare `/` — it is
-        // §5.6's wire rule, not a file rule. This collector's output is a
-        // *config file*, so a name has to survive being written and read back,
-        // and only `frame_name_ok` decides that. Without this a robot
-        // publishing `odo"m` produced `parent = "odo"m"`, which this crate's
-        // own parser refuses — so `--discover > topology.toml` emitted a file
-        // that `--config` could not read, and the operator found out on the
-        // robot rather than on the laptop.
+        // `NameNormalizer` is the wire rule; only `frame_name_ok` decides that a
+        // name survives a write/read round trip through a config file.
         if !frame_name_ok(&parent) || !frame_name_ok(&child) {
             self.dropped_bad_name += 1;
             return;
         }
         match self.parent_of.get(&child) {
             Some(p) if *p != parent => {
-                // A second parent for one child. Recorded, not encoded: see the
-                // module docs.
+                // Recorded, not encoded: see the module docs.
                 self.dropped_multi_parent += 1;
                 self.rejected_parents
                     .entry(child)
@@ -218,10 +177,7 @@ impl Discovery {
     }
 
     /// Children seen with more than one parent, as `(child, rejected parent)`.
-    ///
-    /// Non-empty means the observed system is doing something `tf_tree` cannot
-    /// represent and `tf2` was hiding — the §5.4 class of finding. The caller
-    /// must surface it; the printed config keeps the **first** parent.
+    /// The caller must surface it; the printed config keeps the first parent.
     #[must_use]
     pub fn multi_parent(&self) -> Vec<(&str, &str)> {
         self.rejected_parents
@@ -231,16 +187,12 @@ impl Discovery {
     }
 
     /// Transforms discarded because their child already had a different parent.
-    ///
-    /// The module docs promise a second parent's samples are *"counted and
-    /// named"*; [`Discovery::multi_parent`] names them and this counts them.
     #[must_use]
     pub fn dropped_multi_parent(&self) -> u64 {
         self.dropped_multi_parent
     }
 
-    /// Edges that arrived on both `/tf` and `/tf_static` — §5.7's hard error,
-    /// found before the bridge is ever started.
+    /// Edges that arrived on both `/tf` and `/tf_static` (§5.7).
     #[must_use]
     pub fn kind_clashes(&self) -> Vec<(&str, &str)> {
         self.edges
@@ -250,9 +202,8 @@ impl Discovery {
             .collect()
     }
 
-    /// Transforms discarded because a frame name was unusable (§5.6), because
-    /// parent and child were the same frame, or because the name could not be
-    /// written to a config file and read back (`"`, `\`, a control character).
+    /// Transforms discarded for an unusable name (§5.6), a self-edge, or a name
+    /// that cannot round-trip through a config file.
     #[must_use]
     pub fn dropped_bad_name(&self) -> u64 {
         self.dropped_bad_name
@@ -268,20 +219,13 @@ impl Discovery {
     }
 }
 
-/// The mean rate over the observed span, rounded **up** to two decimals.
+/// The mean rate over the observed span, rounded **up** to two decimals; `None`
+/// when fewer than two samples arrived or all share one stamp.
 ///
-/// `None` when fewer than two samples arrived or they all carried the same
-/// stamp: there is no rate to measure, and inventing one puts a number in the
-/// operator's file that no observation supports.
-///
-/// **This is an observation, and `rate_hz` in the emitted file is read back as
-/// an intention.** Since `docs/PHASE5.md` §6's amendment, `rate_hz` is also the
-/// arena's declared nominal, which `tf_tree doctor`'s `TFT007` judges the robot
-/// against — so a recording captured while a publisher was degraded discovers
-/// the fault as the declaration, and `doctor` would then certify the fault and
-/// fire once the publisher is repaired. Nothing here can tell the two apart;
-/// the mitigation is that `--discover` prints each edge's sample count and the
-/// amendment states that a discovered rate is a starting point to review.
+/// An observation that the emitted `rate_hz` reads back as an intention
+/// (`docs/PHASE5.md` §6, `TFT007`): a recording of a degraded publisher
+/// discovers the fault as the declaration. `--discover` prints sample counts so
+/// the operator can review.
 fn measured_rate(s: &Seen) -> Option<f64> {
     let span_ns = s.last_ns.checked_sub(s.first_ns)?;
     if s.count < 2 || span_ns <= 0 {
@@ -305,18 +249,10 @@ mod tests {
         Sample::identity(p, c, t)
     }
 
-    /// **A discovered config parses back, and the round trip is what makes the
-    /// mode usable at all**: the operator edits what was printed.
+    /// A discovered config parses back to itself; the fixture is irregular
+    /// (jitter, a static, a `/`-prefixed spelling of a bare frame).
     ///
-    /// The fixture is deliberately irregular — two edges at different rates,
-    /// jittered stamps, a static, and a `/`-prefixed spelling of a frame that
-    /// also appears bare — so the emitted rates are not round numbers and the
-    /// normalization is actually exercised.
-    ///
-    /// Mutant: emit `rate_hz` without [`crate::config::float`]'s `.0` guard for
-    /// a whole-number rate and the reparse still works (`as_f64` accepts an
-    /// integer); emit the two spellings as two edges instead of normalizing and
-    /// this fails with `DuplicateChild`, which is the real property.
+    /// Mutant: emit the two spellings as two edges ⇒ `DuplicateChild`.
     #[test]
     fn a_discovered_config_reparses_to_itself() {
         let mut d = Discovery::new(10.0);
@@ -328,8 +264,7 @@ mod tests {
             },
         );
         for k in 0..100i64 {
-            // 20 Hz nominal with ±1 ms of jitter, so the measured rate is not
-            // exactly 20.
+            // 20 Hz nominal with ±1 ms jitter.
             d.observe(
                 Topic::Tf,
                 &dyn_sample(
@@ -369,17 +304,10 @@ mod tests {
         assert!(tree.claim(foot, odom).is_ok());
     }
 
-    /// **The measured rate is the observed one, not the nominal one**, and it
-    /// is rounded **up** so a ring is never sized for a rate slower than what
-    /// arrived.
+    /// The rate is measured and rounded up; 19.783001… Hz gives 19.79 under
+    /// `ceil` and 19.78 under `round`.
     ///
-    /// The interval is chosen so `ceil` and `round` disagree — 19.783001… Hz
-    /// gives 19.79 one way and 19.78 the other. A fixture landing on a round
-    /// number (99 samples over exactly 5 s ⇒ 19.8) would assert nothing about
-    /// the direction, which is the only interesting half.
-    ///
-    /// Mutant: `.round()` instead of `.ceil()` in `measured_rate` ⇒ 19.78, and
-    /// this fails.
+    /// Mutant: `.round()` instead of `.ceil()` in `measured_rate`.
     #[test]
     fn the_rate_is_measured_and_rounded_up() {
         let mut d = Discovery::new(10.0);
@@ -402,12 +330,10 @@ mod tests {
         }
     }
 
-    /// **An edge with one sample has no rate**, so it gets an explicit slot
-    /// count rather than a fabricated frequency.
+    /// An edge with one sample has no rate: it gets a slot count, not an
+    /// invented frequency.
     ///
-    /// Mutant: return `Some(1.0)` from `measured_rate` on the degenerate case ⇒
-    /// the file says `rate_hz = 1.0` about an edge nothing measured, and an
-    /// operator has no way to tell it apart from a real 1 Hz edge.
+    /// Mutant: return `Some(1.0)` from `measured_rate` on the degenerate case.
     #[test]
     fn an_unmeasurable_rate_is_not_invented() {
         let mut d = Discovery::new(10.0);
@@ -429,15 +355,9 @@ mod tests {
         }
     }
 
-    /// **A child with two parents is reported, not encoded** — and it must be,
-    /// because a config carrying both does not even reparse.
+    /// A child with two parents is reported, not encoded (§5.4).
     ///
-    /// This is the §5.4 class of finding: `tf2` re-parents on every message and
-    /// says nothing, so a system can run for months like this.
-    ///
-    /// Mutant: drop the `parent_of` check and let both edges in ⇒ `to_config`
-    /// emits two `[[edge]]` blocks with `child = "base_link"` and the reparse
-    /// fails with `DuplicateChild`, which this asserts cannot happen.
+    /// Mutant: drop the `parent_of` check ⇒ reparse fails with `DuplicateChild`.
     #[test]
     fn a_second_parent_is_reported_and_the_config_still_reparses() {
         let mut d = Discovery::new(10.0);
@@ -457,10 +377,9 @@ mod tests {
         );
     }
 
-    /// **An edge on both topics is a §5.7 hard error, found before startup.**
+    /// An edge on both topics is reported (§5.7).
     ///
-    /// Mutant: never set `kind_clash` ⇒ this reports nothing and the operator
-    /// meets the failure at run time, one dropped transform at a time.
+    /// Mutant: never set `kind_clash`.
     #[test]
     fn an_edge_on_both_topics_is_reported() {
         let mut d = Discovery::new(10.0);
@@ -472,13 +391,9 @@ mod tests {
         assert!(matches!(cfg.edges[0].shape, EdgeShape::Static { .. }));
     }
 
-    /// **An unusable frame name is dropped and counted**, not turned into an
-    /// edge named `""` that the config parser then rejects.
+    /// An unusable frame name is dropped and counted.
     ///
-    /// Mutant: drop the `parent == child` guard ⇒ the self-edge is counted as
-    /// an edge (`dropped_bad_name` falls to 1) and `to_config` emits a block
-    /// whose parent and child are the same frame — a file the parser refuses
-    /// with `SelfEdge`.
+    /// Mutant: drop the `parent == child` guard ⇒ a `SelfEdge` file.
     #[test]
     fn a_bad_name_never_reaches_the_config() {
         let mut d = Discovery::new(10.0);
@@ -488,22 +403,11 @@ mod tests {
         assert!(d.to_config().edges.is_empty());
     }
 
-    /// **A frame name that cannot survive the config file is dropped here, not
-    /// discovered into an unparseable file.**
+    /// A name that cannot survive the config file is dropped, not discovered
+    /// into an unparseable file. The good edge keeps the config non-empty so the
+    /// test cannot pass vacuously.
     ///
-    /// `NameNormalizer` is §5.6's *wire* rule and refuses only the empty name
-    /// and a bare `/`. A robot publishing `odo"m` therefore used to be written
-    /// out as `parent = "odo"m"`, which this crate's own parser refuses — so
-    /// `--discover > topology.toml` produced a file `--config` could not read,
-    /// and the operator met the failure on the robot. A name holding a newline
-    /// was worse: it emitted a structurally broken block.
-    ///
-    /// The good edge in the fixture is non-degenerate on purpose: without it
-    /// the config would be empty and `parse` would trivially succeed, so this
-    /// would pass even if `observe` dropped *everything*.
-    ///
-    /// Mutant: delete the `frame_name_ok` guard from `Discovery::observe` ⇒ the
-    /// emitted text no longer reparses and the `unwrap` fails.
+    /// Mutant: delete the `frame_name_ok` guard in `observe`.
     #[test]
     fn a_name_that_cannot_be_written_to_a_config_is_not_discovered() {
         let mut d = Discovery::new(10.0);
@@ -532,18 +436,11 @@ mod tests {
         );
     }
 
-    /// **Every rejected parent is counted and named**, which is what the module
-    /// docs promise and what a `BTreeMap<String, String>` could not deliver: it
-    /// overwrote, so a child with three parents reported only the last one, and
-    /// no counter moved at all.
+    /// Every rejected parent is counted and named. Three parents, not two, so
+    /// "last only" and "all" are distinguishable.
     ///
-    /// Three parents, not two: with two, "reports only the last" and "reports
-    /// all of them" are indistinguishable once the first is the incumbent.
-    ///
-    /// Mutant: change `rejected_parents` back to `insert(child, parent)` over a
-    /// `BTreeMap<String, String>` ⇒ `multi_parent()` has one entry, not two.
-    /// Mutant: drop `self.dropped_multi_parent += 1` ⇒ the count assertion
-    /// fails.
+    /// Mutant: `rejected_parents` back to a single `String` per child; or drop
+    /// `self.dropped_multi_parent += 1`.
     #[test]
     fn every_rejected_parent_is_counted_and_named() {
         let mut d = Discovery::new(10.0);

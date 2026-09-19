@@ -1,62 +1,17 @@
-//! **`docs/PHASE2.md` §12's attach rows**, which have never existed.
-//!
-//! §12's table asks for two things this repository has never measured:
-//!
-//! | row | what §12 wants |
-//! |---|---|
-//! | attach time, cold and warm | p50 |
-//! | first access after attach, per-edge population on vs off | p99.9, both |
-//!
-//! `crates/tf_tree_bench/benches/` has no attach or population benchmark at all,
-//! and `report.rs`'s `attach_latency` — a required `where_we_are_worse` entry —
-//! has carried `metrics: Vec::new()` since it was written. An honesty section
-//! with no number in it cannot regress, which is the point of filling it.
-//!
-//! # What attaching actually is
+//! `docs/PHASE2.md` §12's attach rows: attach time (cold and warm, p50) and first
+//! access after attach.
 //!
 //! `Tree::attach_shared` maps the segment, validates the header, claims a
-//! participant slot and calls `populate_hot()` — which since
-//! `docs/decisions/0024` warms the tables and *not* the two ring arenas, so the
-//! rings show up in the `plan compile` row instead. That last step is the one §7.1
-//! is NORMATIVE about: it pre-faults every region a reader touches so that no
-//! page fault lands *inside* a lookup. So attach is where tf_tree pays what tf2
-//! does not — a tf2 consumer constructs a `BufferCore` in-process and is ready
-//! immediately — and it is a real cost even though it is paid once.
+//! participant slot and calls `populate_hot()`, which (0024) warms the tables and
+//! not the ring arenas; rings show up in the `plan compile` row.
 //!
-//! # The row this does NOT produce, and why
+//! The "population on vs off" row is not produced: `populate_hot()` is
+//! unconditional inside `attach_shared_inner` and no public path yields an "off"
+//! arm. `attach` and `plan compile (first)` bracket what population costs.
 //!
-//! **"population on vs off" needs a way to attach without populating, and there
-//! isn't one.** `populate_hot()` is called unconditionally inside
-//! `attach_shared_inner` (`crates/tf_tree/src/tree.rs`). Getting the "off" arm
-//! would take one of:
-//!
-//! * `madvise(MADV_DONTNEED)` over the mapping between attach and first access,
-//!   which would need the arena's base pointer and length — `ArenaView` exposes
-//!   neither, and widening it for a benchmark is the wrong trade;
-//! * `MappedArena::attach` directly, which does skip population — but yields an
-//!   arena, not a `Tree`, and there is no public path from one to the other.
-//!
-//! Reporting the "on" arm alone and saying so is better than inventing an "off"
-//! arm out of a different code path. The row stays owed; it is no longer owed
-//! *and* unmeasurable, because the cost it would be compared against is here.
-//!
-//! `0024` moved ring population from attach to
-//! the moment an edge is taken up, which does give the attach path a policy —
-//! but it is not a *toggle*. There is still no `populate: false`, because there
-//! is still no case that wants one: population is now scoped to what the process
-//! actually reads, so the thing an "off" arm would have argued for is the
-//! default. What `0024` did give this file is the decomposition, and it is
-//! better than the row asked for: `attach` and `plan compile (first)` bracket
-//! what population costs and say which half of the process pays it.
-//!
-//! # "Cold" is only as cold as this host allows
-//!
-//! `cold` is the first attach in this process to a segment it has never mapped:
-//! fresh VMA, fresh page tables, allocator not yet warm. It is **not** a cold
-//! page cache — the creator wrote the arena moments earlier and dropping caches
-//! needs root. So `cold` here is an upper bound on the warm case and a lower
-//! bound on a genuinely cold one, and the gap between the two columns is the
-//! part that is this process's own state rather than the kernel's.
+//! `cold` is the first attach in this process (fresh VMA and page tables). It is
+//! not a cold page cache, so it bounds the warm case from above and a genuinely
+//! cold attach from below.
 
 #![allow(clippy::print_stdout)]
 
@@ -67,12 +22,8 @@ use tf_tree::{AttachMode, InterpPolicy, Stamp, Tree};
 /// Attach/lookup cycles timed. Odd, so a median is an observation.
 const CYCLES: usize = 201;
 
-/// The page size the per-page arithmetic in `docs/PHASE2.md` §12.2 divides by.
-/// A constant rather than `sysconf(_SC_PAGESIZE)`, which would buy an `unsafe`
-/// block to print something the byte count beside it already carries: on a host
-/// whose base page is not 4 KiB — a 64 KiB aarch64 kernel is the live example —
-/// the page column is wrong and the byte column still is not, so a reader there
-/// divides again.
+/// The page size `docs/PHASE2.md` §12.2's per-page arithmetic divides by; a constant
+/// because `sysconf` would need `unsafe` (the byte count beside it is authoritative).
 const PAGE_BYTES: usize = 4096;
 
 /// The pair every other harness in this crate measures, so the first-access
@@ -80,9 +31,7 @@ const PAGE_BYTES: usize = 4096;
 const TARGET: &str = "imu_link";
 const SOURCE: &str = "map";
 
-/// A stamp off every dynamic grid, so the first lookup actually interpolates —
-/// `docs/decisions/0013`. An exact-hit stamp would measure `bracket` plus a
-/// seqlock read and under-report the pages a real first access touches.
+/// A stamp off every dynamic grid, so the first lookup interpolates (`0013`).
 const STAMP_NS: i64 = tf_tree_bench::fixture::NOW_NS - 3_700_000;
 
 fn main() -> Result<()> {
@@ -106,9 +55,7 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow!("attaching: {e:?}"))?;
         let a = t0.elapsed().as_nanos();
 
-        // Plan compilation is separated from the lookup rather than folded into
-        // it: it walks the topology blocks, which `populate_hot` warms, so a
-        // combined figure would hide which of the two the population is for.
+        // Separate from the lookup: plan compilation walks the topology blocks.
         let t1 = std::time::Instant::now();
         let target = tree
             .frame(TARGET)
@@ -126,32 +73,20 @@ fn main() -> Result<()> {
         let t2 = std::time::Instant::now();
         let got = plan.at(&guard, stamp);
         let f = t2.elapsed().as_nanos();
-        // Checked, not assumed: a first access that returned an error would be
-        // measuring a refusal rather than a lookup, and would be *faster*.
+        // Checked: an error would measure a refusal, and be faster.
         got.map_err(|e| anyhow!("the first lookup after attach was refused: {e:?}"))?;
 
         attach_ns.push(a as f64);
         plan_ns.push(p as f64);
         first_at_ns.push(f as f64);
 
-        // `guard` borrows `tree`, so it goes first. (`Plan` is `Copy` and owns
-        // nothing, so there is nothing to drop.) Unmapping inside the loop is
-        // not optional: 201 live mappings would accumulate and the later cycles
-        // would be measuring a different process from the earlier ones.
+        // `guard` borrows `tree`, so it drops first; unmapping keeps cycles comparable.
         drop(guard);
         drop(tree);
     }
 
-    // **A separate pass, not a fourth timer inside the loop above.** It was
-    // written that way first and the loop stopped measuring what it had been
-    // measuring: `first lookup after attach` went 130 ns p50 to 210 ns, five
-    // runs to three, with *no engine change at all* — bisected by reverting
-    // every engine file and re-running, at which point the row stayed at 210.
-    // An extra compile per iteration is enough to leave the branch predictor and
-    // caches in a different state for the next iteration's lookup, and moving it
-    // after the timed region does not help because the damage lands on the
-    // iteration that follows. So the loop above is byte-identical to what it was
-    // before this row existed, and this pass pays for its own attaches.
+    // A separate pass: a fourth timer inside the loop above shifted `first lookup
+    // after attach` from 130 to 210 ns p50 (predictor and cache state).
     for _ in 0..CYCLES {
         let dup = fd
             .try_clone_to_owned()
@@ -167,14 +102,7 @@ fn main() -> Result<()> {
         let _ = tree
             .plan(target, source)
             .map_err(|e| anyhow!("compiling {SOURCE} <- {TARGET}: {e:?}"))?;
-        // Compiling the *same* path a second time in the same process. Since
-        // population became per-edge this is the row that prices the risk the
-        // change introduces: a topology change invalidates every cached plan, so
-        // the next lookup recompiles, and recompiling now re-populates. If
-        // `madvise(MADV_POPULATE_READ)` over resident pages were expensive, a
-        // `reparent` would put that cost in front of the next lookup on every
-        // reader in the system. The compile work itself is identical between the
-        // two, so the difference is the population and nothing else.
+        // Recompiling the same path prices per-edge re-population after a topology change.
         let t1b = std::time::Instant::now();
         let _ = tree
             .plan(target, source)
@@ -227,12 +155,7 @@ fn build_owner() -> Result<Tree> {
 fn report(arena_bytes: usize, attach: &[f64], plan: &[f64], replan: &[f64], first: &[f64]) {
     println!("PHASE2 §12 — attach time, and first access after attach");
     println!("  §11.1 fixture on a memfd, {CYCLES} attach/lookup cycles, ReadOnly");
-    // The arena's size is what turns these figures into a per-page cost, and
-    // `docs/PHASE2.md` §12.2 quotes one. That row carried the byte count by
-    // hand from the sitting that first filled it, with nothing re-deriving it;
-    // printing it here makes the division reproducible from this recipe alone.
-    // Pages round **up**, because population advises whole pages: 1 401 472 B
-    // is 342 whole pages and a 640 B remainder, and the remainder is charged.
+    // Pages round up: population advises whole pages.
     println!(
         "  arena {arena_bytes} B = {} pages of {PAGE_BYTES} B",
         arena_bytes.div_ceil(PAGE_BYTES)

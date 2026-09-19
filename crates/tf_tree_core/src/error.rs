@@ -1,10 +1,8 @@
 //! Identity types and the `Copy`, allocation-free error enums.
 //!
-//! Every error is `no_std` and carries integer IDs, never a `String`. Names are
-//! resolved for humans by a `Display` wrapper (Phase 1 step 7) that consults the
-//! arena; the error itself stays allocation-free so it can be returned from the
+//! Errors carry integer IDs, never a `String`, so they can be returned from the
 //! wait-free read path. **Every variant that can name an edge does name one**
-//! (decision D11).
+//! (D11).
 
 use core::fmt;
 use core::num::NonZeroU32;
@@ -42,17 +40,9 @@ impl FrameId {
 /// Like [`FrameId`], edge identity is append-only; removal is tombstoning, never
 /// recycling (invariant 1 / D10).
 ///
-/// **`EdgeId` is a plain `u32` — index `0` is representable — but no builder
-/// hands one out.** `TreeBuilder::build` reserves index `0` and stores
-/// `declared + 1` in the header's `edge_count`, and `tf_tree doctor` iterates
-/// `1..edge_count` to skip it. So the id space a consumer sees is `1 ..=
-/// declared`, matching [`FrameId`]'s, and the difference is confined to the
-/// header field.
-///
-/// An earlier version of this comment said edge 0 was an ordinary slot, which
-/// contradicted the builder and cost `tf_tree_c::unstable` an off-by-one that
-/// its own test caught. The type still permits `EdgeId(0)`; nothing produces
-/// one.
+/// A plain `u32`; index `0` is representable but no builder hands it out:
+/// `TreeBuilder::build` reserves it (`edge_count` is `declared + 1`), so consumers
+/// see `1 ..= declared`, like [`FrameId`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdgeId(pub u32);
 
@@ -68,20 +58,14 @@ impl EdgeId {
 /// A lookup or sample failure.
 ///
 /// Returned by the sample/read path and by plan compilation and evaluation
-/// ([`crate::plan`]).
-///
-/// # It composes like any other Rust error
-///
-/// `Display` and [`core::error::Error`] are implemented, so this propagates with
-/// `?` into `anyhow::Error`, `Box<dyn Error>`, or a caller's own enum
-/// ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
+/// ([`crate::plan`]). Implements `Display` and [`core::error::Error`], so it
+/// propagates with `?` ([`0040`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0040-the-error-that-cannot-be-returned.md)).
 ///
 /// ```
 /// use tf_tree_core::{EdgeId, LookupError};
 ///
 /// fn newest_pose(fail: bool) -> Result<f64, Box<dyn std::error::Error>> {
 ///     if fail {
-///         // The `?` is what needs `Error`, and `Error` is what needs `Display`.
 ///         Err(LookupError::NoData { edge: EdgeId(3) })?;
 ///     }
 ///     Ok(1.0)
@@ -94,24 +78,18 @@ impl EdgeId {
 ///
 /// # Identifiers here, names from `Tree::describe`
 ///
-/// The message above says `edge 3`, not `odom -> base_link`. Resolving a name
-/// needs the arena, and an error returned from the wait-free read path cannot
-/// carry one (D11, `docs/API.md` R5). `tf_tree::Tree::describe` holds a `&Tree`
-/// and is the layer that names things; prefer it wherever a tree is in hand.
-///
-/// **The message text is a diagnostic and not a compatibility promise.** The
-/// *type* and its discriminant are what a caller may depend on.
+/// Messages say `edge 3`, not `odom -> base_link`: naming needs the arena, which
+/// the wait-free read path cannot carry (D11, `docs/API.md` R5). Use
+/// `tf_tree::Tree::describe` where a tree is in hand. **The message text is a
+/// diagnostic, not a compatibility promise**; the type and discriminant are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LookupError {
     /// A frame name that does not resolve to a frame of this tree.
     ///
-    /// Usually a name that was never interned. `tf_tree::Tree::lookup` also
-    /// reports two rarer outcomes of the resolver under this variant — a
-    /// different name holding the hash slot ([`FrameError::FrameHashCollision`],
-    /// permanent) and an interner still mid-publish
-    /// ([`FrameError::InternContended`], transient) — and its `# Errors` section
-    /// says how to tell the three apart without writing.
+    /// Usually a name never interned. `tf_tree::Tree::lookup` also reports a hash
+    /// collision ([`FrameError::FrameHashCollision`]) and a mid-publish interner
+    /// ([`FrameError::InternContended`]) here; see its `# Errors`.
     UnknownFrame {
         /// The 64-bit BLAKE3 prefix hash of the requested name.
         hash: u64,
@@ -130,20 +108,11 @@ pub enum LookupError {
     /// [`crate::MAX_PATH_EDGES`] raw edges to walk, or more than
     /// [`crate::MAX_DEPTH`] steps once folded.
     ///
-    /// `docs/PHASE1.md` §7.1 ("Two bounds, and they price different slots")
-    /// says why one variant covers both; `depth` is what tells them apart.
+    /// `docs/PHASE1.md` §7.1 says why one variant covers both; `depth` tells them apart.
     TreeTooDeep {
-        /// **The count that overran its bound**, and the two cases are disjoint
-        /// by construction, so this one number says which bound refused:
-        ///
-        /// * `MAX_PATH_EDGES + 1` — the walk. It is the only value above
-        ///   [`crate::MAX_PATH_EDGES`] this field takes, and it means "more than
-        ///   the bound" rather than a measured length: the walk stops the moment
-        ///   it runs out of buffer, so it never learns how much further the path
-        ///   went.
-        /// * `MAX_DEPTH + 1 ..= MAX_PATH_EDGES` — the folded step array, and
-        ///   here the number is **exact**. `fold_into` keeps counting past the end of
-        ///   the array precisely so it can report the real folded length.
+        /// The count that overran its bound. `MAX_PATH_EDGES + 1` means the walk
+        /// (a lower bound; it stops when the buffer is full). `MAX_DEPTH + 1 ..=
+        /// MAX_PATH_EDGES` means the folded step array, and is **exact**.
         depth: u16,
     },
     /// The edge has no published samples yet.
@@ -162,9 +131,7 @@ pub enum LookupError {
         /// The newest published stamp on the edge.
         newest: i64,
     },
-    /// The ring lapped the reader mid-read: the bracketing samples were
-    /// overwritten before the read completed. The caller decides whether a retry
-    /// makes sense.
+    /// The ring lapped the reader mid-read; the caller decides whether to retry.
     SlotRecycled {
         /// The edge whose ring lapped the reader.
         edge: EdgeId,
@@ -175,9 +142,7 @@ pub enum LookupError {
         /// The edge whose slot stayed contended.
         edge: EdgeId,
     },
-    /// The plan was compiled against a topology generation that has since
-    /// changed. This is actionable ("re-plan"), not a failure to hide with a
-    /// retry loop.
+    /// The plan's topology generation has changed; re-plan.
     TopologyChanged {
         /// The topology generation the plan was compiled against.
         plan: u64,
@@ -192,8 +157,7 @@ pub enum LookupError {
         got: u8,
     },
     /// The path crosses dynamic edges in **different** time domains, so no single
-    /// query stamp can address all of them. Rejected at compile time rather than
-    /// silently sampling one edge's clock with another's stamp (D9).
+    /// query stamp can address all of them (D9). Rejected at compile time.
     MixedTimeDomains {
         /// The edge whose domain differs from the rest of the path.
         edge: EdgeId,
@@ -216,9 +180,7 @@ pub enum LookupError {
     },
     /// A caller's output buffer is too small for the batch.
     ///
-    /// Checked before any element is written, so the buffer is untouched
-    /// (`docs/PHASE3.md` §5.3): a partially-written output is worse than none,
-    /// because it looks like data.
+    /// Checked before any element is written (`docs/PHASE3.md` §5.3).
     BufferTooSmall {
         /// Elements required.
         need: usize,
@@ -231,19 +193,12 @@ pub enum LookupError {
     /// before a `fork()` and is being used in the child.
     ///
     /// A shared arena is mapped `MADV_DONTFORK` (`docs/PHASE2.md` §7.3), so the
-    /// child has **no mapping** where the arena was, and every reference into it
-    /// is dangling. This crate cannot detect that — it is `no_std` and knows
-    /// nothing about processes — so the variant exists here only so that the
-    /// `std` facade, which does detect it, has one error type to report through.
-    /// Nothing in `tf_tree_core` ever constructs it.
-    ///
-    /// Not retryable and not a transient: the correct response is to open a new
-    /// tree in the child, or to `exec`.
+    /// child has no mapping. Only the `std` facade detects this; this crate never
+    /// constructs it. Not retryable: open a new tree in the child, or `exec`.
     ChildDetached,
     /// The topology says this frame has a parent, but records no edge for the
-    /// link (`edge_of_child == 0`, the "no edge" sentinel). The path cannot be
-    /// evaluated; edge slot `0` is a real record and must not be sampled in its
-    /// place.
+    /// link (`edge_of_child == 0`, the "no edge" sentinel); edge slot `0` must not
+    /// be sampled in its place.
     MissingEdge {
         /// The child frame whose parent link carries no edge.
         child: FrameId,
@@ -251,15 +206,10 @@ pub enum LookupError {
     /// A derivative was requested from an edge whose interpolation policy does
     /// not have one worth reporting — `docs/PHASE4.md` §2.4.
     ///
-    /// This is a **refusal, not a limitation.** `LerpSlerp` does have a body
-    /// twist, and computing it would be easy. It is withheld because it is an
-    /// artifact of the interpolant rather than of the motion: LerpSlerp holds
-    /// the *world-frame* linear velocity constant, so the *body-frame* velocity
-    /// rotates through the segment. Measured on one segment, the body-frame `v`
-    /// vector swings by 5.29 while its magnitude varies by 5e-10 — so a caller
-    /// sanity-checking `‖v‖` sees nothing wrong. Handing that back as a velocity
-    /// would be worse than refusing, and the compatibility interpolator exists
-    /// to bit-match `tf2`, not to be differentiated.
+    /// A **refusal, not a limitation**: `LerpSlerp`'s body twist is an artifact of
+    /// the interpolant (it holds the world-frame velocity constant, so the
+    /// body-frame velocity rotates while its norm looks fine), and the
+    /// compatibility interpolator exists to bit-match `tf2`.
     ///
     /// The fix is to declare the edge `ScLerp`, which is the default.
     DerivativesUnavailable {
@@ -270,11 +220,8 @@ pub enum LookupError {
     },
     /// A derivative was requested at a stamp with no segment to differentiate.
     ///
-    /// Distinct from [`LookupError::NoData`], which means the edge is empty: here
-    /// the *pose* is perfectly well defined and only the derivative is not. Two
-    /// causes, both transient and both resolved by publishing another sample:
-    /// the ring retains exactly one sample, or the two samples bracketing `t`
-    /// carry equal stamps (permitted by invariant 6) and so span zero time.
+    /// Unlike [`LookupError::NoData`], the pose is defined. Transient: the ring
+    /// holds one sample, or the bracketing samples share a stamp (invariant 6).
     NoSegment {
         /// The edge with no differentiable segment at the requested stamp.
         edge: EdgeId,
@@ -297,22 +244,15 @@ pub enum PushError {
         /// The (rejected) stamp that was pushed.
         got: i64,
     },
-    /// The claim this writer holds was revoked — the edge was reaped and is now
-    /// free or owned by someone else.
-    ///
-    /// Returned instead of writing, because the alternative is two writers on a
-    /// single-writer ring (`docs/PHASE2.md` §1, A4). A process that sees this was
-    /// judged dead while it was stopped or stalled; the correct response is to
-    /// stop publishing and re-claim if it still wants the edge.
+    /// The claim was revoked (the edge was reaped) and the push refused
+    /// (`docs/PHASE2.md` §1, A4). Stop publishing; re-claim if still wanted.
     ClaimRevoked {
         /// The edge whose claim was revoked.
         edge: EdgeId,
     },
     /// This handle belongs to a process that no longer exists: it was created
     /// before a `fork()` and is being used in the child. See
-    /// [`LookupError::ChildDetached`], which carries the full explanation.
-    ///
-    /// Never constructed by this crate; the `std` facade is what detects it.
+    /// [`LookupError::ChildDetached`].
     ChildDetached,
 }
 
@@ -322,11 +262,8 @@ pub enum PushError {
 pub enum ClaimError {
     /// The edge is already claimed by a live writer (invariant 4 / D7).
     EdgeAlreadyClaimed {
-        /// The participant **slot** recorded by the current owner — not a PID.
-        ///
-        /// A3 made the claim word name a participant record rather than a
-        /// process, so only a caller holding the arena can turn this into a pid.
-        /// `Tree::claim` does; `doctor` prints both.
+        /// The participant **slot** of the current owner, not a PID (A3);
+        /// `Tree::claim` resolves it.
         owner_slot: u32,
     },
 }
@@ -335,8 +272,7 @@ pub enum ClaimError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FrameError {
-    /// Two distinct names collided on the same 64-bit hash. Detected rather than
-    /// silently corrupting (probability ~3e-12 at 1e4 frames, but real).
+    /// Two distinct names collided on the same 64-bit hash (~3e-12 at 1e4 frames).
     FrameHashCollision {
         /// The colliding 64-bit hash.
         hash: u64,
@@ -346,33 +282,21 @@ pub enum FrameError {
     CapacityExceeded,
     /// Another interner holds this name's slot and cannot be judged.
     ///
-    /// Raised when the claimant is an *anonymous* view (one built without
-    /// `ArenaView::as_participant`), which names no participant record, so no
-    /// caller can decide whether it is alive. Taking the entry over would
-    /// allocate a second id for one name; waiting forever is the hang A8 exists
-    /// to prevent. Reporting it is the only remaining option, and it is
-    /// actionable: identify the view.
+    /// The claimant is an *anonymous* view (no `ArenaView::as_participant`), so
+    /// its liveness cannot be judged; taking over would mint a second id and
+    /// waiting is the hang A8 prevents.
     InternContended,
     /// This handle belongs to a process that no longer exists: it was created
     /// before a `fork()` and is being used in the child. See
-    /// [`LookupError::ChildDetached`], which carries the full explanation.
-    ///
-    /// Never constructed by this crate; the `std` facade is what detects it.
+    /// [`LookupError::ChildDetached`].
     ChildDetached,
     /// **This name is not declared in this arena, and this participant cannot
     /// declare it.**
     ///
-    /// Not a permissions complaint about a frame that exists — the name is
-    /// *absent*, and the read-only mapping is only the reason nothing can be
-    /// done about it here. Every name the creator declared resolves fine
-    /// through a `PROT_READ` mapping, because resolving is a pure read; it is
-    /// *interning a new one* that publishes into the hash table with a
-    /// `compare_exchange`, which a read-only mapping answers with `SIGSEGV`
-    /// rather than with an error.
-    ///
-    /// So it is the ordinary "unknown frame" answer on the default attach, and
-    /// the remedies are the ones for an undeclared name: wait for the publisher
-    /// that will intern it, or declare it where the arena is created.
+    /// Interning publishes into the hash table with a `compare_exchange`, which
+    /// a `PROT_READ` mapping answers with `SIGSEGV`; resolving declared names
+    /// works. Wait for the publisher that will intern it, or declare it where the
+    /// arena is created.
     ReadOnly,
 }
 
@@ -395,23 +319,9 @@ pub enum TopologyError {
     },
 }
 
-// `Display` and `core::error::Error` — decision 0040
-//
-// These print identifiers, never names (`docs/API.md` R5, D11). Nothing here
-// allocates, holds a `String`, or changes a layout: `Display` writes into the
-// caller's formatter, so every error stays `Copy` and every one of them is still
-// returnable from the wait-free read path.
-//
-// **`core::error::Error`, not `std::error::Error`**, so the crate stays `no_std`.
-// It has been in `core` since Rust 1.81 and the MSRV is 1.87; a floor below that
-// would break the crate rather than merely this convenience.
-//
-// Message text: `docs/API.md` R5 (NORMATIVE).
-//
-// Every match below is exhaustive on purpose. These enums are `#[non_exhaustive]`
-// to the outside world, but inside the defining crate that grants no catch-all —
-// so a variant added later fails to compile here instead of quietly rendering as
-// something generic.
+// `Display` and `core::error::Error` (0040): identifiers, never names (`docs/API.md`
+// R5, D11); `core::error::Error` keeps the crate `no_std` (MSRV 1.87 > 1.81).
+// Matches are exhaustive on purpose, so a new variant fails to compile here.
 
 impl fmt::Display for LookupError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

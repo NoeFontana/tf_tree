@@ -1,9 +1,7 @@
 //! Compile and link the `tf2::BufferCore` C++ shim.
 //!
-//! Discovers a ROS 2 install, compiles `src/shim.cpp` against it, and links
-//! `libtf2`. If no ROS install is found the build fails with an actionable
-//! message rather than a screen of missing-header errors — a missing ROS
-//! toolchain is a configuration fact, not a compile error to decipher.
+//! Discovers a ROS 2 install, compiles `src/shim.cpp` against it, and links `libtf2`;
+//! with no install it fails with an actionable message.
 
 use std::path::{Path, PathBuf};
 
@@ -38,8 +36,7 @@ fn main() {
     let mut build = cc::Build::new();
     build.cpp(true).std("c++17").file("src/shim.cpp");
 
-    // ROS 2 headers live one package-directory deep (`include/<pkg>/<pkg>/x.hpp`),
-    // so every immediate subdirectory of `include/` is an include root.
+    // Headers live at `include/<pkg>/<pkg>/x.hpp`: each `include/<pkg>` is an include root.
     let entries = match std::fs::read_dir(&include_root) {
         Ok(e) => e,
         Err(e) => {
@@ -61,28 +58,17 @@ fn main() {
         build.include(dir);
     }
 
-    // ROS's own generated headers use a deprecated std::wstring_convert; that is
-    // not our code and not something we can fix, so do not let it drown the log.
+    // ROS's generated headers use deprecated std::wstring_convert.
     build.flag_if_supported("-Wno-deprecated-declarations");
 
     build.compile("tf_tree_tf2_shim");
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=tf2");
-    // The consuming test/bench binaries are run directly, not through
-    // `ros2 run`, so bake the library path in rather than relying on
-    // LD_LIBRARY_PATH being set at run time.
-    //
-    // `rustc-link-arg` applies only to *this* package's own targets, so it
-    // covers this crate's tests and nothing else. Dependent packages must emit
-    // their own link args; the `links` key in Cargo.toml lets us hand them the
-    // path here (they read it as `DEP_TF_TREE_TF2_SHIM_RPATH`) instead of each
-    // rediscovering the ROS install. See `crates/tf_tree_bench/build.rs`.
-    //
-    // `--disable-new-dtags` emits `DT_RPATH` instead of `DT_RUNPATH`: the
-    // former is inherited by the whole dependency chain, the latter covers only
-    // direct dependencies — and `libtf2.so` in turn needs `librcutils.so`,
-    // which carries no rpath of its own.
+    // Bake the rpath in: consumers run directly, not via `ros2 run`. `rustc-link-arg` reaches
+    // only this package's targets, so dependents re-emit it from `DEP_TF_TREE_TF2_SHIM_RPATH`
+    // (see `crates/tf_tree_bench/build.rs`). `--disable-new-dtags` gives DT_RPATH, inherited
+    // transitively, which `libtf2.so`'s dependency `librcutils.so` needs.
     println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     println!("cargo:rpath={}", lib_dir.display());
@@ -112,8 +98,7 @@ fn find_ros_prefix() -> Option<PathBuf> {
         }
     }
 
-    // 3. Any install under /opt/ros; newest name last so the highest distro
-    //    alphabetically wins deterministically.
+    // 3. Any install under /opt/ros; the alphabetically highest distro wins.
     let mut found: Vec<PathBuf> = std::fs::read_dir("/opt/ros")
         .into_iter()
         .flatten()

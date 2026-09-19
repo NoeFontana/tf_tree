@@ -1,17 +1,7 @@
 #!/usr/bin/env bash
-# The memory comparison with no binding on either side: native C++ tf2 in its own
-# process, native Rust tf_tree in its own.
-#
-# `just footprint` already runs its two modes as two invocations so neither
-# engine's freed chunks can satisfy the other's requests. This does the same
-# thing one step further out: the tf2 arm is a C++ program linking only
-# `libtf2`, not a Rust binary linking `tf_tree_tf2_sys`, so the process being
-# weighed carries no Rust runtime, no Rust allocator and no shim.
-#
-# Both arms print the same tab-separated keys and are compared by the awk block
-# at the end. Both read the same `.tfstream`, which `native_arena --dump-only`
-# generates from the same three lines as `fixture::spin_up` and
-# `Tf2Fixture::load`.
+# Memory comparison with no binding on either side: native C++ tf2 and native Rust
+# tf_tree, each in its own process. Both arms print the same tab-separated keys,
+# compared by the awk block at the end, and read the same `.tfstream`.
 set -euo pipefail
 
 ROS_PREFIX="/opt/ros/${ROS_DISTRO:?source a ROS 2 install first}"
@@ -21,24 +11,21 @@ STREAM="$TARGET_DIR/native/fixture.tfstream"
 
 mkdir -p "$(dirname "$OUT")" "$(dirname "$STREAM")"
 
-# 1. The fixture, and the tf_tree arm. `--dump-only` writes the stream and
-#    exits: this comparison has no arena in it, only a tf_tree process and a tf2
-#    process, so there is nothing to serve.
+# 1. The fixture and the tf_tree arm (`--dump-only`: nothing to serve).
 cargo build --release -q --features shm -p tf_tree_bench --bin native_arena --bin footprint
 "$TARGET_DIR/release/native_arena" --dump-only --stream "$STREAM" >/dev/null
 
 INCLUDES=(-I"$ROS_PREFIX/include")
 for d in "$ROS_PREFIX"/include/*/; do INCLUDES+=(-I"$d"); done
 
-# 2. The tf2 arm. `-O2 -DNDEBUG` matches `native_ratio.sh`; the allocation
-#    behaviour under test is libstdc++'s and libtf2's, not the optimiser's.
+# 2. The tf2 arm; flags match `native_ratio.sh`.
 g++ -std=c++20 -O2 -DNDEBUG -pthread \
     docker/tf2/native_footprint.cpp -o "$OUT" \
     "${INCLUDES[@]}" \
     -L"$ROS_PREFIX/lib" -ltf2 -Wl,-rpath,"$ROS_PREFIX/lib" \
     -Wno-deprecated-declarations
 
-# 3. Two processes, one after the other.
+# 3. Two processes in sequence.
 tf_tree_out=$("$TARGET_DIR/release/footprint" mem-tf_tree)
 tf2_out=$("$OUT" "$STREAM")
 
@@ -47,10 +34,8 @@ echo
 echo "$tf2_out"
 echo
 
-# 4. The comparison. Only the fields both engines can honestly report are
-#    quotiented: tf2 has no declared slots, so `bytes_per_slot` has no tf2 side
-#    and is printed for tf_tree alone rather than folded into a ratio that would
-#    silently compare a declared cost against a stored one.
+# 4. The comparison. `bytes_per_slot` has no tf2 side (tf2 declares no slots), so
+#    it is printed for tf_tree alone.
 awk -v a="$tf_tree_out" -v b="$tf2_out" '
 BEGIN {
   n = split(a, la, "\n"); for (i = 1; i <= n; i++) { split(la[i], kv, "\t"); A[kv[1]] = kv[2] }
@@ -72,24 +57,14 @@ BEGIN {
     printf "         native_arena dump_stream still mirrors fixture::spin_up.\n"
     exit 1
   }
-  # `bytes_per_slot` is what tf_tree would cost if its rings were sized to what
-  # they hold. Printing the achievable figure next to the achieved one is the
-  # whole reason this comparison was built: docs/benchmarks/tf2.md:473 already
-  # says tf_tree is 1.56x denser per unit of capacity and that the fixture
-  # "hands almost all of that back", and nothing had ever shown both numbers
-  # against a native tf2 in one place.
+  # `bytes_per_slot` is tf_tree's cost if its rings were sized to what they hold.
   printf "right-sized, tf_tree would hold %.1f B/sample against tf2 %s -- %.2fx\n", \
          A["bytes_per_slot"], B["bytes_per_sample"], B["bytes_per_sample"] / A["bytes_per_slot"]
   printf "as measured, it holds %s B/sample -- %.2fx. The difference is declared\n", \
          A["bytes_per_sample"], B["bytes_per_sample"] / A["bytes_per_sample"]
   printf "capacity nobody published into, not engine overhead.\n\n"
-  # The two instruments disagree in direction, and that is the finding rather
-  # than noise. `heap_bytes` is a tie; Pss -- the operator-visible one -- is not,
-  # because tf_tree`s arena is one allocation that is ~100%% resident (decision
-  # 0021: `alloc_zeroed` above 16-byte alignment falls back to posix_memalign
-  # plus an explicit zero-fill that touches every page) while tf2`s many small
-  # allocations are not all faulted. `heap_bytes` is exact and deterministic;
-  # `pss_kib_delta` is a page-quantised whole-process delta, stable to ~3%.
+  # The instruments can disagree: the arena is one ~100%% resident allocation
+  # (decision 0021), tf2's small allocations are not all faulted.
   if (A["pss_kib_delta"] > B["pss_kib_delta"]) {
     printf "ON Pss -- what an operator sees in top -- tf_tree is WORSE: %s KiB against\n", \
            A["pss_kib_delta"]

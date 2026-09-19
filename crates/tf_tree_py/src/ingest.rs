@@ -1,47 +1,16 @@
 //! Reading a recording from Python — `docs/PHASE5.md` §3 and §4,
 //! [`0046`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0046-the-consumer-the-crate-boundary-was-drawn-for.md).
 //!
-//! # Why this module exists, in the spec's own words
-//!
-//! §3's status row says `tf_tree_ingest` is a library crate rather than part of
-//! `tf_tree_cli` **"because §4's offline Python API needs the same logic and
-//! cannot depend on a binary crate"**. The crate boundary was drawn, and paid
-//! for, for this module — and until `0046` this module did not exist. The wheel
-//! exposed `open_file` (the way *in* to an index somebody else built) and
-//! `Tree.freeze` (the way *out* of a tree assembled by hand), and no way to read
-//! a recording at all.
-//!
-//! # One function, and deliberately not two
-//!
-//! [`ingest_bag`] returns an ordinary [`Tree`](crate::tree::PyTree) — the same
-//! type `open_file` returns — so `plan`, `at`, `span`, `frames`, `edges` and
-//! `freeze` all work on it unchanged. That is §4.1's "no parallel offline API"
-//! holding structurally rather than by promise.
-//!
-//! **There is no `freeze_bag` beside it, and the first draft of this module had
-//! one.** `tf_tree_ingest::tft::freeze_bag` exists, so binding it directly is
-//! the obvious move, and this module's own header used to argue that
-//! `ingest_bag(p).freeze(out)` "loses the recording's identity" and that a
-//! direct binding was therefore a capability the composition could not express.
-//! Reading the function refutes that: it is `digest_file` + `run` + `freeze_to`,
-//! it streams the *digest* and not the tree, and `Tree::freeze_to` already takes
-//! `source_digest` as a parameter. The gap was entirely in this crate's
-//! `Tree.freeze`, which passed a hardcoded zero.
-//!
-//! So a top-level `freeze_bag` would have been exactly what `CLAUDE.md` forbids
-//! — **a second spelling** of `ingest_bag(p).freeze(out)`, differing only in
-//! whether the provenance field got filled in, and differing *silently*. The
-//! tree carries where it came from instead ([`crate::tree::SourceInfo`]), and
-//! `Tree.freeze` writes it. One path, correct by default.
+//! [`ingest_bag`] returns an ordinary [`Tree`](crate::tree::PyTree), the type
+//! `open_file` returns (§4.1: no parallel offline API). There is no `freeze_bag`:
+//! it would be a second spelling of `ingest_bag(p).freeze(out)`; the tree carries
+//! its provenance ([`crate::tree::SourceInfo`]) and `Tree.freeze` writes it.
 //!
 //! # The GIL
 //!
-//! Released around the whole ingest. This is not the 1 µs threshold
-//! [`crate::tree::GIL_RELEASE_THRESHOLD_NS`] applies to a lookup: an ingest is
-//! two or more passes over a file that is allowed to be larger than memory,
-//! measured in seconds, and holding the GIL across it would stop every other
-//! thread in the interpreter. Nothing inside the `detach` touches a Python
-//! object — the path and the options are owned Rust values by then.
+//! Released around the whole ingest (seconds of file passes, unlike the 1 µs
+//! [`crate::tree::GIL_RELEASE_THRESHOLD_NS`] of a lookup). Nothing inside the
+//! `detach` touches a Python object.
 
 use std::path::PathBuf;
 
@@ -53,20 +22,10 @@ use crate::tree::{PyTree, SourceInfo};
 
 /// Build the library's options from the keyword arguments this API exposes.
 ///
-/// **Five of `IngestOptions`' ten fields are keywords, and the split is not
-/// arbitrary.** `tf_prefix`, the two topic lists and `max_memory_mb` are what a
-/// user with a real recording reaches for. `on_clock_reset`, `on_bad_chunk` and
-/// the chunk-bomb ceilings are either a single supported value or a guard whose
-/// default exists to stop a hostile file, not a knob a dataloader user tunes;
-/// exposing all ten would make the signature the struct's shape rather than the
-/// task's.
-///
-/// `max_record_bytes` is the exception among the guards, and it is exposed for
-/// the reason it was built:
-/// [`0010`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0010-a-ceiling-on-one-record.md) added it so
-/// that "the person who meets it can raise it without forking the crate", and
-/// reachable only from Rust that argument does not hold for the audience §4 is
-/// for.
+/// Five of `IngestOptions`' ten fields are keywords: what a user with a real
+/// recording reaches for, plus `max_record_bytes`, which
+/// [`0010`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0010-a-ceiling-on-one-record.md)
+/// exists to let callers raise without forking.
 fn options(
     static_topics: Option<Vec<String>>,
     tf_topics: Option<Vec<String>>,
@@ -95,15 +54,8 @@ fn options(
 
 /// Map an [`IngestError`] onto Python.
 ///
-/// **The errno variants become real `OSError`s**, on the same argument
-/// `offline::frozen_err` makes: a caller who wrote `except FileNotFoundError`
-/// around the open should not have to learn this hierarchy to catch a missing
-/// recording. Everything else is a [`TfTreeError`] carrying the library's own
-/// rendered message.
-///
-/// `IngestError` is `Copy` and `String`-free (D11), and the rendering happens
-/// here — at the boundary — rather than in the error, which is the separation
-/// `docs/API.md` §1 R5 asks for.
+/// Errno variants become `OSError` (as `offline::frozen_err`); the rest a
+/// [`TfTreeError`] with the library's rendered message (`docs/API.md` §1 R5).
 fn ingest_err(err: IngestError, frames: &Frames) -> PyErr {
     match err {
         IngestError::Io { raw_os_error } | IngestError::Spill { raw_os_error }
@@ -119,26 +71,17 @@ fn ingest_err(err: IngestError, frames: &Frames) -> PyErr {
 /// Read an MCAP recording into an in-memory tree.
 ///
 /// `path` is any `os.PathLike` naming an MCAP recording. Returns an ordinary
-/// `Tree`, carrying the recording it came from in `Tree.source` — which is what
-/// lets `ingest_bag(p).freeze(out)` write a `.tft` traceable to `p` with
-/// nothing extra to remember.
+/// `Tree` whose `Tree.source` records the recording, so
+/// `ingest_bag(p).freeze(out)` writes a `.tft` traceable to `p`.
 ///
-/// # The digest is taken on every call
-///
-/// `Tree.source["digest"]` is BLAKE3 of the recording's bytes, which costs one
-/// extra sequential pass over the file. Measured on the development host,
-/// hashing runs at gigabytes per second against an ingest that reads the same
-/// file at least twice *and* decompresses it, so the digest is a minority of a
-/// cost the caller has already chosen to pay — and making it lazy would move a
-/// "the recording moved" failure to `freeze`, which is a stranger place to meet
-/// it than the call that named the file.
+/// `Tree.source["digest"]` is the BLAKE3 of the recording, one extra sequential
+/// pass taken on every call so a moved file fails here, not at `freeze`.
 ///
 /// # Errors
 ///
-/// `OSError` for a recording that cannot be read; `TfTreeError` carrying the
-/// library's rendered reason for anything else — a file that is not an MCAP, a
-/// `.db3` rosbag2 bag (with the `ros2 bag convert` remedy), a clock reset, an
-/// edge whose kind changed mid-recording, or a record over `max_record_bytes`.
+/// `OSError` for an unreadable recording; `TfTreeError` with the rendered reason
+/// for anything else (not an MCAP, a `.db3` bag, a clock reset, an edge whose
+/// kind changed, a record over `max_record_bytes`).
 #[pyfunction]
 #[pyo3(signature = (
     path, /, *,
@@ -164,9 +107,6 @@ pub(crate) fn ingest_bag(
     let mut frames = Frames::default();
     let (ingested, digest) = py
         .detach(|| {
-            // The digest first: if the file cannot be read at all, that is the
-            // error to report, and reporting it before the two ingest passes
-            // costs nothing on the failing path.
             let digest = tf_tree_ingest::digest_file(&path)?;
             let ingested = tf_tree_ingest::run(&path, &opts, &mut frames)?;
             Ok::<_, IngestError>((ingested, digest))

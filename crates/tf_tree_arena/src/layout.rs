@@ -1,9 +1,7 @@
 //! Arena layout math — region sizes, offsets, and the layout hash.
 //!
-//! An [`ArenaLayout`] is the pure description of where every region lives inside
-//! the flat arena allocation. It performs no allocation itself; [`crate::heap`]
-//! (and, in Phase 2, a memory-mapped backend) consumes it to build a concrete
-//! arena. Every region is 64-byte aligned and laid out in header-field order.
+//! An [`ArenaLayout`] describes where every region lives in the flat arena; [`crate::heap`]
+//! and the mapped backend consume it. Every region is 64-byte aligned, in header-field order.
 
 use alloc::vec::Vec;
 
@@ -50,25 +48,17 @@ pub enum LayoutError {
         /// Number of capacities actually supplied.
         got: usize,
     },
-    /// The computed arena is too large to address with the `u32` region offsets
-    /// stored in [`ArenaHeader`]. Every region offset must fit in `u32`, which
-    /// caps `total_size` at `u32::MAX` (~4 GiB); larger configurations would
-    /// silently truncate offsets and corrupt the arena.
+    /// The computed arena exceeds `u32::MAX` bytes, the limit of the `u32` region offsets.
     ArenaTooLarge {
         /// The total size, in bytes, that overflowed the `u32` offset model.
         total_size: u64,
     },
 }
 
-// `Display` and `core::error::Error` follow `docs/decisions/0059`; the text
-// rules are in `check.rs`'s comment beside `ShmError`'s impl. The match is
-// exhaustive: `#[non_exhaustive]` grants no catch-all inside this crate, so a
-// variant added later fails to compile here.
+// `Display` and `core::error::Error` follow `docs/decisions/0059`; the match is exhaustive on purpose.
 
-/// **The text is a diagnostic and not a compatibility promise**
-/// (`docs/API.md` R5); `source()` is `None`. The text rules and `source()` are
-/// `docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md`
-/// decisions 2 and 3.
+/// **The text is a diagnostic, not a compatibility promise** (`docs/API.md` R5); `source()` is `None`
+/// (`docs/decisions/0059` decisions 2 and 3).
 impl core::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
@@ -88,17 +78,11 @@ impl core::fmt::Display for LayoutError {
     }
 }
 
-/// Lets a `LayoutError` leave a function through `?` into `Box<dyn Error>` or
-/// `anyhow::Error`. [`source`](core::error::Error::source) is the default
-/// `None`, which is not a compatibility promise.
+/// Lets a `LayoutError` convert through `?` into `Box<dyn Error>` or `anyhow::Error`.
 impl core::error::Error for LayoutError {}
 
-/// Description of an arena's fixed capacities and the derived region layout.
-///
-/// Fields are private so the power-of-two invariant on `edge_capacities`
-/// (load-bearing invariant 3) cannot be violated after construction; use
-/// [`ArenaLayout::new`] and the accessors. The region layout is computed once in
-/// [`ArenaLayout::new`] and cached, so the accessors are pure reads.
+/// Fixed capacities and the derived region layout. Fields are private so the
+/// power-of-two invariant on `edge_capacities` (load-bearing invariant 3) holds after construction.
 #[derive(Clone, Debug)]
 pub struct ArenaLayout {
     max_frames: u32,
@@ -108,8 +92,7 @@ pub struct ArenaLayout {
     computed: Computed,
 }
 
-// The regions in header order, `N_REGIONS` of them. These indices are used
-// only internally.
+// The regions in header order, `N_REGIONS` of them.
 const R_HEADER: usize = 0;
 const R_FRAME_TABLE: usize = 1;
 const R_FRAME_HASH: usize = 2;
@@ -139,14 +122,7 @@ pub const DEFAULT_MAX_PARTICIPANTS: u32 = 64;
 /// | `ids` | `AtomicU32`, 4 B | published `FrameId`; `0` = not yet published |
 /// | `claiming` | `AtomicU32`, 4 B | **A8**: participant slot + 1 of the interner that won the hash CAS; `0` = unrecorded |
 ///
-/// `claiming` is what makes a crashed interner recoverable (`docs/PHASE2.md` §1
-/// A8, §11.3 `intern.after_hash_cas_before_id_store`): without it, a waiter that
-/// sees a claimed hash with an unpublished id has no way to find out *who* it is
-/// waiting for, and so must wait forever.
-///
-/// The arrays are laid out contiguously rather than interleaved into a 16-byte
-/// record so the hot path — probing `hashes` — keeps its dense cache lines; the
-/// other two are touched once per intern.
+/// `claiming` (`docs/PHASE2.md` §1 A8, §11.3) lets a waiter find the crashed interner behind a claimed hash with no published id.
 pub const FRAME_HASH_STRIDE: usize = 8 + 4 + 4;
 
 #[derive(Clone, Copy, Debug)]
@@ -156,8 +132,7 @@ struct Computed {
     slots: usize,
 }
 
-/// Derive the region layout from the fixed capacities. Pure arithmetic; called
-/// exactly once, from [`ArenaLayout::new`].
+/// Derive the region layout from the fixed capacities; called once, from [`ArenaLayout::new`].
 fn compute(
     max_frames: u32,
     max_edges: u32,
@@ -169,13 +144,8 @@ fn compute(
     let mp = max_participants as usize;
     let slots: usize = edge_capacities.iter().map(|&c| c as usize).sum();
 
-    // 12 B per frame: `docs/PHASE1.md` §4.3.
-    //
-    // The fields are **atomics** (`docs/PHASE2.md` §1 A1): a reader racing a
-    // writer on the same block reads garbage and discards it, but reading a
-    // non-atomic `u32` while another *process* writes it is a data race and
-    // therefore UB even when the value is thrown away. Relaxed atomic loads
-    // compile to the same instruction.
+    // 12 B per frame (`docs/PHASE1.md` §4.3). Atomic fields: a non-atomic read racing another
+    // process's write is UB even if the value is discarded (`docs/PHASE2.md` §1 A1).
     let topo_stride = align64(mf * 12);
     // Sizes in header order; each aligned so the running offset stays 64-aligned.
     let sizes = [
@@ -212,9 +182,8 @@ fn compute(
 }
 
 impl ArenaLayout {
-    /// Construct a layout, validating that each per-edge capacity is `0`
-    /// (static edge, no ring) or a power of two, and that exactly `max_edges`
-    /// capacities were supplied.
+    /// Validate that each per-edge capacity is `0` (static, no ring) or a power of two and
+    /// that exactly `max_edges` capacities were supplied.
     ///
     /// # Errors
     ///
@@ -240,14 +209,8 @@ impl ArenaLayout {
 
         let max_participants = DEFAULT_MAX_PARTICIPANTS;
         let computed = compute(max_frames, max_edges, max_participants, &edge_capacities);
-        // Every region offset and the slot counts are stored as `u32` in the
-        // header. The **last** region's end is `total_size`; if that fits `u32`,
-        // every offset (<= total_size) and every slot count (slots * 64 <=
-        // total_size) fits too. Reject rather than truncate.
-        //
-        // This used to read `regions[R_POSE]` because the pose arena *was* last.
-        // v3 appended two counter regions after it, so the constant is now the
-        // one that means "last" rather than the one that happened to be.
+        // The last region's end is `total_size`; if it fits `u32`, every offset and slot count does.
+        // Reject rather than truncate.
         let last = computed.regions[N_REGIONS - 1];
         let total_size = last.offset + last.size;
         if total_size > u32::MAX as usize {
@@ -267,17 +230,8 @@ impl ArenaLayout {
 
     /// The smallest valid layout: one frame, no edges, no sample slots.
     ///
-    /// Infallible, and that is the whole point of it existing next to
-    /// [`Self::new`]. `new` can fail two ways — a capacity that is not a power
-    /// of two, and a capacity count that disagrees with `max_edges` — and
-    /// neither is representable here, because there are no capacities. That lets
-    /// this be called from a `static` initializer, where a `Result` has nowhere
-    /// to go and the crates that need one deny `unwrap`/`expect`/`panic`.
-    ///
-    /// Its consumer is `tf_tree`'s fork poison: a detached `Tree` must still
-    /// hand back an `ArenaView` that is *safe to read*, and it cannot be
-    /// a view over the mapping that just went away. An arena with no frames and
-    /// no edges answers every query "not here", which is the truthful answer.
+    /// Infallible, so callable from a `static` initializer. Its consumer is `tf_tree`'s fork
+    /// poison arena, which answers every query "not here".
     #[must_use]
     pub fn minimal() -> ArenaLayout {
         let max_participants = DEFAULT_MAX_PARTICIPANTS;
@@ -290,16 +244,10 @@ impl ArenaLayout {
         }
     }
 
-    /// The layout implied by totals alone, for validating a header.
+    /// The layout implied by totals alone, for validating a header: `compute` uses only the sum
+    /// of the per-edge capacities, so `stamp_slots` reconstructs every region offset.
     ///
-    /// `compute` uses only the **sum** of the per-edge capacities, never their
-    /// split, so a segment's `stamp_slots` is enough to reconstruct every region
-    /// offset without knowing how the slots were divided between edges. That is
-    /// what lets `MappedArena::attach` check a received header
-    /// against the layout its own counts imply.
-    ///
-    /// The returned value carries an empty `edge_capacities` and must not be
-    /// used to *build* an arena — only to compare region geometry.
+    /// Carries an empty `edge_capacities`; compare geometry with it, never build an arena from it.
     ///
     /// # Errors
     ///
@@ -412,11 +360,8 @@ impl ArenaLayout {
         self.computed.slots as u32
     }
 
-    /// The per-edge counter region (`docs/PHASE5.md` §5.2). v3.
-    ///
-    /// Present in every v3 arena, whether or not the `counters` feature is
-    /// compiled in: D34 says a disabled feature must not fork the layout hash,
-    /// so the region exists and only its *use* is conditional.
+    /// The per-edge counter region (`docs/PHASE5.md` §5.2). v3. Present whether or not
+    /// `counters` is compiled in (D34).
     pub fn edge_counters(&self) -> Region {
         self.computed.regions[R_EDGE_COUNTERS]
     }
@@ -428,9 +373,7 @@ impl ArenaLayout {
 
     /// Total arena size in bytes, 64-byte aligned. Guaranteed `<= u32::MAX`.
     pub fn total_size(&self) -> usize {
-        // The **last** region, not the pose arena: v3 appended two counter
-        // regions after it. Reading `R_POSE` here would under-report the size
-        // by both counter regions, and the arena would be mapped short.
+        // The last region, not the pose arena: v3 appended two counter regions after it.
         let last = self.computed.regions[N_REGIONS - 1];
         last.offset + last.size
     }
@@ -448,46 +391,17 @@ const fn fnv1a_u32(mut h: u32, v: u32) -> u32 {
     h
 }
 
-/// Compile-time layout hash of the arena-level structural constants.
-///
-/// This folds the size and alignment of [`ArenaHeader`] together with the
-/// per-region stride constants (bytes-per-element of each region) into a `u32`
-/// via FNV-1a. It is written into [`ArenaHeader::layout_hash`] at construction;
-/// Phase 2 checks it on attach and rejects a mismatch as a hard error.
-///
-/// PRE-RESOLVED (orchestrator): this arena-level hash intentionally covers only
-/// the header plus region strides. `tf_tree_core` folds its own `#[repr(C)]`
-/// record struct sizes into the *full* layout hash later; this function is the
-/// arena's contribution, not the whole story.
+/// Compile-time layout hash of the arena-level structural constants: [`ArenaHeader`] size and
+/// alignment plus each region's stride, folded by FNV-1a into [`ArenaHeader::layout_hash`].
+/// Attach rejects a mismatch. `tf_tree_core` folds its own record sizes into the full hash.
 pub const fn layout_hash() -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     h = fnv1a_u32(h, core::mem::size_of::<ArenaHeader>() as u32);
     h = fnv1a_u32(h, core::mem::align_of::<ArenaHeader>() as u32);
-    // Region strides in header order: header size, frame/edge/claim/participant/
-    // pose byte widths, frame-hash entry width ([`FRAME_HASH_STRIDE`], 16 since
-    // A8 added the `claiming` array), topology per-frame width (12 B per
-    // frame, `docs/PHASE1.md` §4.3), topology block count, stamp width.
-    //
-    // **The two counter-region strides are appended** (`docs/PHASE5.md` §1.2's
-    // amendment). Note the tension that resolves: the amendment warns that a v3
-    // arena "built with counters and one built without would hash identically
-    // and attach to each other", while §5.5 and D34 say the regions exist
-    // regardless of the feature — so those two builds have identical layouts
-    // and *should* attach. The strides are appended because the hash should
-    // describe the layout that exists, not because that scenario is live; if
-    // the regions ever become conditional, this is already correct.
-    // **The length is `N_REGIONS + 1`, and the `+ 1` is `R_TOPO`**, which folds
-    // two values rather than one: the per-frame width `12` and the block count
-    // `TOPO_BLOCKS`. Writing the length as an expression over `N_REGIONS` is
-    // what makes a forgotten stride a compile error instead of a silent
-    // disagreement between this array and `compute`'s `sizes` — see
-    // `docs/decisions/0032-the-region-table-was-not-part-of-the-purchase.md`.
-    //
-    // It is a **cardinality** check and nothing more. It cannot see a stride
-    // written at the wrong index, a stride with the wrong value, or a second
-    // region that also folds two values — that region would make the constant
-    // `+ 2`. The `+ 1` is argued for in prose, here and in `0032` part 3, and
-    // by nothing the compiler reads.
+    // Strides in header order (`docs/PHASE1.md` §4.3, `docs/PHASE5.md` §1.2): header size, per-region
+    // byte widths, `FRAME_HASH_STRIDE`, topology per-frame width and block count, stamp width, then
+    // the two counter-region strides. The length is `N_REGIONS + 1` because `R_TOPO` folds two
+    // values; that makes a forgotten stride a compile error (0032 part 3). Cardinality check only.
     let strides: [u32; N_REGIONS + 1] = [
         320,
         64,
@@ -514,13 +428,7 @@ pub const fn layout_hash() -> u32 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    /// [`ArenaLayout::minimal`] must be the layout `new(1, 0, [])` would have
-    /// produced — it exists to be infallible, not to be *different*.
-    ///
-    /// Without this the two could drift and the poison arena would have a
-    /// geometry nothing else in the codebase agrees with, which is the kind of
-    /// thing that only shows up as an out-of-range participant slot months
-    /// later.
+    /// [`ArenaLayout::minimal`] must equal `new(1, 0, [])`: it exists to be infallible, not different.
     #[test]
     fn minimal_matches_the_fallible_constructor() {
         let a = ArenaLayout::minimal();
@@ -531,9 +439,7 @@ mod tests {
         assert_eq!(a.max_participants, b.max_participants);
     }
 
-    /// The poison arena's participant table must be indexable by any slot a real
-    /// arena could hand out, because a detached `Tree` releases *its own* slot
-    /// into it.
+    /// The poison arena's participant table must be indexable by any slot a real arena hands out.
     #[test]
     fn minimal_has_room_for_every_participant_slot() {
         assert_eq!(
@@ -589,9 +495,7 @@ mod tests {
 
     #[test]
     fn rejects_arena_exceeding_u32_offsets() {
-        // One edge with a 2^27-slot ring => pose arena alone is 8 GiB, past the
-        // u32 offset model. Must be a hard error, not a silent truncation. (The
-        // check is pure arithmetic; no 8 GiB allocation happens here.)
+        // One edge with a 2^27-slot ring: pose arena alone is 8 GiB; must be a hard error.
         let err = ArenaLayout::new(1, 1, vec![1 << 27]).unwrap_err();
         assert!(
             matches!(err, LayoutError::ArenaTooLarge { total_size } if total_size > u32::MAX as u64),
@@ -681,25 +585,7 @@ mod tests {
 
     #[test]
     fn layout_hash_is_deterministic_and_stable() {
-        // Snapshot: any change to the header layout or region strides changes
-        // this value, which is exactly what Phase 2's attach check relies on.
-        //
-        // History, because a changed hash is a fleet-wide restart and the diff
-        // should say which change bought it:
-        //
-        //   0x1F32_7F69 -> 0x9075_90F5   A8 widened the frame-hash stride 12->16
-        //   0x9075_90F5 -> 0x3D10_4195   FORMAT_VERSION 3 (`docs/PHASE5.md` §1):
-        //                                header 256->320, plus the two counter
-        //                                region strides appended
-        //
-        // **This is the only copy.** `docs/PHASE5.md` §1.2 used to say the hash
-        // was "duplicated as the literal 0x9075_90F5 in `tf_tree_ipc`'s wire
-        // tests, so those move with it", and an earlier draft of this comment
-        // repeated it. Both were wrong, and the spec now says so: those literals
-        // are *fixture values* in byte-position assertions — any distinctive
-        // `u32` would do — and `tf_tree_ipc` does not depend on
-        // `tf_tree_arena` at all (`docs/decisions/0005`), so it cannot see this
-        // function. All 83 of its tests pass unchanged across a hash change.
+        // Snapshot: any change to the header layout or region strides changes this value.
         assert_eq!(layout_hash(), layout_hash());
         assert_ne!(layout_hash(), 0);
         assert_eq!(layout_hash(), 0x3D10_4195);
@@ -716,11 +602,7 @@ mod tests {
             )
         });
 
-        // Fixed 32-byte seed: reproducible across runs and CI. The case count is
-        // cut hard under Miri: 10_000 cases of the interpreter is tens of minutes
-        // and makes `just miri` impractical to run at all. The layout math is pure
-        // integer arithmetic, so a small sample exercises the same code paths for
-        // UB purposes; the full sweep still runs on the normal test path.
+        // Fixed seed. Case count is cut under Miri, where 10_000 cases take tens of minutes.
         let mut runner = TestRunner::new_with_rng(
             Config {
                 cases: if cfg!(miri) { 64 } else { 10_000 },
@@ -753,13 +635,9 @@ mod tests {
             .unwrap();
     }
 
-    /// `docs/decisions/0059` step 1(b) for `LayoutError`: every variant renders
-    /// by decision 2's rules, structurally and never as a pinned sentence.
+    /// `docs/decisions/0059` step 1(b): every variant renders by decision 2's rules, structurally.
     ///
-    /// **Mutant (M3):** drop `{total_size}` from `LayoutError::ArenaTooLarge`'s
-    /// arm (applied as `too many` in its place). Applied: this test fails —
-    /// `ArenaTooLarge { total_size: 18446744073709551615 } carries
-    /// 18446744073709551615 1 time(s) and renders it 0`.
+    /// **Mutant (M3):** drop `{total_size}` from `ArenaTooLarge`'s arm; this test fails.
     #[test]
     fn every_layout_error_variant_renders_by_0059s_rules() {
         use crate::render_test::{assert_structure, variant_name};

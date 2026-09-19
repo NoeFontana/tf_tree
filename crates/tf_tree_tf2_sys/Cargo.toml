@@ -1,52 +1,23 @@
-# Deliberately NOT a workspace member (see `exclude` in the root manifest): this
-# crate only builds where ROS 2 is installed, so making it a member would break
-# `cargo build --workspace` on every host without ROS — including CI and the
-# normal development loop. It is reached only as an optional path dependency of
-# `tf_tree_bench --features tf2`.
-#
-# Being outside the workspace also means it cannot use `field.workspace = true`
-# inheritance, so the metadata and lints below are spelled out.
-#
-# An empty table makes that exclusion structural. `exclude` in the root manifest
-# is a path *relative to that manifest*, so inside a git worktree —
-# `.claude/worktrees/<name>/crates/tf_tree_tf2_sys` — cargo walks up, finds the
-# main checkout's root manifest and refuses with "current package believes it's
-# in a workspace when it's not". That breaks `cargo fmt --all`, which formats
-# path dependencies too, so the whole `just lint` gate fails in any worktree.
+# Not a workspace member (root `exclude`): it builds only where ROS 2 is installed,
+# and is reached only via `tf_tree_bench --features tf2`. The empty table below
+# keeps it out of a parent workspace, e.g. inside a git worktree.
 [workspace]
 
 [package]
 name = "tf_tree_tf2_sys"
 description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."
-# Outside the workspace, so this is a hand-kept copy of `[workspace.package]
-# version` — the root `Cargo.toml` carries the argument for the number. Kept in
-# step even though this crate is `publish = false`: it path-depends on
-# `tf_tree_math` with a version requirement, and `^0.0.2` matches only `0.0.2`,
-# so a stale number here does not resolve — it fails to build.
+# Hand-kept copy of `[workspace.package] version`; a stale number fails to resolve `tf_tree_math`.
 version = "0.0.5"
 edition = "2021"
-# Outside the workspace, so this cannot inherit `[workspace.package]
-# rust-version` and has to repeat it. It is not free to differ: this crate path-
-# depends on `tf_tree_math`, which declares 1.85, so a lower number here promised
-# a build that never existed. CI's `msrv` job compares every hand-written
-# `rust-version` in the repository against the workspace's, because a floor that
-# nothing checks is a floor that drifts — which is the defect that produced this
-# line's previous values of 1.83 and 1.85.
+# Hand-kept copy of the workspace floor; CI's `msrv` job compares it.
 rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/NoeFontana/tf_tree"
 homepage = "https://github.com/NoeFontana/tf_tree"
 authors = ["Noé Fontana <noe.fontana.pro@gmail.com>"]
-# The only edge in the repository that reaches ROS 2, and it links `libtf2`.
-# Excluded from the workspace for the same reason it is unpublishable: it builds
-# only where a ROS 2 install is present, so on crates.io it would fail for almost
-# everyone who tried it.
+# Builds only with a ROS 2 install, so it is unpublishable.
 publish = false
-# Declares the native library this crate links, which is what lets `build.rs`
-# publish metadata (`cargo:rpath=...`) to the build scripts of crates that
-# depend on it. `cargo:rustc-link-arg` only reaches *this* package's own
-# targets, so `tf_tree_bench`'s bench/test/bin binaries have to re-emit the
-# rpath themselves — and this is how they learn where ROS was found.
+# Lets `build.rs` publish `cargo:rpath` to `tf_tree_bench`'s build script, which must re-emit it.
 links = "tf_tree_tf2_shim"
 
 [lints.clippy]
@@ -56,29 +27,15 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 dbg_macro = "deny"
-# `docs/decisions/0007` rule 3, mirrored from the root `Cargo.toml`'s
-# `[workspace.lints.clippy]`, which this crate cannot inherit; see the comment
-# there for what the lint does and does not check. This crate builds only in
-# the ROS 2 container, so the container-only `just tf2-check` is the one pass
-# that runs it: no host recipe, and not `just lint`, can see a block here.
+# `docs/decisions/0007` rule 3; only the container-only `just tf2-check` runs it.
 undocumented_unsafe_blocks = "deny"
 
 [lints.rust]
 missing_docs = "warn"
 unreachable_pub = "warn"
 unused_must_use = "deny"
-# `docs/decisions/0007` rules 1 and 4, and `docs/decisions/0048`'s D4: a crate
-# that carries `unsafe` declares that posture explicitly rather than inheriting
-# rustc's default `allow`, and denies `unsafe_op_in_unsafe_fn`.
-#
-# **They live here rather than in `src/lib.rs` because this crate's lints do.**
-# It is outside the workspace (see the note at the top of this file), so it
-# cannot inherit `[workspace.lints]` and already spells its own; a `#![deny(…)]`
-# in the source beside a `[lints]` table would be a second place to look.
-#
-# `unsafe_op_in_unsafe_fn` is **vacuous today** — this crate declares no
-# `unsafe fn` of its own, only calls into `mod ffi`'s `extern "C"` block. It is
-# here so that the first one written is caught rather than the fourteenth.
+# `docs/decisions/0007` rules 1 and 4, `0048` D4: the unsafe posture lives here, not in
+# `src/lib.rs`. `unsafe_op_in_unsafe_fn` is vacuous until this crate declares an `unsafe fn`.
 unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
 

@@ -1,19 +1,7 @@
-// Ground-truth control: multithreaded `tf2::BufferCore` read scaling in **pure
-// C++**, with no Rust and no FFI anywhere in the measurement.
-//
-// # Why this exists
-//
-// The Rust harness reaches tf2 through `tf_tree_tf2_sys`, a hand-written
-// `extern "C"` shim. Any claim about tf2's concurrent behaviour drawn through
-// that shim invites an obvious objection: maybe the *binding* is the bottleneck,
-// not tf2. Reasoning about it is not enough — the shim has no shared mutable
-// state on the lookup path, but "I read the code and it looked fine" is not
-// evidence.
-//
-// So this program removes the bridge entirely. It loads the same `.tfstream`,
-// asks the same queries, sweeps the same thread counts, and reports throughput
-// the same way. If its numbers track the Rust harness's tf2 numbers, the shim is
-// not distorting the result and the collapse under threading is tf2's own.
+// Ground-truth control: multithreaded `tf2::BufferCore` read scaling in pure C++,
+// with no Rust and no FFI. It loads the same `.tfstream`, asks the same queries
+// and sweeps the same thread counts as the Rust harness, so agreement shows the
+// `tf_tree_tf2_sys` shim is not distorting tf2's threading collapse.
 //
 // Build and run via `docker/tf2/native_scaling.sh`.
 
@@ -103,21 +91,13 @@ int main(int argc, char **argv) {
   for (const auto &x : s.statics) buf.setTransform(to_msg(x), "native", true);
   for (const auto &x : s.dynamics) buf.setTransform(to_msg(x), "native", false);
 
-  // Query window: the span every dynamic edge covers.
-  //
-  // This must be *identical* to the Rust harness's `TfStream::common_window`,
-  // or the control sweeps different stamps than the thing it is controlling for
-  // and its numbers cannot be compared. That definition is: the latest of the
-  // per-edge first stamps, to the earliest of the per-edge last stamps. Taking
-  // the global maximum for `hi` instead — as an earlier version did — pushes the
-  // window past the end of the shortest edge, so a chunk of the sweep is
-  // extrapolation on at least one edge and is answered from a different code
-  // path (or not at all).
+  // Query window: identical to the Rust harness's `TfStream::common_window`
+  // (latest per-edge first stamp to earliest per-edge last stamp), so no sweep
+  // extrapolates on any edge.
   std::int64_t lo = std::numeric_limits<std::int64_t>::min();
   std::int64_t hi = std::numeric_limits<std::int64_t>::max();
   {
-    // (parent, child) -> [first, last], in the same edge granularity the Rust
-    // side uses: one entry per published edge, not per parent frame.
+    // (parent, child) -> [first, last]: one entry per published edge.
     std::map<std::pair<std::string, std::string>, std::pair<std::int64_t, std::int64_t>> span;
     for (const auto &x : s.dynamics) {
       auto key = std::make_pair(x.parent, x.child);
@@ -151,8 +131,7 @@ int main(int argc, char **argv) {
   std::printf("native C++ tf2 read scaling (no Rust, no FFI)\n");
   std::printf("stream=%s  %s <- %s  %d rounds x %d lookups/thread\n",
               path.c_str(), target.c_str(), source.c_str(), rounds, per_round);
-  // Printed so the window can be checked against the Rust harness's, which is
-  // the whole point of the control.
+  // Printed so the window can be checked against the Rust harness's.
   std::printf("common window: %.3f s .. %.3f s\n\n", lo / 1e9, hi / 1e9);
   std::printf("%-8s %14s %10s\n", "threads", "tf2 M/s", "vs 1 thread");
 

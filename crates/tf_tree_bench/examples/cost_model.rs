@@ -1,36 +1,20 @@
 //! Where does a lookup's time actually go?
 //!
-//! Decomposes the hot path into its three cost terms so a design can be aimed at
-//! the dominant one instead of at the one that is easiest to think about:
+//! Decomposes the hot path into its cost terms so a design can be aimed at the dominant one:
 //!
 //!   t(depth, capacity) ≈ fixed + depth × (search(capacity) + interp + compose)
 //!
-//! Each sweep varies exactly one term:
-//!
-//! * **capacity sweep** — same depth, same query count, ring capacity 64 → 65536.
-//!   Bracket search is a binary search over logical indices, so its cost is
-//!   `log2(capacity)` *serially dependent* loads. If search dominates, this sweep
-//!   is a straight line in `log2(capacity)` and its slope is the per-probe cost.
-//! * **depth sweep** — same capacity, chain depth 1 → 6. The slope is the
-//!   marginal cost of one more dynamic edge.
-//! * **locality sweep** — identical stamp repeatedly vs a stamp swept across the
-//!   window. Same instruction count; the difference is purely the cache and
-//!   branch-predictor behaviour of the search.
-//! * **interp sweep** — LerpSlerp vs ScLerp at fixed depth and capacity.
+//! Each sweep varies one term: **capacity** (64 → 65536; search is `log2(capacity)` serially
+//! dependent loads, so the slope is the per-probe cost), **depth** (1 → 6; the marginal dynamic
+//! edge), **locality** (one stamp repeated vs swept; the cache and branch-predictor share) and
+//! **interp** (LerpSlerp vs ScLerp).
 //!
 //! **Run pinned, or do not run it at all:**
 //! `taskset -c 2 cargo run --release -p tf_tree_bench --example cost_model`
 //!
-//! Unpinned, this harness migrates cores and swings by >30% — enough to invent
-//! a 16% "regression" in a policy whose code did not change. Pinned, it repeats
-//! to under 1% (measured: three consecutive runs at 253.8 / 255.3 / 254.4 ns).
-//!
-//! A second caveat that pinning does *not* fix: `sample::<LerpSlerp>` and
-//! `sample::<ScLerp>` are monomorphized into the same hot function behind a
-//! `match` on the policy byte, so changing the size of one relocates the other.
-//! Cross-policy comparisons within one build are sound; comparing one policy
-//! across two builds is not. Use `interp_cost` for that — it calls
-//! `Interp::eval` directly and moves only when the interpolation math moves.
+//! Unpinned, this swings by >30%. Also, `sample::<LerpSlerp>` and `sample::<ScLerp>` share one hot
+//! function, so cross-policy comparisons within a build are sound but one policy across two builds
+//! is not; use `interp_cost` for that.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
 use std::hint::black_box;

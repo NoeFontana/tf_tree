@@ -1,24 +1,9 @@
 //! The **unstable** tier of the C ABI — `docs/PHASE4.md` §3.1.
 //!
-//! Everything here is generated into `tf_tree_unstable.h`, which carries **no
-//! compatibility guarantee at all** and requires `#define TFT_ENABLE_UNSTABLE`
-//! before inclusion. §3.1's reasoning: the stable header is the first ABI freeze
-//! in the project and is permanent, so it stays at roughly thirty functions and
-//! anything a C++ user does not need in the hot path waits until Phase 7 has
-//! told us what is actually used.
-//!
-//! Concretely: **a symbol in this module may change signature, change meaning,
-//! or disappear in a patch release.** The `#define` is a speed bump so nobody
-//! reaches this by accident and then reports the removal as a regression.
-//!
-//! Two families live here today:
-//!
-//! * **Derivatives** (§2). `at_with_derivatives` is younger than the rest of the
-//!   engine and its twist convention — body-frame, in the plan's *source* frame —
-//!   is exactly the kind of thing a year of use might argue with.
-//! * **Introspection.** Frame and edge counts, frame names, the instance UUID.
-//!   Diagnostic surface, needed by `tf_tree top` and by anything that wants to
-//!   render a tree, and none of it belongs in a frozen hot-path header.
+//! Generated into `tf_tree_unstable.h`, which carries no compatibility
+//! guarantee and requires `#define TFT_ENABLE_UNSTABLE`: a symbol here may
+//! change or disappear in a patch release. It holds derivatives (§2) and
+//! introspection (counts, frame names, the instance UUID) plus recovery.
 
 use core::ffi::{c_char, c_void};
 
@@ -28,47 +13,27 @@ use crate::{bad_enum, bad_handle, null_arg};
 use crate::{tft_plan, tft_status, tft_tree, TFT_ERR_BUFFER_TOO_SMALL, TFT_OK};
 
 /// Bytes one twist occupies: `[ωx ωy ωz vx vy vz]`, `f64`, rad/s and m/s.
-///
-/// There is deliberately no `tft_twist_layout` enum. A twist is a 6-vector in
-/// one universally agreed order (`tf_tree_math::twist`'s convention, which is
-/// also Sophus's and Pinocchio's), so the quaternion-order trap §3.5 exists for
-/// has no analogue here — and inventing a second layout enum would create one.
+/// There is no `tft_twist_layout` enum: the 6-vector order is universal.
 pub const TFT_TWIST_BYTES: usize = 6 * 8;
 
 /// Evaluate `plan` at `stamp`, reporting the pose **and its first derivative**.
 ///
 /// `out_pose` receives `tft_layout_size(layout)` bytes; `out_twist` receives
-/// [`TFT_TWIST_BYTES`] as `[ωx ωy ωz vx vy vz]`. Either may be NULL, in which
-/// case that half is not written — asking for only the twist is a real request
-/// and costs the same as asking for both.
+/// [`TFT_TWIST_BYTES`]. Either may be NULL, and that half is then not written.
 ///
-/// [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] puts both halves in `out_pose` as
-/// one contiguous row of thirteen `f64` — `docs/API.md` §3.3's `(N, 13)` shape.
-/// Its tail holds exactly the six numbers `out_twist` would receive, so a
-/// caller wanting them together does not pay two buffers for it.
+/// [`crate::TFT_LAYOUT_QVEC7_WXYZ_TWIST6`] puts both halves in `out_pose`
+/// (`docs/API.md` §3.3's `(N, 13)`); the stable `tft_plan_at` and
+/// `tft_plan_at_many` accept it too.
 ///
-/// **That layout is not exclusive to this function.** `tft_plan_at` and
-/// `tft_plan_at_many` accept it too, and both are in the *stable* header — this
-/// entry point is the only way to get pose and twist into two *separate*
-/// buffers, and the only one that will report a twist for a layout that carries
-/// none. If the 13-element row is what you want, the stable pair is where to
-/// get it, batched.
-///
-/// # The twist is in the plan's *source* frame
-///
-/// `plan(target, source)` evaluates `T_target_source`, and the body twist of
-/// that transform is expressed in the **source** frame, not the target. For
-/// `plan("map", "base_link")` — the usual direction — the reported twist is the
-/// robot's own velocity in its own frame, which is almost always what a
-/// consumer wants and almost never what they expect the first time.
+/// The twist is a body twist in the plan's **source** frame: for
+/// `plan("map", "base_link")` it is the robot's own velocity in its own frame.
 ///
 /// # Errors
 ///
 /// * `TFT_ERR_NO_DERIVATIVES` — an edge on the path interpolates with
-///   `LerpSlerp`, whose body twist is an artifact of the interpolant rather than
-///   of the motion, so it is refused rather than reported (§2.4).
+///   `LerpSlerp` (§2.4).
 /// * `TFT_ERR_NO_SEGMENT` — an edge has a pose at this stamp but no segment to
-///   differentiate: one retained sample, or two with equal stamps.
+///   differentiate.
 ///
 /// # Safety
 ///
@@ -93,19 +58,13 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
         }
         let n = match layout::payload_bytes(layout) {
             Some(n) => n,
-            // An unknown layout is an error even when `out_pose` is NULL: a
-            // caller who passes a discriminant this build does not define has a
-            // header/library mismatch, and telling them so on the call where
-            // they would not have used the result anyway is still telling them.
+            // An unknown layout is an error even when `out_pose` is NULL.
             None => return bad_enum("layout"),
         };
         // SAFETY: `check_plan` confirmed the magic word.
         let h = unsafe { &*plan };
         let g = h.share.tree.guard();
-        // Tagged, with the handle's domain, exactly as `tft_plan_at` is: this
-        // is a *query* site, so hard-coding `SystemDomain` here would leave the
-        // derivatives entry point unreadable on the arenas `docs/decisions/0038`
-        // makes readable everywhere else.
+        // Tagged with the handle's domain, as `tft_plan_at` is (`docs/decisions/0038`).
         let sample = match h.plan.at_with_derivatives_tagged(&g, stamp, h.domain) {
             Ok(s) => s,
             Err(e) => return record_lookup(e),
@@ -113,10 +72,8 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
         if !out_pose.is_null() {
             // SAFETY: the caller contracts `n` writable bytes at `out_pose`.
             let dst = unsafe { core::slice::from_raw_parts_mut(out_pose.cast::<u8>(), n) };
-            // With `TFT_LAYOUT_QVEC7_WXYZ_TWIST6` the caller gets pose and twist
-            // contiguous in one 13-element row (see this function's docs).
-            // Every other layout writes the pose alone and ignores the twist,
-            // which is already in `out_twist` if the caller asked for it.
+            // The twist-carrying layout writes both halves; every other layout
+            // writes the pose alone.
             if layout::carries_twist(layout) {
                 layout::write_twist6(&sample.pose, &sample.twist, dst);
             } else {
@@ -137,22 +94,12 @@ pub unsafe extern "C" fn tft_plan_at_with_derivatives(
 
 /// How many frames this tree has declared, including tombstoned ones.
 ///
-/// **Valid frame ids are `1 ..= tft_tree_frame_count()`.** Ids are append-only
-/// and never recycled (`docs/PROJECT.md` §5), so iterating that range visits
-/// every frame that has ever existed.
+/// Valid frame ids are `1 ..= tft_tree_frame_count()` (append-only, never
+/// recycled; `docs/PROJECT.md` §5). Id `0` is the root sentinel, so passing it to
+/// [`tft_tree_frame_name`] is `TFT_ERR_UNKNOWN_FRAME`.
 ///
-/// # Why ids start at 1
-///
-/// `FrameId` is a `NonZeroU32` so that `Option<FrameId>` costs four bytes and
-/// index `0` can mean "root / no parent". Passing `0` to
-/// [`tft_tree_frame_name`] is therefore `TFT_ERR_UNKNOWN_FRAME`, not the first
-/// frame — and a C loop written `for (i = 0; i < n; i++)` gets one error and
-/// then misses the last frame.
-///
-/// Returns `0` for a NULL or dead handle, which is indistinguishable from an
-/// empty tree — deliberately, because there is no error channel on a function
-/// that returns a count and adding one would put a `tft_status` out-parameter on
-/// the simplest call in the header.
+/// Returns `0` for a NULL or dead handle, indistinguishable from an empty tree:
+/// a count has no error channel.
 ///
 /// # Safety
 ///
@@ -177,22 +124,9 @@ pub unsafe extern "C" fn tft_tree_frame_count(tree: *const tft_tree) -> u32 {
 
 /// How many edges this tree has declared, including tombstoned ones.
 ///
-/// **Valid edge ids are `1 ..= tft_tree_edge_count()`** — the same convention as
-/// [`tft_tree_frame_count`], deliberately, because a C caller should not have to
-/// remember two.
-///
-/// # This is not the arena header's field
-///
-/// The header stores `declared + 1`: `TreeBuilder` reserves index `0` and
-/// `tf_tree doctor` iterates `1..edge_count` to skip it. The two id spaces
-/// therefore agree from outside while disagreeing in the header, and *this
-/// function is where they are reconciled* — it subtracts the reservation.
-///
-/// The first version returned the header field raw. Its test asserted 3 for a
-/// three-edge tree and got 4, which is how the reservation was found — from
-/// outside, exactly where a C consumer would have found it. `error.rs`'s
-/// `EdgeId` doc still claims edge 0 is an ordinary slot; the builder disagrees,
-/// and the builder is what runs.
+/// Valid edge ids are `1 ..= tft_tree_edge_count()`, as for
+/// [`tft_tree_frame_count`]. The arena header stores `declared + 1`
+/// (`TreeBuilder` reserves index 0); this function subtracts the reservation.
 ///
 /// # Safety
 ///
@@ -212,29 +146,21 @@ pub unsafe extern "C" fn tft_tree_edge_count(tree: *const tft_tree) -> u32 {
             .header()
             .edge_count
             .load(core::sync::atomic::Ordering::Acquire)
-            // Never underflows: a built arena always stores at least the sentinel,
-            // and `saturating_sub` makes an un-built one report 0 rather than wrap
-            // to 4 billion edges.
+            // A built arena stores at least the sentinel; `saturating_sub`
+            // makes an un-built one report 0.
             .saturating_sub(1)
     })
 }
 
 /// Copy frame `id`'s name into `buf` as a NUL-terminated string.
 ///
-/// Returns `TFT_ERR_BUFFER_TOO_SMALL` — **without writing anything** — when the
-/// name plus its NUL does not fit, and sets the error detail's `requested` to
-/// the number of bytes needed. A truncated frame name is worse than no name: it
-/// is a *different, plausible* frame name, and this library's whole argument is
-/// that plausible wrong answers are the expensive kind.
+/// Returns `TFT_ERR_BUFFER_TOO_SMALL` without writing anything when the name
+/// plus its NUL does not fit, and sets the error detail's `requested` to the
+/// bytes needed.
 ///
-/// **The arena stores at most 48 bytes of a frame name** (`FrameRecord::name`),
-/// so a longer declared name is already truncated before this function sees it
-/// and what you get back is the stored form. Frames are still *identified* by a
-/// hash of the full name, so two long names sharing a 48-byte prefix are
-/// distinct frames that report the same string here. That is a property of the
-/// Phase 1 layout, not of this function; it is documented rather than papered
-/// over because a diagnostic that quietly conflates two frames is worse than one
-/// that admits it. `64` bytes is enough for any name the arena can hold.
+/// The arena stores at most 48 bytes of a frame name (`FrameRecord::name`), so
+/// two longer names sharing a 48-byte prefix are distinct frames reporting the
+/// same string. 64 bytes fits any name the arena can hold.
 ///
 /// # Safety
 ///
@@ -257,27 +183,13 @@ pub unsafe extern "C" fn tft_tree_frame_name(
         // SAFETY: `check_tree` confirmed the magic word.
         let h = unsafe { &*tree };
         let view = h.share.tree.arena_view();
-        // **Three checks, and `frame_record` alone is none of them.**
-        //
-        // `ArenaView::frame_record` bounds `id` against `max_frames`, which is
-        // `frame_count + 1 + frame_headroom` — not against `frame_count`. With
-        // any headroom at all (and a publisher that wants runtime interning must
-        // have some) the slots in between are zeroed arena memory that
-        // `frame_record` happily returns: `name_len == 0`, so this used to write
-        // a lone NUL and report success for a frame that does not exist.
-        //
-        // Reported by review, and the existing test missed it because both C
-        // fixtures were built with zero headroom, which makes the two bounds
-        // coincide.
-        //
-        //  1. `FrameId::new` rejects 0 — the root sentinel, not the first frame.
-        //  2. `id <= frame_count` closes the headroom hole.
-        //  3. `name_hash != 0` closes a narrower one: `FrameTable::finish`
-        //     (`frame.rs`) does `frame_count.fetch_add` *before* `write_record`,
-        //     so a reader that loads the count and immediately reads that id can
-        //     see an all-zero record. `blake3_64` of any name — including the
-        //     empty string, which hashes to `0xa6a1f9f5b94913af` — is non-zero,
-        //     so a zero hash means the slot has not been written.
+        // Three checks; `frame_record` alone is none of them:
+        //  1. `FrameId::new` rejects 0, the root sentinel.
+        //  2. `id <= frame_count`: `frame_record` bounds against `max_frames`,
+        //     which includes zeroed headroom slots.
+        //  3. `name_hash != 0`: `FrameTable::finish` bumps `frame_count`
+        //     before `write_record`, so a reader can see an all-zero record; no
+        //     name, even "", hashes to 0.
         let count = view
             .header()
             .frame_count
@@ -294,9 +206,8 @@ pub unsafe extern "C" fn tft_tree_frame_name(
             );
             return crate::TFT_ERR_UNKNOWN_FRAME;
         };
-        // `FrameRecord` has no name accessor — reading the NUL-padded bytes and
-        // explicit length here, rather than adding one to `tf_tree_core`, keeps
-        // the unstable tier from widening the engine's API for a diagnostic.
+        // `FrameRecord` has no name accessor; read the bytes here rather than
+        // widen the engine's API.
         let n = usize::from(rec.name_len).min(rec.name.len());
         let name = core::str::from_utf8(&rec.name[..n]).unwrap_or("");
         let need = name.len() + 1;
@@ -319,20 +230,11 @@ pub unsafe extern "C" fn tft_tree_frame_name(
     })
 }
 
-/// Copy this tree's 16-byte arena instance UUID into `out`.
+/// Copy this tree's 16-byte arena instance UUID into `out`. Two processes with
+/// the same UUID are looking at the same arena instance.
 ///
-/// Two processes holding the same UUID are looking at the same arena instance.
-/// It is what distinguishes "we both attached to the robot's tree" from "we each
-/// created our own", which otherwise look identical from inside.
-///
-/// # A private in-process arena has no instance UUID
-///
-/// The UUID is written when a *shared* arena is created (`docs/PHASE2.md` §1,
-/// A1); a heap arena leaves the field zero. Returning those zeros would be
-/// actively harmful: two unrelated private trees would compare equal and a
-/// caller would conclude they had joined the same arena. So this returns
-/// `TFT_ERR_NO_DATA` and **writes nothing** when the arena is not shared, which
-/// is a fact the caller can act on rather than a coincidence they cannot detect.
+/// A heap arena has no UUID (`docs/PHASE2.md` §1, A1): this returns
+/// `TFT_ERR_NO_DATA` and writes nothing.
 ///
 /// # Safety
 ///
@@ -364,32 +266,21 @@ pub unsafe extern "C" fn tft_tree_instance_uuid(tree: *const tft_tree, out: *mut
     })
 }
 
-// ---------------------------------------------------------------------------
 // Recovery — `docs/decisions/0044`
-// ---------------------------------------------------------------------------
 
 /// How [`tft_tree_inherit_ownership`] resolved. Mirrors `tf_tree::Inheritance`.
 ///
-/// **A value you do not recognise means *this process is not the owner*.** The
-/// Rust enum is `#[non_exhaustive]`, so a future variant can appear here, and a
-/// `switch` that falls off its cases must treat that as "keep behaving as a
-/// plain participant" — which is never wrong, because inheriting is an
-/// escalation and not a requirement. Only `TFT_INHERITED` says otherwise.
+/// A value you do not recognise means this process is not the owner; only
+/// `TFT_INHERITED` says otherwise.
 pub type tft_inheritance = u8;
 
 /// This process is now the owner and is serving the rendezvous.
 pub const TFT_INHERITED: tft_inheritance = 0;
-/// `tft_tree_owner_lost` would have answered `false`, so nothing was attempted:
-/// usually the owner is alive or another survivor already inherited. **Not
-/// final** while `tft_tree_owner_lost` keeps answering `true` — a fresh open
-/// passing through §3.4 steps 2–4 holds the ownership byte briefly and gives it
-/// back (`0057` Decision 3). Call again on the next pass.
+/// `tft_tree_owner_lost` would have answered `false`, so nothing was attempted.
+/// Not final while it keeps answering `true` (`0057` Decision 3): call again.
 pub const TFT_OWNER_ALIVE: tft_inheritance = 1;
-/// The ownership byte was taken when this process tried for it: another
-/// survivor won it and is binding, or a fresh open holds it in passing and will
-/// hand it back. This process kept its slot and keeps reading. **Not final**
-/// while `tft_tree_owner_lost` keeps answering `true`: call again on the next
-/// pass, and it is told again if a winning survivor dies too.
+/// The ownership byte was taken by another survivor or a fresh open. This
+/// process kept its slot and keeps reading. Not final: call again.
 pub const TFT_CONTENDED: tft_inheritance = 2;
 /// A read-only attachment cannot serve, so it cannot be the heir (D18).
 pub const TFT_READ_ONLY: tft_inheritance = 3;
@@ -397,29 +288,14 @@ pub const TFT_READ_ONLY: tft_inheritance = 3;
 /// process already owns.
 pub const TFT_NOT_APPLICABLE: tft_inheritance = 4;
 
-/// Join a shared arena by name, **read-write** if asked.
+/// Join a shared arena by name, **read-write** if asked (`0044`).
 ///
-/// **`tft_tree_open` is the whole of the frozen tier's opening surface, and it
-/// is `tf_tree::open()` — read-only, name from `$TF_TREE_ARENA`.** So until this
-/// existed a C or C++ consumer could only ever hold a read-only attachment, and
-/// [`tft_tree_inherit_ownership`] would answer `TFT_READ_ONLY` every time: an
-/// owner writes the participant table on every grant and a `PROT_READ` mapping
-/// cannot, which is D18 working. The recovery entry points beside this one are
-/// decoration without it, and that was found while writing their test rather
-/// than while writing their record
-/// ([`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md)).
-///
-/// * `name` — NULL for the environment's default, exactly as `tft_tree_open`
-///   resolves it. A named arena is what a robot with more than one tree has.
-/// * `read_write` — `false` is the consumer default and stays the right choice
-///   for anything that only reads (D18: the MMU, not convention, is what stops a
-///   consumer corrupting a robot's transform tree). Pass `true` only for a
+/// * `name` — NULL for the environment's default, as `tft_tree_open` resolves it.
+/// * `read_write` — `false` is the consumer default (D18); pass `true` only for a
 ///   process that publishes, reaps, or must be able to inherit the owner role.
 ///
-/// **It never creates.** `CreatePolicy::Never`, because creating needs a layout
-/// and there is no way to express one across this boundary — a C creator is
-/// `tft_bridge_create`, which brings its own topology. A missing arena is
-/// `TFT_ERR_ARENA_UNAVAILABLE`, not an empty tree.
+/// Never creates (`CreatePolicy::Never`): a missing arena is
+/// `TFT_ERR_ARENA_UNAVAILABLE`. A C creator is `tft_bridge_create`.
 ///
 /// # Safety
 ///
@@ -490,20 +366,14 @@ pub unsafe extern "C" fn tft_tree_open_named(
 
 /// Has the process that owns this arena gone away (`docs/PHASE2.md` §3.5)?
 ///
-/// One non-blocking `poll` of the attach socket, plus — only once that reports a
-/// hangup — one `F_OFD_GETLK` on the ownership byte. So it answers *"the arena
-/// has no owner"*, not *"my socket is dead"*, and a survivor that did not
-/// inherit stops being told to try
-/// ([`0043`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0043-owner-lost-is-a-question-about-the-owner.md)).
-/// `false` for anything that is not a joined rendezvous attachment.
+/// One non-blocking `poll` of the attach socket, plus, once that reports a
+/// hangup, one `F_OFD_GETLK` on the ownership byte: it answers "the arena has no
+/// owner" (`0043`), and is `false` for anything that is not a joined rendezvous
+/// attachment. A dying owner is seen at the end of its exit (`0057`;
+/// `docs/PHASE2.md` §3.5 and §3.7 step 9, NORMATIVE).
 ///
-/// **A dying owner is seen at the end of its exit, not at its signal**
-/// (`docs/PHASE2.md` §3.5 and §3.7 step 9, NORMATIVE). See
-/// [`0057`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md).
-///
-/// Pair it with [`tft_tree_inherit_ownership`] in your own loop — there is no
-/// background thread and no daemon, per `0019`, so **nothing calls this for
-/// you**, and an arena whose survivors never call it stays ownerless.
+/// Nothing calls this for you (`0019`): pair it with
+/// [`tft_tree_inherit_ownership`] in your own loop.
 ///
 /// # Safety
 ///
@@ -529,21 +399,10 @@ pub unsafe extern "C" fn tft_tree_owner_lost(tree: *const tft_tree, out: *mut bo
 }
 
 /// Inherit the owner role from a departed owner and begin serving
-/// (`docs/PHASE2.md` §3.5).
+/// (`docs/PHASE2.md` §3.5; `0044`).
 ///
-/// **This is the call an all-C++/Python fleet did not have.** After an owner is
-/// killed and survivors remain attached, a fresh create is refused with
-/// `TFT_ERR_ARENA_UNAVAILABLE`; see
-/// [`0044`](https://github.com/NoeFontana/tf_tree/blob/main/docs/decisions/0044-recovery-the-languages-a-robot-is-written-in-cannot-reach.md).
-///
-/// Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values. **None of
-/// them is a reason to stop reading** — lookups are unaffected by ownership in
-/// every one of these states, and unaffected *during* a takeover as well.
-///
-/// On failure the process keeps its participant slot, its byte and its mapping,
-/// and gives back the ownership byte if it had taken one — so a failed attempt
-/// leaves a plain participant rather than an arena with an owner that is not
-/// serving.
+/// Writes one of the `TFT_INHERITED` … `TFT_NOT_APPLICABLE` values; none is a
+/// reason to stop reading. On failure the process stays a plain participant.
 ///
 /// # Safety
 ///
@@ -565,7 +424,6 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
         }
         // SAFETY: `check_tree` confirmed the magic word.
         let h = unsafe { &*tree };
-        // `&self` since `0044` step 1.
         match h.share.tree.inherit_ownership() {
             Ok(o) => {
                 let code = match o {
@@ -573,9 +431,7 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
                     tf_tree::Inheritance::OwnerAlive => TFT_OWNER_ALIVE,
                     tf_tree::Inheritance::Contended => TFT_CONTENDED,
                     tf_tree::Inheritance::ReadOnly => TFT_READ_ONLY,
-                    // `Inheritance` is `#[non_exhaustive]`, so a variant added
-                    // later lands here rather than failing to compile, and
-                    // "not applicable" is the safe reading of one.
+                    // `Inheritance` is `#[non_exhaustive]`; "not applicable" is the safe reading.
                     _ => TFT_NOT_APPLICABLE,
                 };
                 // SAFETY: the caller contracts a writable byte at `out`.
@@ -597,51 +453,22 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
 /// Collect what dead participants left behind, and report how many records were
 /// freed.
 ///
-/// Both sweeps, summed: the claim leases no live process holds
-/// (`Tree::reap_dead`) and the participant records whose lock bytes the kernel has
-/// released (`Tree::reap_participants`). They differ in which arena table they
-/// walk, and a caller in C has no basis to choose between them — the Rust
-/// surface keeps them separate for a supervisor that does.
+/// Both sweeps, summed: claim leases no live process holds (`Tree::reap_dead`)
+/// and participant records whose lock bytes the kernel has released
+/// (`Tree::reap_participants`).
 ///
-/// **The name overlaps the narrower Rust `Tree::reap_dead` on purpose.** Two
-/// functions here would be two things a C caller has to learn the difference
-/// between in order to call both of them every time.
+/// Usually there is nothing to do: the owner's hangup callback already revokes a
+/// dead participant's claims. A dead owner (or any participant killed after it,
+/// which nobody watches) has no hangup, and this is the collector
+/// (`docs/PHASE2.md` §0.0 *Reaping (§6.3)*; §6.3: "reaping must not be
+/// owner-only").
 ///
-/// **Most of the time there is nothing to do, and that is the design.** The
-/// owner's socket-hangup callback already revokes a dead participant's claims
-/// and frees its record, so an ordinary killed-and-restarted publisher needs no
-/// reaper. Two producers have no hangup for anyone to observe — a dead **owner**,
-/// and a `TreeBuilder::build_shared` participant with no socket — and this is
-/// their only collector.
+/// The other unwatched producer, a `build_shared` participant with no socket, is
+/// **out of contract** (`docs/decisions/0031-the-participant-record-with-no-byte.md`,
+/// `0028` step 0b): sweeping in a process tree that contains one frees the
+/// records and claims of *live* publishers.
 ///
-/// **Only one of that pair is in contract, and this call is written for that
-/// one.** A dead owner is an ordinary, supported outcome: nothing sees its
-/// hangup, so its claims outlive it and something has to sweep them. The
-/// `build_shared` participant is different — its claim can go stale *to another
-/// process* only if that process holds the arena read-write, which means the
-/// rendezvous (`tf_tree::Open`) or the `ReadWrite` fd-attach that `0028` step 0b
-/// refuses. Reaching it therefore takes a `build_shared` arena served through a
-/// hand-bound `OwnerServer`, and
-/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that
-/// composition **out of contract** on 2026-09-18. Sweeping in a process tree
-/// that contains one frees the records and claims of *live* publishers.
-///
-/// **The pair above is two producers of a stale claim, not two situations, and
-/// the in-contract one is wider than "the owner's".** A hangup is observed by
-/// the owner's `epoll` and by nothing else, so once the owner is dead nobody
-/// watches any peer: a participant killed after that leaves claims this call is
-/// the only collector of, and they are not the dead owner's. Inheriting the
-/// role does not close it — `Tree::inherit_ownership` binds a fresh
-/// `OwnerServer`, and the survivors that were attached before the death still
-/// hold sockets to the process that died, which the heir's `epoll` never
-/// watched. `docs/PHASE2.md` states the same reach from the other side, in
-/// §0.0's *Reaping (§6.3)* row rather than in §6.3 itself: this sweep is what
-/// gets "any slot on an arena whose owner is dead". §6.3's own body is the
-/// normative rule it satisfies — *"reaping must not be owner-only"*.
-///
-/// Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
-/// with no rendezvous: none of them can prove a holder is gone, and none of them
-/// may write the arena.
+/// Writes `0` for a read-only tree, a heap tree, or a tree with no rendezvous.
 ///
 /// # Safety
 ///

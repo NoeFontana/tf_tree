@@ -3,92 +3,23 @@
 //! [`crate::catalogue`] owns the identifiers and the printing; this module
 //! decides what fired. Every check is a pure function over captured data
 //! ([`EdgeStats`], [`crate::doctor::Snapshot`], [`crate::doctor::Observations`],
-//! [`crate::hostfacts::HostFacts`]) so it can be tested by constructing the
-//! offending state directly — including states a live arena cannot reach on its
-//! own.
+//! [`crate::hostfacts::HostFacts`]), so a test can construct the offending state
+//! directly.
 //!
-//! # Which checks this build cannot perform, and why each one is *skipped*
-//! rather than passed
+//! # Skipped, not passed
 //!
-//! Several ids report [`crate::catalogue::Status::Skipped`] with a stated
-//! reason: two unconditionally, and the rest depending on what the arena, the
-//! engine build and the host can supply. A check that silently returns nothing
-//! is indistinguishable from one that found nothing, and those two answers mean
-//! opposite things to whoever is reading.
+//! A check that cannot judge reports [`crate::catalogue::Status::Skipped`] with a
+//! reason, because silence is indistinguishable from "found nothing".
+//! `docs/PHASE5.md` §0.0 enumerates them; the instrument for the code is
+//! `rg -n 'CheckOutcome::skipped' crates/tf_tree_cli/src/checks.rs`.
 //!
-//! **No count appears here, and its absence is the correction.** This sentence
-//! read *"two unconditionally, and **nine** more"* while `docs/PHASE5.md` §0.0
-//! read ten and [`crate::catalogue`] read ten — three sites, two answers, and
-//! the bullet list below was missing `TFT014` entirely, so the number and the
-//! enumeration under it disagreed in the same comment. §0.0 is the source of
-//! truth over this module's prose (`CLAUDE.md`) and it enumerates rather than
-//! tallies; the instrument for the code is
-//! `rg -n 'CheckOutcome::skipped' crates/tf_tree_cli/src/checks.rs`, which
-//! answers from the file this comment is in rather than from a number somebody
-//! has to remember to raise. The same drift happened in `catalogue.rs` once
-//! before, in the note it carries about it.
-//!
-//! * **`TFT002`** (static republished with a different value) and **`TFT003`**
-//!   (edge kind changed) are detected by [`tf_tree_bridge`]'s `StaticStore`,
-//!   which counts exactly these two conditions as it ingests. Wiring `doctor` to
-//!   it is not a dependency-cycle problem — `tf_tree_bridge` has *no*
-//!   dependencies at all — it is a locality problem: a `StaticStore` lives in
-//!   the bridge process's heap, the arena stores neither a static edge's
-//!   publication history nor its declared kind over time, and `doctor` is a
-//!   different process. Surfacing them needs the bridge to publish its counters
-//!   into the arena, which `docs/PHASE5.md` §1.2 does not reserve space for.
-//!
-//! And the conditional ones, which depend on what the arena, the engine build
-//! and the host can supply:
-//!
-//! * **`TFT001`** (multi-publisher conflict) is skipped wherever the push
-//!   stream carries no writer identity, which is everywhere but the fixture.
-//!   See [`PushStream`].
-//! * **`TFT004`** (clock skew) is skipped four ways, and two of them are about
-//!   where the arena came from: a **replayed** source records ingest-time
-//!   offsets against a recording's stamps, and an arena **at rest** carries
-//!   offsets from whenever it was frozen. Then `TFT005`'s epoch condition, and
-//!   nothing sampled yet. See [`PushStream::no_live_receipt`].
-//!
-//!   **What it detects is narrower than `docs/PHASE5.md` §6's opening asks
-//!   for**, and `tft004`'s own doc is where that argument lives.
-//! * **`TFT005`** (stamps in the future) is skipped when the arena's stamps do
-//!   not share an epoch with the system clock — see [`Clock`].
-//! * **`TFT007`** (rate deviates from nominal) is skipped when **no** edge in
-//!   the arena declares a nominal rate, because a `0` means *undeclared* and
-//!   not *0 Hz* — see `tft007`.
-//! * **`TFT008`** (inter-arrival spread) is skipped when it judged **nothing**:
-//!   no edge retained the intervals a spread needs
-//!   (`doctor::SPREAD_MIN_INTERVALS`, which the skip reason quotes rather than
-//!   this line restating it), or the only ones that did have stopped publishing
-//!   — see [`stopped_publishers`].
-//! * **`TFT009`** (gaps / dropouts) is skipped when it judged **nothing**, for
-//!   `TFT008`'s reason a row over and with a longer reach — see `tft009`.
-//!   `gap_evidence_skip` names **which** gap.
-//! * **`TFT010`** is skipped whenever the `docs/PHASE5.md` §5 counters carry no
-//!   verdict — see [`no_counter_evidence`], which is *two* conditions: an engine
-//!   built without the feature, and an arena that has served **no lookups**.
-//! * **`TFT011`** skips only when *both* of the two independent pieces of
-//!   evidence it reports under one id are blind, which is what a recording is.
-//! * **`TFT013`** (declared and never published to) is skipped inside the grace
-//!   period §6's row requires, because `head == 0` is what every dynamic edge of
-//!   a correct arena reads as before its publishers start. The arena records no
-//!   declaration time, so the evidence is `publish_activity` — how long the
-//!   longest-running publisher in this arena has been running — and there are
-//!   two further skips, for the two arenas it cannot measure: see `tft013`.
-//! * **`TFT014`** (participant or claim slot leak) is skipped on a frozen `.tft`,
-//!   whose participant table is a byte copy of one from a run that has ended —
-//!   see [`SlotTable`].
-//! * **`TFT016`** is skipped when the host is not Linux.
-//! * **`TFT018`** (out-of-order stamps) is skipped wherever the push stream was
-//!   replayed from an arena's rings rather than recorded as it arrived, and the
-//!   two ways that happens fail it differently — see [`PushStream`]. It runs on
-//!   the fixture and on a recording (`doctor --from-bag`).
-//! * **`TFT019`** inherits exactly that, since it is `TFT018`'s evidence, and is
-//!   skipped in addition when the edges that *did* go backwards are in no
-//!   wall-clock domain, naming their tags.
-//!
-//! [`tf_tree_bridge`]: https://docs.rs/tf_tree_bridge
+//! * `TFT002`/`TFT003` detect nothing here: their evidence lives in the bridge
+//!   process (`tf_tree_bridge`'s `StaticStore`), not in the arena.
+//! * `TFT001`, `TFT004`, `TFT018`, `TFT019` depend on the [`PushStream`].
+//! * `TFT005` depends on the [`Clock`]; `TFT007`–`TFT011` on evidence being
+//!   present (`tft007`, `tft009`, [`stopped_publishers`], [`no_counter_evidence`]).
+//! * `TFT013` has a grace period (`tft013`); `TFT014` skips on a frozen `.tft`
+//!   ([`SlotTable`]); `TFT016` skips off Linux.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
@@ -105,17 +36,9 @@ use crate::hostfacts::{HostFacts, MemLock, ShmemThp, Thp};
 
 /// A stamp further than this from the reference clock is not a late sample, it
 /// is a units error or uninitialised memory.
-///
-/// One year: long enough that no robot's legitimate history reaches it, short
-/// enough to catch the classic fault of pushing nanoseconds into a field the
-/// publisher believed was seconds (a 10<sup>9</sup>× overshoot).
 const ABSURD_HORIZON_NS: i64 = 365 * 24 * 3600 * 1_000_000_000;
 
 /// How far ahead of the wall clock a stamp may sit before `TFT005` fires.
-///
-/// Not zero: a publisher stamping with its own clock a few hundred microseconds
-/// before the sample reaches the arena is normal, and a check that fires on
-/// every healthy system is a check people turn off.
 const FUTURE_TOLERANCE_NS: i64 = 50_000_000;
 
 /// Fraction of lookups that may fail with an extrapolation error before
@@ -126,37 +49,12 @@ const EXTRAP_HOTSPOT_RATE: f64 = 0.01;
 const GAP_FACTOR: i64 = 3;
 
 /// The largest `|offset|` any publish pipeline could account for.
-///
-/// **This is a bound on physics, not a tuned constant, and the difference is why
-/// it is allowed to exist at all.** A recorded offset is the publisher's clock
-/// error *plus* the time between stamping a transform and pushing it. The second
-/// term is real and unbounded above by nothing in this codebase — a global
-/// localiser may stamp a transform with the capture time of the scan it matched
-/// — so a small offset proves nothing. But **no transform publisher takes ten
-/// seconds** from stamp to push. Beyond that, latency cannot be the explanation
-/// and a clock can.
-///
-/// So the check that uses this finds a *broken* clock — a machine whose NTP
-/// never came up, whose RTC is dead, whose timezone handling put it in another
-/// century — and **not** the PTP-scale drift `docs/PHASE5.md` §6 opens with.
-/// `TFT004`'s own doc, and this module's header, say so where a reader of
-/// either will meet it.
 pub const OFFSET_BEYOND_ANY_PIPELINE_NS: i64 = 10_000_000_000;
 
 /// Occupancy above this fraction of a table's capacity fires `TFT015`.
-///
-/// `pub(crate)` because `tf_tree top` colours the same row on the same rule; a
-/// second copy of the literal there disagreed with this one at exactly 80.0 %.
 pub(crate) const OCCUPANCY_LIMIT: f64 = 0.80;
 
 /// Where the reference clock for the time-based checks came from.
-///
-/// The distinction is load-bearing rather than cosmetic. `EdgeRecord::domain`
-/// (D9) lets an arena carry stamps in *any* time domain — seconds since boot, a
-/// simulator's clock, a bag's original timeline — so "this stamp is in the
-/// future" is only a meaningful sentence when the arena's stamps and the
-/// system's clock share an epoch. Assuming they do would make `doctor` report
-/// every edge of a monotonic-clock arena as decades stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Clock {
     /// The arena's newest stamp is within `ABSURD_HORIZON_NS` of the system
@@ -191,36 +89,6 @@ impl Clock {
 
     /// Decide which clock applies, given **every** edge's newest stamp and the
     /// system clock.
-    ///
-    /// # Why this is a vote and not a single stamp
-    ///
-    /// `ABSURD_HORIZON_NS` does double duty: it is the domain-agreement
-    /// threshold here *and* `TFT006`'s absurdity radius. So whatever this
-    /// function picks as the reference is, by construction, the one value
-    /// `TFT006` can never call absurd. Deriving it from an extremum — the
-    /// arena's maximum stamp, say — hands that immunity to the single worst
-    /// edge: one publisher with the classic nanoseconds-into-a-seconds-field
-    /// overshoot *defines* the clock, `TFT005` skips itself because the arena
-    /// now looks non-Unix, and `TFT006` fires on every **correct** edge for
-    /// being far from the broken one. The check written for that exact fault
-    /// exonerates it and blames the healthy majority.
-    ///
-    /// The estimator therefore has to have a breakdown point. Two parts:
-    ///
-    /// * **The domain is decided by majority.** Count the edges whose newest
-    ///   stamp sits within the horizon of the system clock. A *minority* of bad
-    ///   stamps can then never flip the arena out of `Wall`, which is what keeps
-    ///   `TFT005` and `TFT006` pointed at the outlier instead of at everyone
-    ///   else.
-    /// * **Ties go to the wall clock.** At 50% contamination no estimator drawn
-    ///   from the arena can tell the good half from the bad half, so the
-    ///   tiebreak uses the one piece of evidence no edge can corrupt: the
-    ///   external clock.
-    ///
-    /// When the vote says the stamps genuinely are not Unix time, the fallback
-    /// reference is the **median** of the per-edge newest stamps, not the
-    /// maximum, for the same reason: `TFT006` still measures distance against
-    /// it, and a centre one edge can drag is a centre that check cannot use.
     #[must_use]
     pub fn decide(newest_stamps: &[i64], system_unix_nanos: i64) -> Clock {
         // The distance is taken in `i128`. A stamp is arbitrary data an arbitrary
@@ -358,21 +226,6 @@ pub fn collect_edge_stats(tree: &Tree, snap: &Snapshot) -> Vec<EdgeStats> {
 }
 
 /// How the push stream a check reads was obtained.
-///
-/// # This replaced a `live: bool`, and the bool was keying on the wrong fact
-///
-/// `TFT001`, `TFT018` and `TFT019` used to skip *iff the arena was live*. That
-/// happened to be right while `doctor` had two sources, and it stops being right
-/// the moment a third one exists, because "live" is not what any of the three
-/// checks actually needs. What they need is a property of the **stream**:
-///
-/// * `TFT001` needs a writer identity per sample.
-/// * `TFT018` needs the arrivals invariant 6 *rejected*.
-/// * `TFT011`'s Phase 1 half needs a per-sample arrival delay.
-///
-/// Keyed on liveness, a frozen `.tft` would have run `TFT018` and passed it
-/// **unconditionally** — see [`PushStream::RingsAtRest`] — which is the
-/// fabricated all-clear the whole catalogue is written to refuse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushStream {
     /// Every attempted push, recorded as it happened, with the writer that made
@@ -381,42 +234,18 @@ pub enum PushStream {
     Observed,
     /// Every transform a recording holds, replayed in the recording's own log
     /// order (`doctor --from-bag`).
-    ///
-    /// Carries rejected arrivals — a bag is written in log order, so a stamp
-    /// that went backwards is *in the file* in the position it arrived at — and
-    /// carries neither a writer nor an arrival delay: a `/tf` message has no
-    /// publisher identity in it, and the recorder's log time is a different
-    /// clock from the publisher's stamp.
     Recorded,
     /// Reconstructed from an arena's rings with no writer attached: a frozen
     /// `.tft` (`doctor --from-file`), or any other arena at rest.
-    ///
-    /// **This variant cannot show an inversion, and that is why `TFT018` skips
-    /// on it rather than passing.** `SampleRing::push` refuses a stamp older
-    /// than the ring's last, so a ring holds only *accepted* pushes; the
-    /// rejected arrival that `TFT018` exists to name left no trace in the arena
-    /// at all. Reading the window is exact here — nobody is writing — so the
-    /// result would be a guaranteed `pass`, which is worth strictly less than
-    /// saying why there is no answer.
     RingsAtRest,
     /// Reconstructed from the rings of an arena being written while it is read
     /// (`doctor --attach`).
-    ///
-    /// Everything [`PushStream::RingsAtRest`] cannot supply, plus one it gets
-    /// *wrong*: the oldest slot of the retained window is the one being
-    /// overwritten, so a sample from the next lap can appear at the old end and
-    /// read as an inversion on a perfectly ordered publisher.
     RingsUnderWriter,
 }
 
 impl PushStream {
     /// Why this stream cannot name the process that pushed a sample (`TFT001`),
     /// or `None` when it can.
-    ///
-    /// **The predicate and the reason are one function on purpose.** Two of them
-    /// is how a check ends up skipping for a reason that stopped being true, or
-    /// running with evidence it does not have; here a new variant cannot compile
-    /// without answering both at once.
     #[must_use]
     pub fn no_writer_identity(self) -> Option<&'static str> {
         match self {
@@ -436,13 +265,6 @@ impl PushStream {
 
     /// Why the clock offsets in this arena were not recorded against *this*
     /// host's clock, now (`TFT004`), or `None` when they were.
-    ///
-    /// The third of the sibling predicates above, and it splits the variants
-    /// differently from either — which is the argument for it being a method on
-    /// this enum rather than a `matches!` at the call site. `TFT001` divides on
-    /// writer identity, `TFT018` on whether a rejected arrival left a trace, and
-    /// this one on **when and by whom the wall clock was read**. A variant added
-    /// later cannot compile without answering all three.
     #[must_use]
     pub fn no_live_receipt(self) -> Option<&'static str> {
         match self {
@@ -450,14 +272,6 @@ impl PushStream {
             // out rather than left to the shared arm.** `Observed` is the
             // fixture: it *is* the publisher and it is running now, so its
             // offsets were taken against this host's clock moments ago.
-            //
-            // `RingsUnderWriter` is `--attach`, and it is the weaker of the two:
-            // a shared arena outlives its writers, so an offset there may have
-            // been taken by a process that has since exited. `TFT004` narrows
-            // that with a `claimed` gate rather than a skip, because an arena
-            // with *some* live writers still has a question worth answering.
-            // What neither variant can tell you is whether the writer was
-            // republishing recorded data — see `tft004`'s own doc for that gap.
             PushStream::Observed | PushStream::RingsUnderWriter => None,
             PushStream::Recorded => Some(
                 "this arena was built by replaying a recording, so its clock offsets were \
@@ -518,55 +332,6 @@ impl PushStream {
 
 /// Why the `docs/PHASE5.md` §5 counters carry no verdict about an arena, or
 /// `None` when they do.
-///
-/// # A zero counter has two meanings and they are opposites
-///
-/// `EdgeCounters` are incremented by *lookups*. An arena nobody has looked
-/// anything up in therefore reads exactly like a perfectly healthy one: zero
-/// extrapolation errors, zero of everything. `TFT010` seeing that clean sheet
-/// and reporting `pass` is a **fabricated all-clear** — the same shape as
-/// `TFT007` comparing an observed rate against an undeclared zero, which §6's
-/// amendment already had to correct once.
-///
-/// It is not a property of `--from-bag`. A bag-built arena is merely the source
-/// where it is *guaranteed*: `tf_tree_ingest::run` pushes and never reads, so it
-/// hands back an arena that has served no lookups at all. The reference fixture
-/// does the same (`fixture::spin_up` publishes; nothing calls `Plan::at`), and a
-/// live arena at bringup, before its first consumer, is in the same state.
-///
-/// **A fourth state was missing from the message until 2026-08-29, and it is the
-/// one a running robot is usually in.** `Guard::drop` and `note_err` both
-/// early-return on a non-writable view, so a **read-only** participant records
-/// nothing — writing a counter is a write. Read-only is the consumer default
-/// (D18), so a publish-only publisher beside read-only consumers leaves every
-/// counter at zero *while consumers are actively looking up*. The message named
-/// only the three source-shaped causes and closed with "a live arena reaches it
-/// before its first consumer", which carries the false implicature that the
-/// state ends once a consumer attaches. It does not. The predicate is right —
-/// it reads the evidence, not the source — and the prose sent the operator to
-/// the wrong remedy.
-///
-/// `docs/PHASE5.md` §5.5's amendment justifies the design with "`doctor` reports
-/// what the *writable* participants recorded, which on a real robot is the
-/// bridge and every publisher — the processes whose failures the counters are
-/// mostly about". That does not hold for `TFT010` and `TFT011`, which are about
-/// **consumer** behaviour: a counter is incremented by a *lookup*, and a bridge
-/// does not look up. So
-/// the predicate is read off **the evidence itself** rather than off the source
-/// — which is what keeps a fifth `Source` from silently reintroducing the bug,
-/// and what makes the answer right for a live arena nobody is reading yet.
-///
-/// # The threshold is "any lookup at all", not "enough lookups"
-///
-/// `lookups_ok + err_extrap_before + err_extrap_after` is incremented once per
-/// lookup that touched the edge, whichever way it went, so their sum over the
-/// arena is the number of lookups the counters have seen. One is enough to make
-/// a zero mean *zero* rather than *unknown*; asking for more would be this
-/// module inventing a significance threshold the spec does not state.
-///
-/// `counters` is [`tf_tree::counters_compiled_in`]. It comes first and keeps its
-/// own reason: a build with the feature off also reads zero everywhere, and
-/// "rebuild the engine" and "exercise the arena" are different instructions.
 #[must_use]
 pub fn no_counter_evidence(counters: bool, stats: &[EdgeStats]) -> Option<&'static str> {
     if !counters {
@@ -621,9 +386,6 @@ pub struct Inputs<'a> {
     pub occupancy: Vec<(&'static str, u32, u32)>,
     /// `TFT018`'s per-edge evidence, already split by domain tag and by whether
     /// its rejections are concentrated.
-    ///
-    /// A field rather than a call inside each reader — see
-    /// [`ClockStepEvidence`].
     pub clock_step: &'a ClockStepEvidence,
     /// How the push stream in `obs` was obtained, which is what decides whether
     /// `TFT001`, `TFT011`'s Phase 1 half, `TFT018` and `TFT019` have evidence.
@@ -636,11 +398,6 @@ pub struct Inputs<'a> {
 }
 
 /// Where the participant table in a [`Snapshot`] came from.
-///
-/// The sibling of [`PushStream`], and it exists for the same reason: the
-/// question "is this participant running?" has an answer for some sources and
-/// none for others, and the difference has to be a value the check reads rather
-/// than a fact the caller remembers to act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotTable {
     /// The table of an arena that exists now — a live shared segment
@@ -657,9 +414,6 @@ pub enum SlotTable {
 impl SlotTable {
     /// Why this table cannot say whether a participant is running, or `None`
     /// when it can.
-    ///
-    /// One function for the predicate and the sentence, exactly as
-    /// [`PushStream::no_writer_identity`] is.
     #[must_use]
     pub fn no_liveness(self) -> Option<&'static str> {
         match self {
@@ -676,9 +430,6 @@ impl SlotTable {
 }
 
 /// Run every catalogue entry plus the two id-less Phase 1 checks.
-///
-/// `suppress` names ids removed from the `--exit-code` gate; they still run and
-/// still print.
 #[must_use]
 pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
     let mut outcomes = Vec::with_capacity(Tft::ALL.len());
@@ -727,14 +478,6 @@ pub fn run(inp: &Inputs<'_>, suppress: &BTreeSet<Tft>) -> Report {
 }
 
 /// `TFT001` — more than one writer pid on one edge.
-///
-/// # It needs a writer identity per sample, and only the fixture has one
-///
-/// `docs/PHASE4.md` §1.3 predicts that real ROS stacks have two nodes publishing
-/// one edge and that `tf2` averages them silently, which makes this the check a
-/// stranger's recording is most wanted for — and the recording is exactly where
-/// it cannot run. So the skip reason names the missing evidence rather than the
-/// source, because the source is not the problem.
 fn tft001(inp: &Inputs<'_>) -> CheckOutcome {
     if let Some(why) = inp.stream.no_writer_identity() {
         return CheckOutcome::skipped(Tft::Tft001, why);
@@ -750,18 +493,6 @@ fn tft001(inp: &Inputs<'_>) -> CheckOutcome {
 
 /// Every clock offset in `snap` that says something about a **live** publisher,
 /// or the one reason there are none.
-///
-/// **One function, because the alternative was two spellings of one predicate.**
-/// [`tft004`] and [`clock_offset_note`] both need "which offsets count, and if
-/// none, why" — and an earlier revision of this file answered it twice.
-/// [`PushStream::no_writer_identity`]'s doc states the house rule for exactly
-/// this shape. A fifth condition added below now reaches the note as well,
-/// instead of leaving it to report a spread over edges the check refused to
-/// judge.
-///
-/// The two callers still walk `snap.edges` once each, which is the cost of
-/// `evidence_notes` not being handed the outcomes; what is shared is the
-/// *decision*, which is the part that goes wrong silently.
 fn live_clock_offsets(
     snap: &Snapshot,
     stream: PushStream,
@@ -783,11 +514,6 @@ fn live_clock_offsets(
     // publisher exited with no replacement therefore still carries the number it
     // last measured, and reporting it says "this publisher's clock reads X" about
     // an edge that has no publisher.
-    //
-    // A claim held by a process that has *died* is still `claimed` and still
-    // reports, which is deliberate: the offset was true of the writer that took
-    // that claim, and whether the writer is alive is `TFT014`'s question, asked
-    // of the participant table rather than guessed at here.
     let measured: Vec<(&EdgeInfo, i64)> = snap
         .edges
         .iter()
@@ -809,17 +535,6 @@ fn live_clock_offsets(
 
 /// What `TFT004` measured, for the report metadata — the fleet's offsets, which
 /// the check itself deliberately does not turn into findings.
-///
-/// **This is the useful half of `TFT004` today.** The check fires only on an
-/// offset no pipeline could explain, which is a broken clock; the *spread* is
-/// what an operator reads to see that one machine sits apart from the others,
-/// and a human can weigh it against a pipeline they know and this process does
-/// not. Emitting it as a note rather than a finding is the shape
-/// `docs/decisions/0036` question 3 ratified: report the spread, flag nothing
-/// until a threshold has evidence.
-///
-/// `None` whenever the check did not run, because the two share one predicate
-/// (`live_clock_offsets`) — so the note can never contradict the skip.
 #[must_use]
 pub fn clock_offset_note(snap: &Snapshot, stream: PushStream, clock: Clock) -> Option<String> {
     let measured = live_clock_offsets(snap, stream, clock).ok()?;
@@ -853,53 +568,6 @@ pub fn clock_offset_note(snap: &Snapshot, stream: PushStream, clock: Clock) -> O
 }
 
 /// `TFT004` — a publisher whose clock cannot be reconciled with this host's.
-///
-/// Reads `ClaimRecord::clock_offset_nanos`, which **is** the offset: the writer
-/// computes `wall clock - stamp` at one push because nobody else can pair the
-/// two afterwards (`docs/decisions/0036`, and `docs/PHASE5.md` §6's amendment).
-/// Differencing it against a stamp again is the mistake that amendment exists to
-/// prevent.
-///
-/// # What it finds, and the larger thing it does not
-///
-/// **It fires only on an offset no publish pipeline could produce**
-/// ([`OFFSET_BEYOND_ANY_PIPELINE_NS`]), in either direction, and it reports the
-/// whole fleet's offsets either way through [`clock_offset_note`].
-///
-/// It does **not** flag a publisher for differing from the fleet median, which
-/// is what §6 asks for, and the reason is not caution:
-///
-/// > A recorded offset is `clock error + stamp-to-push latency`, and **one
-/// > sample cannot separate them.** A localiser that stamps with its match's
-/// > capture time legitimately sits tens of milliseconds above an odometry
-/// > publisher that stamps at computation time. Flagging that difference would
-/// > report a healthy fleet as skewed, which is the one thing a diagnostic must
-/// > not do.
-///
-/// The signal that *does* separate them is **drift**: a clock error moves over
-/// time and a pipeline latency does not. That needs a series, which
-/// `tf_tree top` polls for and `doctor` does not have — so the fleet-relative
-/// rule is owed, and [`crate::top`]'s module header carries it, beside the loop
-/// that would collect the series.
-///
-/// # A gap this cannot close, named rather than left
-///
-/// **`ros2 bag play` into a live stack defeats the replayed-source skip.** That
-/// skip reads [`PushStream`], which describes how *`doctor`* obtained the push
-/// stream — and a bag played through the §5 ingest bridge into a shared arena is
-/// `RingsUnderWriter` like any other live arena. Its publishers stamp with the
-/// recording's original times, so every edge records an offset of however old
-/// the recording is, and this check reports it.
-///
-/// It cannot be fixed here: provenance is a property of the *writer* and the
-/// arena records none. The finding text names replay as the alternative reading
-/// so that an operator meets the possibility, which is the most an unprovenanced
-/// arena permits.
-///
-/// # Skips
-///
-/// Five conditions, all in [`live_clock_offsets`] so the note cannot disagree
-/// with them.
 fn tft004(inp: &Inputs<'_>) -> CheckOutcome {
     let measured = match live_clock_offsets(inp.snap, inp.stream, inp.clock) {
         Ok(m) => m,
@@ -979,13 +647,6 @@ fn tft005(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT006` — stamps whose *value* is impossible.
-///
-/// Two rules, and the second is narrower than §6's title on purpose. A negative
-/// stamp is invalid in every time domain. A stamp of exactly zero is only
-/// invalid when the arena's stamps are Unix time, where it means 1970 — under
-/// any other domain zero is a legitimate origin, and the benchmark fixture
-/// publishes it. Flagging it unconditionally would make `doctor` fail on a
-/// correct arena, which is the one thing a gate must never do.
 fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
     let now = inp.clock.nanos();
     let wall = matches!(inp.clock, Clock::Wall(_));
@@ -1015,10 +676,6 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
         // The distance rule catches the units error a range check cannot: a
         // publisher writing nanoseconds into a field it believed was seconds is
         // off by a factor of a billion, which is far outside any horizon.
-        //
-        // Both ends are checked because only one of them may be wrong — a
-        // single garbage stamp among good ones moves exactly one end. They are
-        // deduplicated so an edge holding one sample does not report twice.
         let mut ends = vec![("newest", st.newest_stamp)];
         if st.oldest_stamp != st.newest_stamp {
             ends.push(("oldest", st.oldest_stamp));
@@ -1052,11 +709,6 @@ fn tft006(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// What evidence one edge offers `TFT007`.
-///
-/// Three-valued, and the three are not interchangeable: only the last supports
-/// a comparison, and the first two are the reasons [`rate_coverage_note`] can
-/// state what a `pass` did **not** cover. Both consumers match on this one
-/// enum so they cannot drift into disagreeing about which edges were checked.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RateEvidence {
     /// Nothing declared a rate for this edge — `EdgeRecord::nominal_rate_mhz`
@@ -1076,19 +728,6 @@ enum RateEvidence {
 }
 
 /// Relative deviation from a declared rate before `TFT007` fires.
-///
-/// 20%, and both directions matter for different reasons. Slow is the obvious
-/// fault. Fast is the quiet one: a ring sized from `rate_hz * history_secs`
-/// holds proportionally less history than the operator asked for, so an edge
-/// declared at 50 Hz and running at 100 Hz retains half the window every
-/// consumer was tuned against.
-///
-/// Not tighter, because the observed side is a **median** interval over a
-/// finite window: scheduler jitter moves it far less than it moves a mean, but
-/// a partly-filled ring and a rate rounded to two decimals by
-/// `tf_tree topology --discover` both put a few percent in. A check that fires
-/// on a healthy robot is a check somebody adds to `--suppress` permanently,
-/// and then it detects nothing at all.
 const RATE_TOLERANCE: f64 = 0.20;
 
 /// Intervals needed before an observed rate is worth comparing to a declared
@@ -1129,40 +768,6 @@ fn rate_evidence(e: &doctor::EdgeInfo, samples: Option<&[&PushSample]>) -> RateE
 }
 
 /// `TFT007` — the observed publish rate is far from the declared nominal.
-///
-/// # Where the declared rate comes from
-///
-/// `EdgeRecord::nominal_rate_mhz` (`docs/PHASE5.md` §1.2), written at
-/// declaration time from `EdgeCfg::nominal_rate_hz`. The path an operator
-/// actually uses is a topology file's `rate_hz` — `tf_tree topology --discover`
-/// writes one, `TopologyConfig::builder` carries it into the arena, and the
-/// ROS 2 bridge builds from exactly that. An edge sized by `capacity` declares
-/// nothing and is not compared.
-///
-/// # Why the whole check skips when it compared nothing
-///
-/// A `Pass` from this check is an active claim: *every edge that declared a
-/// rate is publishing at it*. That claim needs at least one compared edge, and
-/// there are two ways to have none. Nothing declared — a zero is "not
-/// declared", not "declared as 0 Hz", and comparing an observed rate against it
-/// makes every edge deviate by infinity, which is a fabricated finding on a
-/// correct arena. Or edges declared and none of them retained enough intervals
-/// to measure: `doctor` run seconds after bringup, during a publisher restart,
-/// or on an edge whose publisher has stopped entirely (no samples at all).
-/// **Both skip**, with a reason naming which one it was, because a `Pass`
-/// earned by the second is exactly the fabricated assurance the first case is
-/// guarded against.
-///
-/// There is a third way to have none, and it is the one a `pass` would be most
-/// wrong about: every declaring edge's publisher has **stopped**.
-/// [`stopped_publishers`] is the predicate, and such an edge is withheld from
-/// the comparison; `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing blindness*.
-///
-/// When *some* edges are comparable and others are not, the check runs on those
-/// and [`rate_coverage_note`] (which gap each uncompared edge fell into) and
-/// [`stopped_publisher_note`] (the withheld publishers, named from the other
-/// side) state what it did not cover, because a bare `pass` would otherwise
-/// read as "every edge publishes at its intended rate".
 fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
     let by_edge = inp.obs.by_edge();
     let stopped = stopped_publishers(inp.obs, inp.clock, inp.stream);
@@ -1216,9 +821,6 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
     }
     // Not `declared == 0`: that guard leaves a hole between itself and
     // `rate_coverage_note`, which also says nothing when it compared nothing.
-    // An arena whose declaring edges all fell short of `RATE_MIN_INTERVALS`
-    // would satisfy both and report a bare `pass` having compared no edge at
-    // all — no finding, no skip reason, and no note in `--json` either.
     if comparable == 0 {
         return CheckOutcome::skipped(
             Tft::Tft007,
@@ -1244,17 +846,6 @@ fn tft007(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// The disclosure that pairs with `tft007`: which edges its result covers.
-///
-/// `None` when the answer is unambiguous — nothing was compared (the check
-/// skipped and says so itself, naming which of its gaps it hit), or every
-/// dynamic edge was declared, measurable and still publishing. A note is
-/// emitted only for the middle case, where `pass` is true of the edges that
-/// were compared and silent about the rest.
-///
-/// # Why it takes the clock and the source
-///
-/// `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing
-/// blindness* (its paragraph on the disclosure).
 #[must_use]
 pub fn rate_coverage_note(
     snap: &Snapshot,
@@ -1296,32 +887,6 @@ pub fn rate_coverage_note(
 /// fires, this passes) or average its declared rate while alternating 1 ms and
 /// 100 ms gaps (this fires, `TFT007` passes). This one needs no declaration, so
 /// it has evidence on arenas `TFT007` cannot judge at all.
-///
-/// # It is the spread, not a p99 against the nominal
-///
-/// `docs/PHASE5.md` §6's row read *"p99 inter-arrival ≫ nominal"* until the
-/// amendment that corrected it to this rule. Two reasons, both of them §6's own
-/// arguments applied one row over. Judging against the *declared* nominal is
-/// what [`tft009`]'s doc refuses for gaps — an edge running at half its nominal
-/// would have every interval over the bar, burying the jitter this check exists
-/// to find under a deviation `TFT007` already reports once. And a nominal exists
-/// only where a topology file declared one, so keying on it would make the one
-/// spread check in the catalogue skip on every arena built without a `rate_hz` —
-/// which is where a stranger's first `doctor` run happens.
-///
-/// # A stopped publisher is withheld, not judged
-///
-/// [`stopped_publishers`] is the predicate and [`stopped_publisher_note`] the
-/// disclosure; `docs/PHASE5.md` §6, *`TFT007` and `TFT008` carried `TFT009`'s trailing blindness*.
-///
-/// # And a run that judged nothing skips rather than passing
-///
-/// `Pass` here is the active claim *no edge in this arena publishes unevenly*,
-/// and an arena where no edge retained [`doctor::SPREAD_MIN_INTERVALS`]
-/// intervals — or where the only ones that did have stopped — supports no such
-/// claim. The two are different skips
-/// because the remedies are opposite: wait for the rings to fill, or go and look
-/// at a dead publisher.
 fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
     let withheld: BTreeSet<u32> = stopped_publishers(inp.obs, inp.clock, inp.stream)
         .into_keys()
@@ -1361,19 +926,10 @@ fn tft008(inp: &Inputs<'_>) -> CheckOutcome {
 /// Intervals an edge must retain before `TFT009` has an inter-arrival
 /// distribution to measure a gap against. Four, because a median over three is
 /// one sample away from being an extremum.
-///
-/// Written once, and quoted by the skip reason rather than restated there —
-/// the shape [`tft008`]'s skip already uses for
-/// [`doctor::SPREAD_MIN_INTERVALS`]. A number spelled beside the predicate that
-/// enforces it is a number that drifts from it.
 const GAP_MIN_INTERVALS: usize = 4;
 
 /// The shape of one edge's retained inter-arrival distribution: the median
 /// period it publishes at, and the largest gap between two retained stamps.
-///
-/// The median is [`doctor::median_period`] rather than a second sort in this
-/// file, so "the period this edge publishes at" is one number across `TFT007`,
-/// `TFT008`, `TFT011` and here.
 struct IntervalShape {
     /// The median retained inter-arrival interval. Strictly positive.
     median_ns: i64,
@@ -1382,11 +938,6 @@ struct IntervalShape {
 }
 
 /// Why one edge's retained stream supports no [`IntervalShape`].
-///
-/// Three-valued for [`RateEvidence`]'s reason one row over: the three are not
-/// interchangeable, the remedies are opposite, and `TFT009` has to be able to
-/// say **which** when it judged nothing at all. Folding them would send an
-/// operator after a bringup problem when the fault is a reordered stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShapeGap {
     /// Fewer than [`GAP_MIN_INTERVALS`] intervals. The remedy is to wait for
@@ -1399,8 +950,6 @@ enum ShapeGap {
     /// happened. The real fault is `TFT018`, which fires on the same stream at
     /// error severity; adding a warn about a phantom gap next to it sends the
     /// operator looking for a lost publisher instead of a reordered one.
-    /// Declining loses nothing: an interval sequence that is not monotone has
-    /// no meaningful inter-arrival distribution to measure a gap against.
     NotMonotone,
     /// A non-positive median, which every retained stamp being identical
     /// produces: the ratio would divide by zero and make every non-zero
@@ -1433,16 +982,6 @@ fn interval_shape(samples: &[&PushSample]) -> Result<IntervalShape, ShapeGap> {
 }
 
 /// Why `TFT009` judged no edge at all, in terms an operator can act on.
-///
-/// One clause per [`ShapeGap`] **present**, never a fixed three-clause shape
-/// with two zeroes in it and never a fold of the three into one: the remedies
-/// are different — wait for the rings to fill (or size them above
-/// [`GAP_MIN_INTERVALS`]), go and read `TFT018`, or go and look at a publisher
-/// stamping one instant — and a skip whose reason does not separate them costs
-/// the operator the same walk the check was supposed to save.
-///
-/// The empty case is its own sentence, because "no edge retained enough" and
-/// "nothing published at all" are different arenas.
 fn gap_evidence_skip(too_few: usize, not_monotone: usize, no_period: usize) -> String {
     let mut why: Vec<String> = Vec::new();
     if too_few > 0 {
@@ -1486,27 +1025,6 @@ pub struct Silence {
 }
 
 /// Every edge whose publisher has **stopped** — the gap that has not ended.
-///
-/// # One predicate, because three checks have to agree about it
-///
-/// Every rule in this module that judges a publisher measures *between*
-/// retained stamps, and a publisher that died three weeks ago leaves a full ring
-/// of perfectly spaced samples: the median is healthy, the largest gap is one
-/// period, the coefficient of variation is ~0, and the observed rate equals the
-/// declared one. `TFT009` reports the silence; `TFT007` and `TFT008` must not
-/// report `pass` about the same edge in the same document, because a check
-/// clearing a publisher another one is calling dead is worse than either answer
-/// alone. (`TFT008` is in that position on any such arena; `TFT007` only where
-/// the edge declared a rate — without a declaration it skips before reaching
-/// the edge. `docs/PHASE5.md` §6's amendment states the full condition.)
-///
-/// So the three read this one function, and [`stopped_publisher_note`]
-/// discloses what it withheld. `CLAUDE.md` forbids a second spelling of an
-/// existing path; a rule is a path.
-///
-/// # It answers nothing on a source nobody is writing
-///
-/// See `live_wall_now`, which carries both conditions and their reasons.
 #[must_use]
 pub fn stopped_publishers(
     obs: &Observations,
@@ -1540,30 +1058,6 @@ pub fn stopped_publishers(
 
 /// `TFT009` — an inter-arrival interval far above the edge's own median, and
 /// the one that has not ended.
-///
-/// Relative to the edge's own median rather than to a fixed threshold because a
-/// 200 ms gap is a dropout at 100 Hz and normal at 5 Hz. Deliberately still not
-/// against the declared rate [`tft007`] now has: an edge running at half its
-/// nominal has no dropouts, and reporting one for every interval would bury the
-/// gaps this check exists to find under a rate deviation `TFT007` already
-/// reports once.
-///
-/// The second half is [`stopped_publishers`] — **the gap that has not ended
-/// yet**, which every rule above is blind to because they all measure *between*
-/// retained stamps. `tf_tree top` already reports it under this same id, but it
-/// needs two ticks to see a `head` that did not move; a single snapshot has to
-/// compare the newest stamp against a clock instead. The interval is
-/// `now - newest`: the trailing edge of the same inter-arrival distribution the
-/// rules above measure, judged by the same [`GAP_FACTOR`] against the same
-/// median. Nothing new is calibrated.
-///
-/// # And a run that judged nothing skips rather than passing
-///
-/// `docs/PHASE5.md` §6, *`TFT009` was the one check in this group with no skip
-/// arm*.
-///
-/// [`gap_evidence_skip`] is the reason, and it names which [`ShapeGap`] rather
-/// than only that there was one.
 fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
     let stopped = stopped_publishers(inp.obs, inp.clock, inp.stream);
     let mut out = Vec::new();
@@ -1626,19 +1120,6 @@ fn tft009(inp: &Inputs<'_>) -> CheckOutcome {
 
 /// The reference instant to measure a *trailing* silence against, or `None`
 /// when there is no such thing for this source.
-///
-/// Two conditions, and both are about whether "how long since the last sample"
-/// is a question with an answer:
-///
-/// * **The clock must share an epoch with the stamps** ([`Clock::Wall`]), for
-///   `TFT005`'s reason in the opposite direction.
-/// * **Something must be writing.** On a frozen `.tft` or a bag the newest stamp
-///   is as old as the recording, so `now - newest` measures how long ago the file
-///   was made — which would fire on every archive `doctor` is pointed at, and is
-///   the false positive that makes an operator stop reading the report.
-///   [`PushStream::RingsUnderWriter`] is `doctor --attach`, the live case, and is
-///   the only one where a silent edge means a publisher stopped rather than a
-///   file being old.
 fn live_wall_now(clock: Clock, stream: PushStream) -> Option<i64> {
     match (clock, stream) {
         (Clock::Wall(now), PushStream::RingsUnderWriter) => Some(now),
@@ -1648,17 +1129,6 @@ fn live_wall_now(clock: Clock, stream: PushStream) -> Option<i64> {
 
 /// Why `TFT009` could not look for a publisher that **stopped**, or `None` when
 /// it could — or when it did not run at all.
-///
-/// The retained-gap half of `TFT009` runs on every source; the trailing-silence
-/// half needs a live arena and a comparable clock (`live_wall_now`). A check that
-/// quietly does half its work is indistinguishable from one that passed, which is
-/// the whole reason [`crate::catalogue::Status::Skipped`] carries a mandatory
-/// reason — so where `TFT009` *ran*, the disclosure has to be a note.
-///
-/// # It reads the outcome, because the two can contradict each other
-///
-/// `docs/PHASE5.md` §6, *`TFT009` was the one check in this group with no skip
-/// arm* (its last paragraph, on `Meta.notes`).
 #[must_use]
 pub fn silence_coverage_note(
     tft009: &CheckOutcome,
@@ -1693,11 +1163,6 @@ pub fn silence_coverage_note(
 
 /// The disclosure that pairs with the withholding: which edges `TFT007` and
 /// `TFT008` declined to judge because [`stopped_publishers`] named them.
-///
-/// `None` when nothing was withheld. It is a note rather than a skip because
-/// those checks may still have judged other edges — and where they judged
-/// *nothing*, each says so in its own skip reason instead of leaning on this
-/// line, exactly as `TFT007` already does for an undeclared rate.
 #[must_use]
 pub fn stopped_publisher_note(
     obs: &Observations,
@@ -1717,10 +1182,6 @@ pub fn stopped_publisher_note(
 }
 
 /// `TFT010` — an edge whose consumers keep asking outside its window.
-///
-/// Its evidence is *entirely* the §5 counters, so it skips whenever those carry
-/// no verdict — see [`no_counter_evidence`], which covers both a build without
-/// the feature and an arena nobody has looked anything up in.
 fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
     if let Some(why) = no_counter_evidence(inp.counters, inp.stats) {
         return CheckOutcome::skipped(Tft::Tft010, why);
@@ -1771,30 +1232,6 @@ fn tft010(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT011` — the ring is shorter than the lag its consumers actually showed.
-///
-/// Two independent pieces of evidence, both reported under this id:
-///
-/// 1. `worst_extrap_gap_ns` against the ring's **actual retained span**. This is
-///    gated on `extrap_before > 0`, and that gate is the whole correctness of
-///    the check: the high-water mark covers the distance past *either* end of
-///    the window, and a request past the *newest* end means the publisher is
-///    behind, which no amount of extra capacity fixes. Reporting that as an
-///    undersized ring would send an operator to enlarge a buffer that is
-///    already big enough.
-/// 2. The Phase 1 `short-buffer` finding — `capacity x median period` against
-///    the largest observed publish latency — which needs a per-sample arrival
-///    delay and therefore only fires on the fixture
-///    ([`PushStream::no_arrival_delays`]).
-///
-/// # It skips only when *both* halves are blind, and that is the whole rule
-///
-/// Either half alone is a real result, so losing one is a disclosure
-/// ([`crate::evidence_notes`]) and not a skip. Losing both is not: an arena that
-/// has served no lookups and a stream with no arrival delays leave this function
-/// walking two empty sets and returning `pass`, which says "your rings are big
-/// enough" on evidence that could not have said otherwise. That is the
-/// fabricated all-clear [`no_counter_evidence`] exists to refuse, and a bag
-/// source hits it on both halves at once.
 fn tft011(inp: &Inputs<'_>) -> CheckOutcome {
     let counters = no_counter_evidence(inp.counters, inp.stats);
     let delays = inp.stream.no_arrival_delays();
@@ -1861,34 +1298,10 @@ fn tft012(inp: &Inputs<'_>) -> CheckOutcome {
 /// How long *something* in an arena must have been publishing before `TFT013`
 /// will call an edge that has not published a fault — §6's *"after a grace
 /// period"*.
-///
-/// **Five seconds, and it is `tf_tree_cli`'s choice rather than
-/// `docs/PHASE5.md`'s**, in the same way `CLOCK_STEP_MIN_REJECTED_RUN` is: §6
-/// names no length, and the value lives here rather than in prose that can
-/// drift from it. Both of its costs are real and are stated rather than
-/// tuned away. Too short and a node still in DDS discovery is reported as
-/// missing — a robot's publishers do not all start in the same millisecond, and
-/// a check that fires during every bringup is one an operator suppresses
-/// permanently. Too long and an arena whose publishers have produced less than
-/// this much data never reaches a verdict at all, which is why that outcome is a
-/// *stated skip* here and not silence.
-///
-/// Five is comfortably past node startup and DDS discovery on the stacks this
-/// tool is pointed at, and far below any duration in which a genuinely absent
-/// publisher stops mattering.
 const DECLARATION_GRACE_NS: i64 = 5_000_000_000;
 
 /// How long **anything** in this arena has been publishing, or which of the two
 /// absences stands in the way of an answer.
-///
-/// Three-valued for [`RateEvidence`]'s reason: `TFT013`'s skip reason has to
-/// name **which**, and the two absences are opposite arenas with opposite next
-/// steps. A `None` folded them, and the reason printed for the fold described
-/// only the first — an arena with a publisher that had accepted 3600 pushes was
-/// told *nothing in this arena has published a measurable stream … an edge with
-/// `head == 0` is what every dynamic edge of a correct arena reads as at
-/// bringup*, using a fact ([`doctor::EdgeInfo::head`]) the same function had
-/// already read three lines earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublishActivity {
     /// No dynamic edge has ever accepted a push. Bringup and a total outage at
@@ -1899,29 +1312,6 @@ enum PublishActivity {
     /// dynamic edge — and no dynamic edge yielded the two samples
     /// [`doctor::median_period`] needs, so the span below cannot be computed
     /// from any of them.
-    ///
-    /// **Three arenas reach this state and their remedies are different**,
-    /// which is why the numbers travel with it rather than one sentence being
-    /// printed over all of them.
-    ///
-    /// * A ring that *cannot* hold two. `Capacity::history` is
-    ///   `next_pow2(ceil(rate_hz * secs))` and `SampleRing::retained` is
-    ///   `capacity - 1`, so a ring declared `rate_hz * secs <= 2` retains
-    ///   exactly one sample however long the publisher runs — reachable
-    ///   **permanently**, not only at bringup.
-    /// * A ring that has simply not been given two: a publisher that has pushed
-    ///   once into a 512-slot ring, which is every `doctor --attach` at
-    ///   bringup, and a `--from-bag` run whose recording carries one dated
-    ///   record for the edge — `crate::recording` admits no record with
-    ///   `stamp_ns == 0`, so a bag can yield no observation at all against a
-    ///   head in the thousands.
-    /// * Samples enough and **no positive median period**:
-    ///   [`doctor::median_period`] declines a non-positive median as well as a
-    ///   short stream, so a publisher stamping one instant or stamping
-    ///   backwards lands here with a full ring.
-    ///
-    /// Naming one of the three as *the* cause is the defect this variant was
-    /// split out of [`PublishActivity::NoPublisher`] to stop, one arena over.
     Unmeasurable {
         /// Accepted pushes on the busiest dynamic edge. The evidence that this
         /// is not the arena above.
@@ -1942,30 +1332,6 @@ enum PublishActivity {
 }
 
 /// [`PublishActivity`] for this arena.
-///
-/// # Why this quantity and not the arena's age
-///
-/// The arena records no declaration time, and adding one is an arena field that
-/// `CLAUDE.md` forbids adding opportunistically —
-/// `docs/decisions/0032` is the queue such a field joins. So the grace period is
-/// measured against the only clock the arena keeps about itself: its own
-/// publishing.
-///
-/// `EdgeRecord::head` is the **monotone total** samples ever published
-/// (invariant 5), not a ring index, so `(head - 1) x median period` is how long
-/// that publisher has been running — including across every lap the ring has
-/// wrapped. That matters: the *retained* span would have been the obvious
-/// quantity and it saturates at `capacity / rate`, so a 100 Hz edge with a
-/// 100-slot ring would report one second forever and an arena that had been up
-/// for a week would never clear a five-second grace.
-///
-/// It is a **lower** bound in both terms — `head` counts accepted pushes, and
-/// the median under-reads a stream with gaps — which is the conservative
-/// direction: this check accuses late rather than early.
-///
-/// One walk, not two: an "is anything publishing" pass beside a "how long" pass
-/// can come to disagree, which is the defect
-/// [`rate_coverage_note`] was repaired for one section up.
 fn publish_activity(inp: &Inputs<'_>) -> PublishActivity {
     let by_edge = inp.obs.by_edge();
     let mut best: Option<i64> = None;
@@ -2004,40 +1370,6 @@ fn publish_activity(inp: &Inputs<'_>) -> PublishActivity {
 }
 
 /// `TFT013` — an edge declared and never published to, **after a grace period**.
-///
-/// Dynamic edges only. A static edge carries its pose inline in the record and
-/// never pushes, so its `head` is 0 for the whole life of a correct arena.
-///
-/// # The grace period, which §6's row required and this check did not have
-///
-/// `head == 0` alone is the state of *every* dynamic edge of a correct arena
-/// between `TreeBuilder::build` and the first push, so a `doctor` run at bringup
-/// — before the publishers are up, which is the run an operator is most likely
-/// to make — accused every one of them. §6's Detection column has always read
-/// "head == 0 **after a grace period**"; the predicate had no time term at all.
-///
-/// The evidence is [`publish_activity`], and where there is none the whole check
-/// **skips** with a reason. There are **two** such arenas and the reason has to
-/// say which, because they are opposite:
-///
-/// * [`PublishActivity::NoPublisher`] — nothing has ever published. That skip is
-///   the honest answer to a real ambiguity rather than a gap: it is a robot at
-///   bringup and a robot whose every publisher is dead, and no fact in the arena
-///   separates them. `TFT017` (no live writer) is the id that reports the
-///   second.
-/// * [`PublishActivity::Unmeasurable`] — publishers **exist** and no dynamic
-///   edge yielded the two samples a median period needs. This one is not an
-///   ambiguity at all, and printing the sentence above for it states something
-///   false about the arena: it says nothing has published, to an operator whose
-///   publisher has accepted thousands of pushes, and sends them to `TFT017`.
-///   **Its own reason then has the same shape one level down**, which is why
-///   the variant carries two numbers and the message branches on them. A ring
-///   too small to ever hold two samples, a large ring that has only been given
-///   one, and a stream of samples with no positive median period are three
-///   different arenas: a ring-size remedy is false about a 512-slot ring at
-///   bringup or a recording carrying one dated record per edge, and a
-///   too-few-samples sentence is false about a publisher stamping one instant,
-///   which [`doctor::median_period`] declines for its own reason.
 fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
     let activity = match publish_activity(inp) {
         PublishActivity::Running(ns) => ns,
@@ -2124,121 +1456,16 @@ fn tft013(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// Which of `TFT014`'s two participant leaks a slot is, if either.
-///
-/// `docs/decisions/0028` plan step 6. **Two findings and not one**, because the
-/// responses differ and an operator sent after the wrong one at 3am has been
-/// actively misled: (a) is a slot nothing will ever reassign, and (b) is a slot
-/// a *live* open file description is holding on behalf of a process that no
-/// longer exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotLeak {
     /// **(a)** A record that is not `FREE` over a lock byte nobody holds.
-    ///
-    /// `docs/decisions/0028`'s *The ordering* table: on every path that has a
-    /// byte, the byte is taken *before* the arena record leaves `FREE`, so
-    /// "free byte over a non-`FREE` record" is the leak and nothing else
-    /// produces it.
     Abandoned,
     /// **(b)** The byte *is* held, and `/proc` says the process the identity
     /// record names is gone.
-    ///
-    /// **Judged without reference to the arena record, and it has to be.** The
-    /// two facts are the lock file's — a held byte and the identity beside it —
-    /// so this fires on a `FREE` arena row as readily as on a `LIVE` one, which
-    /// is what makes the *read-only* participant's inheritor visible. That one
-    /// writes no arena record at all (D18) and is the shape a `fork`ed Python
-    /// worker leaves behind, so a variant that needed a record would miss the
-    /// case it is mostly for.
-    ///
-    /// So what holds it is a descriptor that outlived its process, which on
-    /// Linux means a `fork` inheritor: `docs/PHASE2.md` §6.2 is NORMATIVE that
-    /// an OFD lock belongs to the open file description and that `fork` shares
-    /// it. **Not reclaimable, deliberately** — the kernel's answer is *alive*,
-    /// and overruling it with a `/proc` inference is the inversion §5.1 exists
-    /// to forbid. `docs/decisions/0030` closes it at the source, by having the
-    /// atfork handler close what it inherited; until then this is a documented
-    /// limitation *with a detection*, which is the whole reason this variant
-    /// exists.
     ForkInheritor,
 }
 
 /// Whether participant slot `p` is one of the two leaks above.
-///
-/// # One predicate, and the read order it depends on
-///
-/// The `state` word is consulted **first**, and it answers only *is there a
-/// record here* — never *is its process alive*, which is the split
-/// `docs/PHASE2.md` §5.1 draws and the reason `identity()` in the assigner was
-/// a bug. The byte is consulted second. That order is a correctness constraint
-/// rather than a style: `tf_tree`'s `reclamation_verdict` (`0028` piece 2, third
-/// constraint) states the argument in full — under word-then-byte the `Acquire`
-/// load of a live word synchronises-with `fill_slot`'s publishing `Release`
-/// store, so a byte probe sequenced after it must see the byte held, and
-/// reversing the two erases a published record under `loom` in 0.00 s.
-///
-/// This function is the *reporting* half and does not re-read either fact: the
-/// word was read by [`Snapshot::capture`] and the byte by
-/// [`Snapshot::probe_lock_facts`], whose signature is what makes the order
-/// unhoistable — it hands the probe the captured row, so there is nothing to
-/// compute before the capture. The argument that the order *matters* is
-/// `loom`'s, in `tf_tree`; the argument that this program obeys it is that
-/// signature.
-///
-/// # Every arm, and which way it fails
-///
-/// | `state` | byte | `/proc` | verdict |
-/// |---|---|---|---|
-/// | `FREE` | held | gone | **(b)** [`SlotLeak::ForkInheritor`] — the read-only participant's inheritor, and the likeliest one |
-/// | `FREE` | held | running or unknown | nothing — an ordinary read-only consumer (D18) |
-/// | `FREE` | free or unknown | any | nothing — an empty slot, which is most of a real table |
-/// | non-`FREE` | free | gone | **(a)** [`SlotLeak::Abandoned`] |
-/// | non-`FREE` | free | unknown | **(a)** — the byte alone is the leak signature, and §5.1 says the byte is the fact |
-/// | non-`FREE` | free | running | nothing. See below |
-/// | non-`FREE` | held | gone | **(b)** [`SlotLeak::ForkInheritor`] |
-/// | non-`FREE` | held | running or unknown | nothing — somebody is holding it |
-/// | `LIVE` | unknown | any | (a) iff [`ParticipantInfo::alive`] is false |
-///
-/// **A `FREE` record is not silence, and that was a real hole.** `FREE` says
-/// only that no *arena* record is here, and the participant D18 makes the
-/// consumer default — read-only, `PROT_READ`, Python's `multiprocessing`
-/// worker — never writes one: it takes a lock byte, writes a lock-file identity
-/// record, and leaves the arena table alone. So the fork inheritor of a
-/// read-only participant is `FREE` + held + gone, it is the single most likely
-/// shape on a Python deployment, and returning `None` for every `FREE` row
-/// reported it as `"status": "pass"` while `docs/RUNBOOK.md` told the operator
-/// this check would name it. Clause (b) is therefore judged from the byte and
-/// the identity record, which are the two facts such a slot has; clause (a)
-/// still needs an arena record, because an arena record is the thing it says
-/// nothing will reassign.
-///
-/// **`free` + `running` is silence, and it is the one place this is quieter
-/// than the reclaimer.** `tf_tree`'s reclamation predicate calls a non-`FREE`
-/// record over a free byte reclaimable with no `/proc` conjunct at all, so on
-/// that combination a report and a sweep can disagree. The disagreement is
-/// deliberate: what produces it is a participant with a record and no byte,
-/// which `0028` open question 1 ruled out of the deployment model and step 0b
-/// removed the producer of — and naming a process `/proc` says is *running* as
-/// leaked is the one false positive that gets a `warn` suppressed for good.
-///
-/// **The `unknown` byte row is the run with no byte answer** — usually the
-/// source with no lock file at all, the in-process fixture and `--from-bag`,
-/// whose participant table is this process's own. It keeps exactly the
-/// predicate this check shipped with, so a source that cannot be asked about a
-/// byte reports what it always did rather than falling silent. **An `--attach`
-/// run reaches it too**, for any slot whose `F_OFD_GETLK` returns `Err`, which
-/// is why `slot_facts` is three-valued rather than folding a failed probe into
-/// `Free` — a failed probe is not an accusation. The cost is that
-/// `abandoned_evidence`'s message for this row says "no lock file was read on
-/// this run", which on that path is false.
-///
-/// **The one race left in it is the creator's, and it is µs-wide.** That path
-/// takes the byte *before* writing the identity record (a deliberate deviation
-/// from §3.3, argued in `tf_tree_ipc::Open::register_creator`), so for a few
-/// microseconds a freshly taken byte sits over the *previous* occupant's
-/// identity — and if that occupant is dead, this reads (b). A diagnostic that
-/// is momentarily wrong about a slot being re-taken is the cost of that
-/// deviation, and it is priced in the direction of a report rather than a
-/// reclamation: nothing acts on (b) but a human.
 #[must_use]
 pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
     // The word first, and it answers exactly one question: is there an arena
@@ -2270,54 +1497,6 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
 }
 
 /// The evidence clause of an [`SlotLeak::Abandoned`] finding.
-///
-/// One rendering per evidence set. A message that says "the lock byte is free"
-/// on a run that never opened a lock file is asserting a syscall it did not
-/// make, and an operator who then goes looking for the holder has been sent by
-/// the tool.
-///
-/// **[`RecordedProcess::Unknown`] has two causes and they are not one clause.**
-/// Its own doc says so — *"no identity record to ask about, **or** `/proc`
-/// would not say"* — and this function collapsed them into "/proc could not say
-/// what became of the process" until 2026-09-19. On the byte-less
-/// `build_shared` record that `a_byteless_record_in_a_served_arena_is_accused_of_leaking`
-/// pins, the lock file yields no identity record, so `/proc` was never asked
-/// about anybody: the message named a syscall the run did not make, beside a
-/// pid `/proc` would have answered for instantly.
-///
-/// **`recorded_pid` separates the two *as far as this run can*, and the clause
-/// is written to claim no more than that.** `slot_facts`
-/// (`crates/tf_tree_cli/src/lib.rs`) builds it from
-/// `read_identity(slot).ok().flatten()`, which folds a read that **failed**
-/// into a read that found nothing — so `None` means *this run has no identity
-/// record*, never *the lock file holds none*. Saying the latter would be the
-/// same defect one level down: an absence asserted from a question that may not
-/// have been answered.
-///
-/// **And the pid in the finding is usually real**, so the clause says where it
-/// comes from: it is the arena record's, which `tft014` falls back to, and the
-/// remedy this check prints — *check the pid is gone before you reap* — needs
-/// something to check. A reader told no process was named would otherwise read
-/// the pid beside it as contradicting that.
-///
-/// **Usually, because a `RESERVED` record's pid is still zero**, and `slot_leak`
-/// sends every non-`FREE` state through the byte table. The producer is
-/// `fill_slot` (`crates/tf_tree_core/src/participant.rs`): it CASes
-/// `FREE -> RESERVED`, writes the fields, then publishes `Release(LIVE)`, and a
-/// registrant killed inside that window leaves a `RESERVED` record whose `pid`
-/// field is still `0`. Once the kernel releases its lock byte, that record
-/// reaches this row. Telling an operator the printed number is the record's
-/// own, and then to go and check it, is `slot_subject`'s *"slot 8 pid 0 …
-/// /proc has no running process for it"* defect arriving by a new route, so
-/// that shape gets its own clause saying there is nothing to check.
-///
-/// *This named "the creator's µs-wide window — byte taken, identity record not
-/// yet written" for one round, and that window cannot reach here at all: with
-/// the byte taken `p.byte` is [`LockByte::Held`], which `slot_leak` routes to
-/// [`SlotLeak::ForkInheritor`] or to no finding. It is clause (b) on
-/// `slot_leak`, which is where that rustdoc already assigned it. The test had
-/// to set a free byte to reach this arm, contradicting its own prose — a
-/// rationale the fixture falsified, in the same commit.*
 fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
     match (p.byte, p.recorded) {
         (LockByte::Free, RecordedProcess::Gone) => {
@@ -2347,26 +1526,6 @@ fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
 
 /// The pid a slot finding's evidence is about, and the arena record's, in one
 /// subject line.
-///
-/// **The lock file's pid leads, because the `/proc` sentence in every message
-/// below is about that one.** `doctor` shipped
-/// *"slot 8 pid 0 … /proc has no running process for it"*: the `0` is
-/// [`ParticipantInfo::pid`], the arena record's field, which is still zero on a
-/// `RESERVED` row and is *always* zero on the `FREE` row a read-only
-/// participant leaves — while the process the sentence is about is named only
-/// in the lock file. Printing the record's number beside the other one's
-/// evidence gives an operator a pid to hunt that no evidence in the finding
-/// concerns.
-///
-/// Both are named when both exist and differ, because both are then real: the
-/// lock file names the process, and the arena record names the occupancy that
-/// is stuck. When the record's field is zero it names nothing and is left out
-/// rather than printed as a `0` somebody has to interpret.
-///
-/// The trailing byte clause is what separates the two shapes **in the subject
-/// alone**, which is what `docs/RUNBOOK.md`'s `TFT014` rows key on: at 3am, a
-/// slot to reap and a slot nothing may reap must not need a paragraph of prose
-/// to tell apart.
 fn slot_subject(p: &ParticipantInfo) -> String {
     let byte = match p.byte {
         LockByte::Held => "byte still HELD",
@@ -2386,240 +1545,11 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 }
 
 /// The pid this finding is about, or `None` when nothing named one.
-///
-/// **The one predicate three renderings share**, because the zero used to reach
-/// them one at a time. `slot_subject`'s own doc has said since it was written
-/// that a record whose field is zero "names nothing and is left out rather than
-/// printed as a `0` somebody has to interpret" — and its fallback arm printed
-/// the zero anyway whenever the lock file named nobody either. [`tft014`]'s
-/// abandoned message printed it a second time, and told the operator to go and
-/// check it a third.
-///
-/// `recorded_pid` is the lock file's and leads, because the `/proc` sentence in
-/// every message is about that one; `ParticipantInfo::pid` is the arena
-/// record's, still zero on a `RESERVED` row and always zero on the `FREE` row a
-/// read-only participant leaves.
 fn named_pid(p: &ParticipantInfo) -> Option<u32> {
     p.recorded_pid.or(Some(p.pid).filter(|&n| n != 0))
 }
 
 /// `TFT014` — a participant slot, or a claim, that outlived its owner.
-///
-/// Both halves of §6's title, and they are one condition seen from two tables:
-/// a process died without running `Drop`, and what it left behind is a slot
-/// nothing will reassign and — if it was writing — an edge nothing will
-/// reclaim. `Snapshot::participants` carries one liveness answer per slot and
-/// both halves read it, so a report cannot call the same process alive on an
-/// edge line and dead on a slot line.
-///
-/// # The predicate is the lock byte, and it is [`slot_leak`]
-///
-/// `docs/PHASE2.md` §5.1: liveness is the participant's OFD lock byte, never
-/// the record. The **claim half** reads
-/// [`crate::doctor::ParticipantInfo::alive`], which is
-/// [`Tree::participant_alive`] — `F_OFD_GETLK` on the slot's byte for a tree
-/// from `tf_tree::open` and a `/proc` inference otherwise, both failing safe
-/// towards *alive*. Reading `state` instead is what made this check blind in
-/// the state it is named for — `identity` answers for any record whose `state`
-/// word reads `LIVE`, and a participant killed without running `Drop` leaves
-/// one behind, so `owner_pid` came back non-zero and the check stayed quiet
-/// (`docs/decisions/0028`, issue #184).
-///
-/// The **participant half** needs more than one boolean and takes it from
-/// [`slot_leak`], whose table is the whole predicate. One `alive` cannot
-/// separate a joiner healthily sitting in `RESERVED` from one that died there,
-/// nor a released byte from one a forked child still holds, and those are the
-/// two silences `0028` plan step 6 closes. The extra facts arrive through
-/// [`Snapshot::probe_lock_facts`]; a source with no lock file supplies neither
-/// and the check reports what it always did.
-///
-/// **Detection only. Nothing here reclaims anything**, deliberately: `0028`
-/// reclaims from the *assigner* and from `Tree::reap_participants`, and a
-/// `doctor` check that mutated a robot's arena as a side effect of being asked
-/// a question would be the tool overstepping in the direction D18 exists to
-/// prevent.
-///
-/// # Which shapes reach it, and which of those `--attach` can see
-///
-/// **Not the one issue #184 measured.** A rendezvous joiner `SIGKILL`ed under a
-/// running owner is reclaimed by the owner's socket-hangup callback
-/// (`crates/tf_tree/src/open.rs`, issue #191, which `0028` calls *candidate B —
-/// hangup-driven owner reap*): its `ParticipantTable::release` is a real
-/// `LIVE -> FREE` transition — measured with an owner, a read-write joiner and
-/// a third observing process, the killed joiner's `state` word reading `FREE`
-/// by the observer's first poll 50 ms later. On that arena this arm stays quiet
-/// and the claim half is what speaks.
-///
-/// So a slot finding here means the slot was one that callback **cannot**
-/// reach. `0028` enumerates those places; the ones that leave this state — a
-/// `LIVE` record over a free byte — are:
-///
-/// * **The owner's own slot** (`0028` candidate B, hole 3). The owner registers
-///   itself and nothing hangs up on it.
-/// * **An owner killed between the hangup's probe and its CAS** (`0028`, *"a
-///   crash between the hangup and the CAS"*). One `compare_exchange`, so
-///   nothing is torn; what is lost is the reclamation.
-/// * **A client the owner's `epoll::add` failed for** (hole 4). It is
-///   deliberately left unwatched, so its death produces no hangup.
-/// * **A takeover heir's inherited peers** (hole 3 again). A new owner's
-///   `epoll` set holds no pre-takeover client sockets, and
-///   `Tree::inherit_ownership` binds a *fresh* `OwnerServer` while the
-///   survivors keep the ones they hold to the process that died. **§3.5 shipped
-///   2026-08-28** (`docs/PHASE2.md` §0.0), so this is live; this bullet read
-///   "reachable only once it is wired" until 2026-09-19.
-/// * **A byte-less `TreeBuilder::build_shared` creator in a served arena.** It
-///   registers a `LIVE` record and takes no byte at all, so there is nothing
-///   for the kernel to release and nothing for a hangup to be about. It is
-///   **out of contract**
-///   (`docs/decisions/0031-the-participant-record-with-no-byte.md`) and it is
-///   the one shape in this list the check does not merely miss but **accuses**
-///   — see the paragraphs below, and
-///   `a_byteless_record_in_a_served_arena_is_accused_of_leaking`.
-///
-/// **A `ReadWrite` `Tree::attach_shared` participant was hole 5 and is gone.**
-/// `0028` step 0b made both fd-attach arms return
-/// `ShmError::ReadWriteNeedsRendezvous`, so the shape cannot be constructed;
-/// this list named it until 2026-09-19, four paragraphs above a sentence in
-/// this same doc comment that says it was removed.
-///
-/// The remaining hole, the fork-inherited connection (hole 1), leaves the byte
-/// **held** by the child, so it is not in the list above — it is a finding of
-/// its own shape, [`SlotLeak::ForkInheritor`], and the one that does not need
-/// an arena record at all: the read-only participant D18 makes the consumer
-/// default writes none, and a `fork`ed Python worker holding its dead parent's
-/// byte is exactly a `FREE` row over a held byte.
-///
-/// **What `doctor --attach` can be pointed at is a property of the arena at the
-/// moment you run it, not of the shape**, and that is worth knowing before
-/// reading a quiet report as an all-clear. Attaching goes through the
-/// rendezvous, so it needs *somebody serving*. An arena whose owner died and
-/// whose survivors have not inherited refuses a fresh join with
-/// `ArenaHeldButUnreachable` — the record is `LIVE`, the leak is real, and no
-/// new process can be told, which is the state that hides the owner's own slot
-/// and an owner killed between the hangup's probe and its CAS. Let a survivor
-/// call `Tree::inherit_ownership` and the same arena serves again: **those two
-/// shapes become visible to this check, on an arena that now also has a heir's
-/// unwatched peers in it.** So none of the shapes above is permanently out of
-/// reach, and a quiet report from an arena that *did* accept the join is not a
-/// report about every shape it could hold.
-///
-/// *This paragraph said "only two of those five" and named `attach_shared` as
-/// one of the two — wrong in both directions by 2026-09-19, since that shape no
-/// longer exists and takeover had shipped three weeks earlier. The rewrite then
-/// sorted the shapes into reachable and not, which is the same error one level
-/// up: takeover is exactly what moves a shape between those two lists. It names
-/// the condition now, and counts nothing.*
-///
-/// `crates/tf_tree/tests/rendezvous.rs`'s
-/// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live` stages the
-/// reclaimed peer and the unreclaimable owner on one arena and asserts the
-/// `ArenaHeldButUnreachable` refusal above.
-///
-/// # It needs a table, not a picture of one
-///
-/// A frozen `.tft` is a byte copy of the whole arena, participant records
-/// included, so *every* slot in it names a process that exited when the freeze
-/// finished. Running here would fire on every correct `.tft` ever written, for
-/// an arena that has no assigner for a leaked slot to wedge — so the check
-/// **skips** on [`SlotTable::Image`] and says which source can answer. That
-/// replaces a `pass`, which was the worse of the two: a fabricated all-clear
-/// about a question the file cannot be asked.
-///
-/// # Which direction it fails in
-///
-/// Towards silence, in three named ways, because a warn that fires on a
-/// healthy robot is one that gets suppressed within a week.
-///
-/// **Two of the five that used to be here are now findings**, which is `0028`
-/// plan step 6: `RESERVED` was unreportable while the only fact was
-/// `participant_alive` (it folds `state == LIVE` in ahead of the probe and so
-/// answers "not alive" for a healthy joiner mid-attach exactly as for one that
-/// died there), and the fork case was unreportable while `/proc` was composed
-/// away rather than carried. `doctor` now opens the lock file — the thing
-/// `cmd_participants` always did and this check did not — and [`slot_leak`]
-/// composes the three facts once. Note what did **not** change: the fork case
-/// is still not reclaimable by anybody, because the kernel's answer for it is
-/// *held*; what it gained is a name.
-///
-/// * **A claim over a slot that has since been re-granted is not reported, and
-///   this one is reachable from the ordinary #184 flow.** The claim's owner word
-///   carries the `ClaimRecord`'s own per-edge epoch, not the participant's
-///   incarnation (`tf_tree_core::edge::pack_owner`), so nothing in it says
-///   *which occupancy* of the slot took the claim. **The producer this sentence
-///   named is gone as of 2026-08-29**: it read "the hangup reap frees the dead
-///   writer's slot but not its claims — nothing calls `Tree::reap_participant`
-///   on hangup", and the owner's callback now revokes that slot's claims before
-///   it frees the record, so the ordinary #184 flow no longer leaves one. Two
-///   producers remain and this check is still blind to both, and they are not
-///   equally in scope: a **dead owner**, whose own hangup nobody sees, is in
-///   contract and unchanged; a `TreeBuilder::build_shared` participant has no
-///   socket to hang up, and its claim can go stale *to another process* only in
-///   the served composition
-///   `docs/decisions/0031-the-participant-record-with-no-byte.md` put out of
-///   contract on 2026-09-18. Not a regression: the
-///   `owner_pid == 0` predicate was silent here too, for the same reason.
-///   Closing the *detection* still needs the incarnation *inside* the claim
-///   word, which is an arena format change and not one `0028` proposes.
-/// * **A claim caught mid-handoff (`CLAIMING`) is excluded.** It names no slot,
-///   exactly as a dead owner's claim names no slot, so from a snapshot the two
-///   are the same shape. `Tree::reap` may act on `CLAIMING` because it probes
-///   the claim's *own* lease first; this check has no such probe, so it reports
-///   neither and loses a claimer killed inside that window.
-///
-/// **The one place it used to fail the other way has had one of its two
-/// producers removed.** A `ReadWrite` `Tree::attach_shared` wrote an arena
-/// record and took no lock byte, so its healthy participant read as a leak;
-/// `0028` step 0b made both fd-attach arms refuse `ReadWrite`, so every
-/// supported read-write participant now joins through the rendezvous and takes
-/// its byte before the record leaves `FREE`.
-///
-/// **The second producer is still here, and the sentence that used to say
-/// otherwise was wrong.** It read: *"`TreeBuilder::build_shared` called
-/// directly still registers without a byte and is still supported — but such a
-/// tree has no lock file, so it reaches [`slot_leak`]'s `unknown` byte row and
-/// is judged by `/proc` alone, exactly as it was before."* That offers the
-/// **subject's** missing lock file as though it decided the **observer's**
-/// evidence, which is the confusion `docs/decisions/0028`'s erratum retracts
-/// one layer down. [`LockByte::Unknown`] is a fact about **this run's
-/// evidence**, not about the subject: `slot_facts`
-/// (`crates/tf_tree_cli/src/lib.rs`) produces it when no lock file was read
-/// *and* when a probe returns `Err` — three-valued on purpose, and neither
-/// value is "the subject has no lock file". A `doctor --attach` reached its
-/// arena by name, so it holds one and it probes: the
-/// byte-less record reads [`LockByte::Free`] with no identity record beside it
-/// — `(LockByte::Free, RecordedProcess::Unknown)`, which is
-/// [`SlotLeak::Abandoned`]. A live, publishing process is reported as an
-/// abandoned slot, over the evidence clause *"the lock byte is free"*. Pinned
-/// by `a_byteless_record_in_a_served_arena_is_accused_of_leaking`, whose mutant
-/// also says what the retracted sentence did **not** get wrong: the `unknown`
-/// row accuses too, on `state == LIVE && !alive`. The difference is the
-/// evidence an operator is then sent after — under that row the message adds
-/// *"/proc says its process is gone, and no lock file was read on this run"*.
-/// On a `--from-bag` or fixture source that clause is true. On an `--attach`
-/// run it is not, and an `--attach` run *can* land there, because a failed
-/// probe reaches the same row — a message wrong about its own run rather than
-/// about its subject, and it predates all of this. *This said "the one shape in
-/// this check" whose prose is wrong that way, and the shape this paragraph is
-/// about was a second: `abandoned_evidence`'s free-byte arm said `/proc` could
-/// not say, where there was no identity record for `/proc` to be asked about.
-/// That one is fixed; this one is not, because the row it belongs to is the
-/// no-evidence row and there is nothing truer to put there.*
-///
-/// **What bounds it is where "still supported" stops.** That phrase is about
-/// the **call**, not about serving its result:
-/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
-/// 2026-09-18 that binding a rendezvous over a `build_shared` arena is *out of
-/// contract*, and serving is the only way a byte-less `LIVE` record is ever put
-/// in front of this check — unserved, the fd goes to a child, nothing attaches
-/// by name, and no `doctor` run can reach the arena at all. So the check is
-/// wrong, in the accusing direction, about exactly the population the project
-/// does not support.
-///
-/// **The claim half rests on the owner word being decoded correctly.** It is
-/// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
-/// live claim to nothing and reports every claimed edge as leaked;
-/// `Snapshot::capture` uses `tf_tree_core::edge::slot_of`, and
-/// `doctor::tests::a_held_claim_resolves_to_the_writers_pid` pins it.
 fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
     if let Some(why) = inp.slots.no_liveness() {
         return CheckOutcome::skipped(Tft::Tft014, why);
@@ -2754,11 +1684,6 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT015` — a fixed-capacity table nearly full.
-///
-/// Worth a warning rather than an error because nothing is broken yet, and
-/// worth a warning at all because the arena cannot grow (`docs/PROJECT.md` §5):
-/// the failure when a table fills is a refused `intern` or `declare_edge`, at
-/// which point the fix is a rebuild and a fleet restart.
 fn tft015(inp: &Inputs<'_>) -> CheckOutcome {
     let mut out = Vec::new();
     for &(what, used, cap) in &inp.occupancy {
@@ -2861,12 +1786,6 @@ fn tft016(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT017` — a dynamic edge nobody is writing to.
-///
-/// The Phase 1 `unclaimed-dynamic` check, given an id by `docs/PHASE5.md` §6's
-/// amendment. Distinct from `TFT013` (declared and *never* published to) and
-/// from `TFT014` (a slot, or the claim it was holding, whose owner is gone):
-/// this is an edge with no claim at all, which may have a full ring of history
-/// that is now going stale.
 fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
     CheckOutcome::ran(
         Tft::Tft017,
@@ -2878,29 +1797,6 @@ fn tft017(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// `TFT018` — a later arrival carried an older stamp than an earlier one.
-///
-/// The Phase 1 `out-of-order` check, given an id by `docs/PHASE5.md` §6's
-/// amendment. Distinct from `TFT006`, which judges a stamp's *value*: a stream
-/// of perfectly plausible stamps can still arrive backwards, and that is what
-/// breaks a consumer's interpolation.
-///
-/// # It runs on a stream that was recorded, and skips on one that was replayed
-///
-/// The gate is [`PushStream::no_rejected_arrivals`], not liveness, and the two
-/// are not the same question. **An arena of any kind is the wrong evidence for
-/// this check**: `SampleRing::push` rejects a stamp older than the ring's last,
-/// so a ring holds only accepted pushes and [`Observations::from_arena`] can
-/// only ever reconstruct a non-decreasing sequence — on a live arena, on a
-/// frozen `.tft`, and on an arena built from a bag, which §3.1 additionally
-/// *sorts*. A live arena adds a second, opposite failure on top: the retained
-/// window is read with relaxed loads while a publisher writes into it, so a
-/// sample from the next lap can appear at the old end and read as an inversion
-/// the publisher never made.
-///
-/// So there are exactly two streams it can run against: the fixture's, which
-/// records the pushes the engine refused because the fixture *is* the publisher,
-/// and a recording's log order (`doctor --from-bag`), where a backwards stamp is
-/// in the file at the position it arrived at.
 fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
     if let Some(why) = inp.stream.no_rejected_arrivals() {
         return CheckOutcome::skipped(Tft::Tft018, why);
@@ -2915,57 +1811,14 @@ fn tft018(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// The one domain tag `TFT019` will attribute a clock step to.
-///
-/// Taken from the type rather than written as `0`: `docs/API.md` §2.5 records
-/// that a tag is a permanent choice read by every consumer and every recording
-/// already on disk, so the literal and the type must not be able to drift apart.
 const WALL_CLOCK_TAG: u8 = <SystemDomain as Domain>::TAG;
 
 /// How long a burst of rejected pushes has to be before `TFT019` will call it a
 /// clock step, in **arrivals on that edge**.
-///
-/// # This number is not in the spec
-///
-/// `docs/PHASE5.md` §6's amendment says "a run of rejections **concentrated in a
-/// short window**" and `docs/API.md` §5.3 item 1 says "a run of rejected
-/// pushes". Neither names a length, so this constant is *this implementation's*
-/// choice and is stated here rather than left implicit in a `> 0`.
-///
-/// # Why a count of arrivals and not a duration
-///
-/// The stamps are the quantity under suspicion, and the observed stream carries
-/// no independent arrival clock — [`Observations::from_arena`] sets
-/// `arrival_delay_ns` to zero because the arena records no receipt time
-/// (`TFT004`'s skip reason is the same fact). A window measured in seconds could
-/// only be measured with the clock that stepped. Counting arrivals needs no
-/// clock at all.
-///
-/// # Why eight
-///
-/// A clock that steps back by Δ against a publisher at *f* Hz rejects about Δ·*f*
-/// arrivals in one unbroken burst, so eight is reached by an 8 ms step at 1 kHz,
-/// 80 ms at 100 Hz, 800 ms at 10 Hz. A *reordered* stream — a merge, a queue, a
-/// pair swapped in transit — rejects as many arrivals as the reorder distance,
-/// which is one to a few. Eight sits above the second population and well below
-/// the first.
-///
-/// **Both costs of the choice, named rather than implied.** A step shorter than
-/// eight publish periods is not attributed: `TFT018` still reports the rejected
-/// pushes, which is the answer that existed before `TFT019` and is not a
-/// regression. A reordering burst longer than eight arrivals on a wall-clock
-/// edge *is* attributed, and that is a false attribution this threshold does not
-/// prevent. Raising it trades the first for the second.
 const CLOCK_STEP_MIN_REJECTED_RUN: usize = 8;
 
 /// How `TFT019` split `TFT018`'s per-edge evidence: what it attributed to a
 /// wall-clock step, what was too diffuse to be one, and what it would not judge.
-///
-/// **Captured once per `doctor` run and read twice** — by `tft019` and by
-/// [`ClockStepEvidence::coverage_note`]. That is why it is a field of [`Inputs`]
-/// rather than a call inside each reader: two captures could not disagree today,
-/// but the report would then be walking `obs` once per reader to answer one
-/// question, and the invariant "the outcome and the note describe the same
-/// split" would be a convention instead of a type.
 pub struct ClockStepEvidence {
     /// Runs on a `SystemDomain` edge whose rejections are concentrated enough to
     /// be a step, each with the label to report it under.
@@ -2979,25 +1832,12 @@ pub struct ClockStepEvidence {
     /// Runs on any other tag, as `(edge, tag)`, with `None` for an edge whose
     /// tag could not be read at all. Named, not counted: the skip reason has to
     /// say *which* tag it declined to guess about.
-    ///
-    /// `Option<u8>` rather than a sentinel value, because every `u8` is a legal
-    /// tag — `Domain` is an open trait — so a `u8::MAX` meaning "unknown" would
-    /// print "tag unreadable" for an edge that declared 255.
     refused: Vec<(u32, Option<u8>)>,
 }
 
 impl ClockStepEvidence {
     /// Split `TFT018`'s per-edge evidence by the edge's declared domain tag and
     /// by whether its rejections are concentrated.
-    ///
-    /// Three buckets, and an edge whose tag cannot be read joins the refused
-    /// ones: "the tag is unreadable" and "the tag is not a wall clock" have the
-    /// same consequence here — no clock step may be attributed.
-    ///
-    /// Captured unconditionally, including on a live arena where `TFT019` skips
-    /// and discards it. `live` is not a parameter because the split is a fact
-    /// about the stream and the skip is a fact about the check; folding them
-    /// would give this type two meanings.
     #[must_use]
     pub fn capture(snap: &Snapshot, obs: &Observations) -> ClockStepEvidence {
         let index = snap.edge_index();
@@ -3032,16 +1872,6 @@ impl ClockStepEvidence {
 
     /// The disclosure that pairs with `tft019`'s outcome: which edges its
     /// result does *not* cover.
-    ///
-    /// `None` when the outcome already carries the whole story — nothing was
-    /// found, or everything found was attributed, or the skip reason itself
-    /// names every refused tag. [`crate::catalogue::Status`] is three-valued and
-    /// none of them is "ran, half blind"; this is the same gap
-    /// [`rate_coverage_note`] exists to fill.
-    ///
-    /// `stream` is a parameter rather than a caller-side `if`: wherever `TFT019`
-    /// skipped outright, a note listing edges it "did not attribute" would
-    /// describe a run that did not happen.
     #[must_use]
     pub fn coverage_note(&self, stream: PushStream) -> Option<String> {
         if stream.no_rejected_arrivals().is_some() {
@@ -3089,11 +1919,6 @@ impl ClockStepEvidence {
 
 /// Render `(edge, tag)` pairs for a skip reason or a note, each with the reason
 /// that tag specifically is not a clock this check will blame.
-///
-/// Tag-specific rather than one blanket sentence: `SimDomain` (2) *does* step
-/// backwards — a `/clock` reset from a bag loop or a sim restart is exactly that
-/// — so telling its operator "a steady or PTP tag cannot have stepped at all"
-/// would be false about the one case with its own decision record.
 fn tag_list(refused: &[(u32, Option<u8>)]) -> String {
     refused
         .iter()
@@ -3130,80 +1955,6 @@ fn tag_refusal(tag: u8) -> &'static str {
 }
 
 /// `TFT019` — a wall clock stepped backwards, which is `TFT018`'s cause.
-///
-/// `docs/PHASE5.md` §6's amendment, argued in `docs/API.md` §5.3.
-/// `CLOCK_REALTIME` is not monotone: an NTP step or a leap second moves it
-/// backwards, `docs/PHASE1.md` §2 invariant 6 then rejects every push until the
-/// clock catches up, and the result reads as a `tf_tree` defect to whoever meets
-/// it at 3 a.m. `TFT018` reports that, accurately and unhelpfully, as a
-/// publisher that restarted without resetting its clock.
-///
-/// # An attribution, not a second detector
-///
-/// The evidence is [`doctor::out_of_order_runs`] — literally the function
-/// `TFT018` reports from — plus one fact the arena already holds, the edge's
-/// declared `EdgeRecord::domain`. There is no second scan of the stream and no
-/// counter: `dropped_non_monotonic` is a *bridge* counter and an arena with no
-/// bridge in front of it has none.
-///
-/// # It fires on a *run*, not on an inversion
-///
-/// `docs/PHASE5.md` §6 says "a run of rejections **concentrated in a short
-/// window**"; the concentration is [`CLOCK_STEP_MIN_REJECTED_RUN`] consecutive
-/// rejected arrivals, which is this implementation's number and not the spec's —
-/// that constant carries the argument and both costs. A single stray inversion
-/// on a wall-clock edge is a publisher fault, and calling it an NTP step is the
-/// same fabricated all-clear this check refuses on an unknown tag, pointed the
-/// other way. Those edges land in `diffuse` and are disclosed in
-/// [`ClockStepEvidence::coverage_note`].
-///
-/// # It fires only on tag 0, and says which tag when it does not
-///
-/// [`Domain`] is an open trait, so a user-declared tag carries no way to state
-/// "this clock can step". Guessing that an unknown tag is steady would fabricate
-/// an all-clear on the edge most likely to be a PTP driver that lost lock, and
-/// guessing the other way would blame a clock for a publisher's fault. So an
-/// edge on any other tag is *refused*, with the tag named — the same register as
-/// `TFT007` skipping an undeclared rate rather than comparing against zero. Since
-/// `SimDomain` (2) and `SteadyDomain` (3) exist, that refusal is correct rather
-/// than merely conservative: a steady clock cannot step, so regressions there are
-/// a real publisher defect.
-///
-/// # It does not demote `TFT018`
-///
-/// `TFT018` stays an error and keeps failing `doctor --exit-code`; this is a
-/// warn that explains it. Rejected pushes are lost data whatever caused them.
-///
-/// # It reaches a verdict on a recording, and that is what `--from-bag` is for
-///
-/// This check needs a *recorded* push stream. Until `doctor` gained a recording
-/// source it had two — the built-in fixture and a live `--attach` — and it
-/// skipped on the second, so no run against real data could reach a verdict at
-/// all. `doctor --from-bag <recording.mcap>` is that third source: a bag is
-/// written in log order, so a stamp that went backwards is in the file at the
-/// position it arrived at, and both this check and `TFT018` run on it.
-///
-/// **A frozen `.tft` (`--from-file`) is not a substitute**, and the reason is
-/// worth stating because it is the obvious guess: a `.tft` is an *arena*, and an
-/// arena's rings hold only the pushes the engine accepted, so the rejected
-/// arrival this check attributes was never stored. See
-/// [`PushStream::RingsAtRest`].
-///
-/// # Skips and passes
-///
-/// * **A stream replayed from rings** — skipped, inheriting `TFT018`'s skip
-///   rather than working around it. There is nothing to attribute: on a live
-///   arena the only inversions are artifacts of reading a ring while it is
-///   written, and on an arena at rest there are none at all.
-/// * **No regressions at all** — `Pass`, not `Skipped`. This check's evidence is
-///   `TFT018`'s and it is complete: every retained stream was examined and none
-///   went backwards, so there is nothing to attribute and saying so is earned.
-/// * **Regressions on tag 0, none concentrated** — `Pass`, with the note. The
-///   evidence is complete here too and it says "not a step"; the note is what
-///   keeps that from reading as "nothing was seen".
-/// * **Regressions, none on tag 0** — `Skipped`, naming the tags. `Pass` there
-///   would read as "no clock step", which is an assurance about clocks this
-///   check is not able to give.
 fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
     if let Some(why) = inp.stream.no_rejected_arrivals() {
         return CheckOutcome::skipped(
@@ -3261,63 +2012,6 @@ fn tft019(inp: &Inputs<'_>) -> CheckOutcome {
 }
 
 /// The occupancy triples for [`Inputs::occupancy`], read from the header.
-///
-/// **`participants` is deliberately absent, and [`PARTICIPANT_OCCUPANCY_NOTE`]
-/// says so in the report.** §6 names frames, edges *and* participants, but
-/// `ArenaHeader::participant_count` is never incremented anywhere in the
-/// workspace — the only writes to it are the zero it is initialised with. A row
-/// fed from it would read `0 / max_participants` on every arena, so `TFT015`
-/// would report `pass` for participants on a fleet that had exhausted every
-/// slot and could not attach another node.
-///
-/// Emitting the row anyway would be worse than omitting it: this catalogue's
-/// whole premise is that a check without evidence says so rather than passing,
-/// and a permanently-`0%` row passes silently and looks like a real result. So
-/// the row is dropped and the gap is disclosed in `Meta.notes`, which exists
-/// for exactly this "ran, but half blind" case.
-///
-/// # The numerator is not the arena's to give, and that is the part to read
-///
-/// **This doc used to end "restore the row in the same commit that makes the
-/// engine maintain the counter", and that is the wrong remedy twice over.**
-///
-/// First, a header counter cannot be maintained. A participant that is *killed*
-/// cannot decrement it, so it would drift up for the life of the arena — which
-/// is the whole reason `docs/PHASE2.md` holds liveness in a lock byte the kernel
-/// releases (D17) instead of in a count somebody has to remember to undo.
-///
-/// Second, and less obvious: **the arena participant table is not a valid
-/// numerator either, and it is wrong in the same direction.** A read-only
-/// attachment is D18's default and Python's; its mapping is `PROT_READ`, so it
-/// takes a lock-file byte and writes **no arena record at all**. A fleet whose
-/// consumers are all read-only — the shape this project recommends — therefore
-/// fills the slot table while the arena table stays as empty as the counter.
-/// Measured at `crates/tf_tree_cli/tests/attach.rs`'s
-/// `the_two_participant_censuses_disagree_by_the_read_only_population`: one
-/// publisher and one read-only consumer, **2 held lock bytes against 1 arena
-/// record**, and the gap grows with every consumer.
-///
-/// **`no_occupancy_row_is_permanently_zero` does not catch that substitution**,
-/// which is why the test above exists. Measured: feed the row from the arena
-/// table and that test still passes, because its fixture is an in-process arena
-/// whose own process *does* hold a record, so `used > 0` and the row looks real.
-/// The guard added because this was untested does not cover the likeliest wrong
-/// answer to it.
-///
-/// So the numerator is the **lock file's**, and choosing exactly which lock-file
-/// population is a decision rather than a detail — a byte can be held with no
-/// arena record (a read-only attach), and a `LIVE` record can outlive its byte
-/// (either a leaked slot, which `docs/decisions/0028`'s assigner reclaims and
-/// grants on the next hello, or a live `build_shared` participant that never took
-/// one at all). Those two are indistinguishable from outside the process, which is
-/// what makes the choice a decision.
-///
-/// **`docs/decisions/0056` is a `draft` and settles none of that yet.** What it
-/// records is the measurement above, the exclusion of both arena-side sources, and
-/// a recommendation — held lock bytes, on the ground that the owner's slot
-/// assigner is the only authority on whether a slot can be granted. Restore the
-/// row when that record is `ready`, and take the numerator it names then rather
-/// than the one recommended now.
 #[must_use]
 pub fn occupancy_of(tree: &Tree) -> Vec<(&'static str, u32, u32)> {
     let view = tree.arena_view();
@@ -3344,11 +2038,6 @@ pub const PARTICIPANT_OCCUPANCY_NOTE: &str =
      under the truth and pass with the slot table full. See docs/decisions/0056";
 
 /// Every edge's newest stamp — the sample [`Clock::decide`] votes over.
-///
-/// Deliberately the whole population and not an aggregate: the aggregation is
-/// `decide`'s job, and it needs the individual values to be robust to an
-/// outlier. Handing it a single pre-reduced stamp is what let one broken
-/// publisher define the reference clock.
 #[must_use]
 pub fn newest_stamps(snap: &Snapshot) -> Vec<i64> {
     snap.edges.iter().filter_map(|e| e.newest_stamp).collect()
@@ -3394,11 +2083,6 @@ mod tests {
 
     /// The participant table that goes with [`edge`]: one running writer in
     /// slot 0, which is the owner every edge this helper builds names.
-    ///
-    /// Every fixture gets one, because `TFT014`'s claim half now asks the
-    /// participant table whether the owner is running and an empty table
-    /// answers "nobody is" — the state a hand-built snapshot would otherwise
-    /// fall into by omission rather than by intent.
     fn live_writer() -> Vec<ParticipantInfo> {
         vec![ParticipantInfo {
             slot: 0,
@@ -3456,11 +2140,6 @@ mod tests {
     }
 
     /// [`inputs`] as `doctor --attach` sees it: an arena somebody is writing.
-    ///
-    /// A separate helper rather than a fifth parameter, because `inputs`'
-    /// four-argument shape is load-bearing across thirty-odd call sites and
-    /// `PushStream` is the *only* thing the trailing-silence half of `TFT009`
-    /// needs differently.
     fn live_inputs<'a>(
         snap: &'a Snapshot,
         obs: &'a Observations,
@@ -3475,21 +2154,6 @@ mod tests {
 
     /// **A publisher that stopped is the most common fault in the field, and
     /// every rule in `TFT009` was blind to it.**
-    ///
-    /// The rules above measure intervals *between retained stamps*, so a
-    /// publisher that died three weeks ago leaves a full ring that reads
-    /// healthy — while the transform every consumer is reading has been frozen
-    /// since.
-    ///
-    /// **The two halves are asserted against the same fixture**, which is what
-    /// makes this a statement about the blindness rather than about a fixture
-    /// chosen to fire: the identical 100 Hz stream is `Pass` when nothing is
-    /// writing and `Fired` when something is, and the difference is entirely
-    /// "how long ago was the last one".
-    ///
-    /// **Mutant:** delete the `live_wall_now` block from `tft009`. The first
-    /// assertion still passes (it is the old behaviour) and the second fails on
-    /// `Status::Pass`, which is the defect stated as a test.
     #[test]
     fn a_publisher_that_stopped_is_reported_where_every_retained_stamp_reads_healthy() {
         const MS: i64 = 1_000_000;
@@ -3558,36 +2222,6 @@ mod tests {
 
     /// **A publisher that stopped is not certified healthy by `TFT007` and
     /// `TFT008` while `TFT009` is calling it dead.**
-    ///
-    /// A full ring of perfectly spaced samples from three weeks ago reads
-    /// healthy to every rule that measures *between* retained stamps.
-    /// `TFT009`'s trailing half was repaired for exactly that; these two
-    /// carried the identical blindness, and a report with all three in it read
-    /// as checks clearing a publisher another one was calling dead.
-    ///
-    /// **The fixture declares a nominal rate deliberately**, and that is what
-    /// puts `TFT007` in a position to clear the edge at all: on an arena with no
-    /// `rate_hz` it skips before reaching any edge, so what this test pins is
-    /// the declared-rate case. `TFT008` needs no declaration and is in that
-    /// position on any such arena.
-    ///
-    /// **The two halves are asserted against the same fixture**, which is what
-    /// makes this a statement about the blindness rather than about a fixture
-    /// chosen to fire: the identical 100 Hz stream at its identical declared
-    /// 100 Hz is judged `Pass` when nothing is writing — correctly, because on
-    /// a recording the trailing distance is the age of the file — and withheld
-    /// when something is.
-    ///
-    /// **Mutant A**, run: drop the `stopped.contains_key(&e.id)` arm from
-    /// `tft007`. The live case reports `Pass`, and its `Skipped` assertion fails
-    /// with the message an operator would have read as an all-clear.
-    /// **Mutant B**, run: drop the `stopped.contains(&edge)` arm from
-    /// `doctor::check_inconsistent_rates`. `TFT008`'s live case reports `Pass`
-    /// and its assertion fails. Each arm is its own mutant because a union of
-    /// the two would let either cover for the other.
-    /// **Mutant C**, run: make `stopped_publisher_note` return `None`. The note
-    /// assertion fails; the two skips still hold, which is why the note is
-    /// asserted separately rather than trusted to follow from them.
     #[test]
     fn a_stopped_publisher_is_not_certified_healthy_by_tft007_and_tft008() {
         const MS: i64 = 1_000_000;
@@ -3667,26 +2301,6 @@ mod tests {
     }
 
     /// **The coverage note and `TFT007`'s own status describe the same run.**
-    ///
-    /// `tft007` withholds a stopped publisher from its comparison;
-    /// [`rate_coverage_note`] states what the check covered. They read the same
-    /// arena, so an edge withheld by one must not be counted as compared by the
-    /// other — and until this test existed the note computed its counts from
-    /// [`rate_evidence`] alone, so on the first arena below the report said both
-    /// *not run, compared nothing* and *compared 1 of 2*. That is the
-    /// self-contradiction the withholding was built to remove, produced by the
-    /// change that removed it.
-    ///
-    /// Both arenas are live (`live_inputs`), because withholding only happens
-    /// where a trailing silence has an answer.
-    ///
-    /// **Mutant A**, run: drop the `stopped.contains_key(&e.id)` guard from
-    /// `rate_coverage_note`'s match. The first arena's `assert_eq!(.., None)`
-    /// fails with the "compared 1 of 2" note the skip contradicts.
-    /// **Mutant B**, run: count a withheld edge into `too_few` instead of its
-    /// own term. The second arena's note reads "2 have fewer than 8 retained
-    /// intervals" — a claim about a ring that is full — and the assertion on
-    /// "1 have stopped publishing" fails.
     #[test]
     fn the_rate_coverage_note_and_tft007_agree_about_a_stopped_publisher() {
         const MS: i64 = 1_000_000;
@@ -3773,22 +2387,6 @@ mod tests {
 
     /// **`TFT008` skips rather than passing on an arena it could not measure a
     /// spread over at all.**
-    ///
-    /// `Pass` here is the active claim *no edge in this arena publishes
-    /// unevenly*, which an arena read seconds after bringup does not support —
-    /// and the arm that refuses it had no test: the whole crate stayed green
-    /// with the guard weakened back to the bare `Pass`.
-    ///
-    /// Distinct from the stopped-publisher skip beside it, which this asserts
-    /// by reading the reason: the remedies are opposite — wait for the rings to
-    /// fill, or go and look at a dead publisher.
-    ///
-    /// **Mutant A**, run: replace the `spread.judged == 0` skip with
-    /// `CheckOutcome::ran(Tft::Tft008, ...)`, i.e. the behaviour that shipped
-    /// before. The first case reports `Pass` and the `match` panics.
-    /// **Mutant B**, run: `SPREAD_MIN_INTERVALS: usize = 2`. The first case is
-    /// then measurable and passes, so the constant the reason quotes is the
-    /// only thing separating the two halves of this test.
     #[test]
     fn tft008_skips_when_nothing_retained_enough_intervals_to_measure() {
         const MS: i64 = 1_000_000;
@@ -3821,42 +2419,6 @@ mod tests {
 
     /// **Every finding-producing arm of `TFT016` fires, and the two arms nobody
     /// could have noticed breaking are pinned by more than a count.**
-    ///
-    /// This check had no test of any kind. The only `Inputs` this module builds
-    /// carries `host: None`, which drives the Linux skip and nothing else; the
-    /// whole-fixture harness in `tests/catalogue.rs` passes `None` on purpose
-    /// (*"a test whose result depends on the CI runner's huge-page setting is a
-    /// test that fails for a reason nobody can act on"*); and the end-to-end
-    /// `--json` test runs the real binary and asserts nothing about this id.
-    /// `hostfacts`' parsers are well tested — they hold that
-    /// [`crate::hostfacts::probe`] reads the right *files*. Nothing held what
-    /// the check does with what they return.
-    ///
-    /// **What it does not prove**, stated because the split is the point: it
-    /// reads no `/sys` and no `/proc` and constructs every [`HostFacts`] by
-    /// hand, so it says nothing about whether `probe` reads the right files.
-    /// That half is `hostfacts`' own parser tests, and keeping them apart is
-    /// what makes this one runnable on any CI runner.
-    ///
-    /// **Mutants, both run.** (1) Invert the shmem predicate —
-    /// `if !host.shmem_thp.honours_madvise()` → `if host.…`. That is *healthy
-    /// host reads broken, broken host reads healthy*, the one thing
-    /// `hostfacts`' own module doc says a diagnostic must never do, and the
-    /// whole crate stayed green before this test: the `Never` row and its
-    /// `Advise`/`WithinSize` complements are what catch it, and only the pair
-    /// pins the **direction**. (2) Delete `|MCL_ONFAULT` from the memlock
-    /// message. `docs/decisions/0049` measured that flag — without it the call
-    /// prefaults the whole over-provisioned arena — and the advice it replaced
-    /// had already shipped to operators, the second time this string has been
-    /// corrected. The substring assertions below are deliberate and are not
-    /// brittleness: they are what makes the third correction fail a test rather
-    /// than reach a robot. (3) Change `docs/API.md` §8.3's recommended flags,
-    /// which is the same drift from the other end and is what the comparison
-    /// against that section catches. **Also run, and it must stay GREEN:**
-    /// give §8.3's *withdrawn* quotation the `mlockall(` prefix it does not
-    /// currently carry. That is an editorial change and says nothing about the
-    /// advice; a comparison that read the whole document, or a set over the
-    /// section, would go red on it.
     #[test]
     fn every_tft016_arm_fires_and_the_two_corrected_strings_are_pinned() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 4));
@@ -3971,10 +2533,6 @@ mod tests {
         // and leaving `checks.rs` would be the worst outcome"*, and nothing
         // enforced that. This holds the operator-facing string to
         // `docs/API.md` §8.3, which is where the wrong advice was copied from.
-        // The other sites that spell the flags are guarded by review alone;
-        // `rg -l mlockall` is the list, and no count of it is written here.
-        // The advice this message was copied from, read out of the document
-        // rather than spelled a second time here.
         let recommended = api_md_recommended_mlockall();
         assert_eq!(
             mlockall_args(&msg),
@@ -3988,22 +2546,6 @@ mod tests {
 
     /// The `mlockall(...)` flags `docs/API.md` §8.3 **recommends**, whitespace
     /// and backticks removed.
-    ///
-    /// # Why the first call in the section, and not a set over it
-    ///
-    /// §8.3 spells the flags twice: the recommendation, and the *withdrawn*
-    /// form quoted underneath to say what it does wrong. A set over the section
-    /// — or over the whole document, or over `0049`, which quotes the withdrawn
-    /// form twice — reads that quotation as a second recommendation and turns
-    /// red on an editorial change that says nothing about the advice.
-    /// Document order is what separates them: the recommendation is the bullet
-    /// the section leads with.
-    ///
-    /// It is a comparison rather than a `contains` because the two sites spell
-    /// the same flags with different spacing and backticks, and because
-    /// `contains("MCL_ONFAULT")` is satisfied by a message that names that flag
-    /// and drops one of the other two. The question is *which flags*, and only
-    /// the whole argument list asks it.
     fn api_md_recommended_mlockall() -> String {
         const API_MD: &str = include_str!("../../../docs/API.md");
         let (_, after) = API_MD
@@ -4034,23 +2576,6 @@ mod tests {
 
     /// **`TFT013`'s unmeasurable skip names the obstacle this arena has, and
     /// there are three of them.**
-    ///
-    /// [`PublishActivity::Unmeasurable`] is reached whenever no dynamic edge
-    /// yields [`doctor::median_period`] an answer, and the sentence that
-    /// shipped named a ring size for all of them. `median_period` declines a
-    /// stream shorter than two **and** a non-positive median, and a ring that
-    /// can hold 511 samples is not a ring-size problem, so a remedy printed
-    /// over all three is false about two of them — the same shape as the
-    /// `NoPublisher` fold this variant was split out of.
-    ///
-    /// `tests/catalogue.rs` drives the first two through a real arena, which is
-    /// where the reachability claim belongs. This is the arm-by-arm reading of
-    /// the message, including the third, which needs stamps a `TreeBuilder`
-    /// will not accept.
-    ///
-    /// **Mutant, run:** delete the `observed < 2` arm. The third case then
-    /// reports a stream of one against `observed = 5` and the last assertion
-    /// fails.
     #[test]
     fn tft013_names_which_of_the_three_unmeasurable_arenas_this_is() {
         let one_sample = |edge: u32, stamp: i64, n: usize| {
@@ -4118,25 +2643,6 @@ mod tests {
     /// **`TFT009` skips rather than passing on an arena in which it judged no
     /// edge at all**, which is `TFT008`'s defect one row over and reached
     /// further than it.
-    ///
-    /// Both of `TFT009`'s halves run only over edges [`interval_shape`]
-    /// accepted, so on an arena where every edge falls into a [`ShapeGap`] the
-    /// subject set is empty and the empty finding list rendered as `pass` —
-    /// here about a five-second dropout that is in `TFT009`'s own samples, and
-    /// beside a `TFT008` skip over the identical empty set.
-    ///
-    /// **Mutant A**, run: replace the `judged == 0` skip with the bare
-    /// `CheckOutcome::ran`, i.e. the behaviour that shipped. The first case
-    /// reports `Pass` and the `match` panics.
-    /// **Mutant B**, run: `GAP_MIN_INTERVALS: usize = 3`. The first case is then
-    /// measurable and the dropout fires, so the constant the reason quotes is
-    /// the only thing separating the two halves of this test.
-    /// **Mutant C**, run: delete the empty-arena sentence from
-    /// `gap_evidence_skip` and let an arena with no samples fall into the
-    /// three-clause one, which then names no class at all.
-    /// **Mutant D**, run: give `ShapeGap::NoPeriod` the too-few-intervals
-    /// clause. The status stays `Skipped` and the last arm fails, which is why
-    /// each arm reads the reason instead of the status.
     #[test]
     fn tft009_skips_when_no_edge_retained_enough_intervals_to_measure_a_gap() {
         const MS: i64 = 1_000_000;
@@ -4279,19 +2785,6 @@ mod tests {
 
     /// **`TFT004` fires on a clock no publish pipeline explains, and stays quiet
     /// on one that a pipeline does.**
-    ///
-    /// The whole design of this check is in the gap between those two edges:
-    /// 200 ms is an ordinary stamp-to-push latency for a localiser that stamps
-    /// with the capture time of the scan it matched, and 3 600 s is a machine
-    /// whose NTP never came up. Only the second is attributable, and a check
-    /// that flagged the first would report a healthy fleet as skewed.
-    ///
-    /// The direction is asserted too, because it is the operator's next action:
-    /// a positive offset means the publisher's clock reads *earlier* than this
-    /// host's.
-    ///
-    /// Mutant, run: `ns.abs() > OFFSET_BEYOND_ANY_PIPELINE_NS` to `ns.abs() > 0`
-    /// — the 200 ms edge is reported as a clock fault.
     #[test]
     fn tft004_fires_only_past_any_plausible_pipeline_latency() {
         let mut plausible = edge(1, 1, 2, 100);
@@ -4343,20 +2836,6 @@ mod tests {
     }
 
     /// **Every reason `TFT004` has no answer, each with its own skip.**
-    ///
-    /// Five, and the two that are about *provenance* are the ones a reader would
-    /// not think of: an arena replayed from a recording records ingest-time
-    /// offsets against the recording's stamps, and a frozen `.tft` carries
-    /// offsets from whenever it was frozen. Both would report years of skew on
-    /// publishers that were fine.
-    ///
-    /// Asserting on the *reason* and not merely on the outcome, because a skip
-    /// whose reason names the wrong condition sends an operator to fix the wrong
-    /// thing — and all four outcomes are otherwise identical.
-    ///
-    /// Mutant, run: make `no_live_receipt` return `None` for
-    /// `PushStream::Recorded` — the first case reports an hour of skew from a
-    /// recording instead of skipping.
     #[test]
     fn tft004_skips_name_which_of_the_five_conditions_fired() {
         let mut e = edge(1, 1, 2, 100);
@@ -4438,14 +2917,6 @@ mod tests {
     }
 
     /// **The fleet spread reaches the report, and says what it is not.**
-    ///
-    /// The note must carry its caveat with it — an offset is clock error *plus*
-    /// stamp-to-push latency — or a reader will treat the spread as skew and
-    /// chase a pipeline difference.
-    ///
-    /// Mutant, run: drop the `no_live_receipt` guard from `clock_offset_note` —
-    /// the recorded-source case emits a spread the check itself refused to
-    /// compute, which is a note contradicting a skip.
     #[test]
     fn the_clock_offset_spread_reaches_the_report_and_carries_its_caveat() {
         let mut a = edge(1, 1, 2, 100);
@@ -4493,16 +2964,6 @@ mod tests {
     }
 
     /// **`TFT011` must not fire on a gap past the *newest* end of the window.**
-    ///
-    /// `worst_extrap_gap_ns` is a high-water mark over both ends. A request
-    /// newer than the newest sample means the publisher stopped, and enlarging
-    /// the ring cannot help; reporting it as an undersized ring sends an
-    /// operator to change the one thing that is already correct. The gate is
-    /// `extrap_before > 0`.
-    ///
-    /// Mutant: drop the `st.extrap_before == 0` term from the guard in
-    /// `tft011`. Applied: the `after`-only case fires and the first assertion
-    /// fails.
     #[test]
     fn ring_undersize_is_only_claimed_when_a_request_fell_off_the_back() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -4554,15 +3015,6 @@ mod tests {
     }
 
     /// **A zero stamp is only a fault when the arena's stamps are Unix time.**
-    ///
-    /// `EdgeRecord::domain` (D9) permits any time domain, and the benchmark
-    /// fixture's own history starts at stamp 0. Flagging zero unconditionally
-    /// would make `doctor --exit-code` fail on a correct arena. A *negative*
-    /// stamp is invalid under every domain and is flagged either way.
-    ///
-    /// Mutant: change the `if wall && st.zero_stamps > 0` guard in `tft006` to
-    /// `if st.zero_stamps > 0`. Applied: the `NewestStamp` case fires and its
-    /// `Status::Pass` assertion fails.
     #[test]
     fn a_zero_stamp_is_a_fault_only_under_a_wall_clock_domain() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -4612,10 +3064,6 @@ mod tests {
     /// off by 10^9, which no plausible-range check on the value alone
     /// distinguishes from a valid stamp — but it is enormously far from every
     /// other stamp in the arena.
-    ///
-    /// Mutant: raise `ABSURD_HORIZON_NS` to 100 years. Applied: the fired
-    /// assertion fails — the injected stamp sits ~54 years from the reference
-    /// clock, which a 100-year horizon waves through.
     #[test]
     fn an_absurd_stamp_is_measured_against_the_reference_clock() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -4647,11 +3095,6 @@ mod tests {
 
     /// An arena in which edge 1 has been publishing at 100 Hz for `activity_ns`,
     /// plus the `subject` edge (id 2) the test is about.
-    ///
-    /// `publish_activity` reads `head` and the observed median together, so
-    /// both halves have to be here: a snapshot with a large `head` and no samples
-    /// measures nothing, and so does a full sample list on an edge whose `head`
-    /// the fixture forgot to set.
     fn with_a_running_publisher(subject: EdgeInfo, activity_ns: i64) -> (Snapshot, Observations) {
         const PERIOD_NS: i64 = 10_000_000; // 100 Hz.
         let head = u64::try_from(activity_ns / PERIOD_NS).unwrap() + 1;
@@ -4669,34 +3112,6 @@ mod tests {
 
     /// **`TFT005` fires past its tolerance, stays quiet inside it, and refuses
     /// the question outright when the arena's stamps are not wall-clock time.**
-    ///
-    /// The check had no test of any kind: its firing branch, its 50 ms
-    /// tolerance and its message had never been executed, and the reference
-    /// fixture cannot reach it — the fixture stamps from 0, so `Clock::decide`
-    /// lands on `Clock::NewestStamp` and this check skips there. `docs/PHASE5.md`
-    /// §11 asks for one test per check id; this is `TFT005`'s.
-    ///
-    /// **The tolerance is pinned at its edge**, one nanosecond either side, in
-    /// the shape `the_rate_tolerance_band_is_pinned_at_its_edge` uses: a test
-    /// written against "now" and "an hour ahead" passes with the constant set to
-    /// anything at all, and the constant's own doc is an argument about a
-    /// *small* number — a publisher stamping a few hundred microseconds before
-    /// the sample reaches the arena is normal, and firing on that is how a check
-    /// gets suppressed permanently.
-    ///
-    /// The third case is the epoch guard, which is not a detail:
-    /// `EdgeRecord::domain` lets an arena carry stamps in any time domain, and
-    /// "this stamp is in the future" is only a sentence when the arena's stamps
-    /// and the host's clock share an epoch. Without it every edge of a
-    /// monotonic-clock arena reads as decades ahead.
-    ///
-    /// **Mutant A**, run: `if ahead > FUTURE_TOLERANCE_NS` to `if false`. The
-    /// firing case reports `Pass` and its assertion fails.
-    /// **Mutant B**, run: `if ahead > 0`. The inside-the-tolerance case fires
-    /// and its assertion fails.
-    /// **Mutant C**, run: delete the `let Clock::Wall(now) = inp.clock else`
-    /// guard and read `inp.clock.nanos()`. The skip case fires instead of
-    /// skipping and its `match` panics.
     #[test]
     fn tft005_fires_past_the_future_tolerance_and_not_inside_it() {
         let obs = Observations::new();
@@ -4751,17 +3166,6 @@ mod tests {
     }
 
     /// **`TFT013` is about dynamic edges only.**
-    ///
-    /// A static edge carries its pose inline in `EdgeRecord::static_pose` and
-    /// never pushes, so `head == 0` is its permanent, correct state. A check
-    /// that did not exclude them would report every static edge on every
-    /// healthy robot — which is how a diagnostic becomes noise nobody reads.
-    ///
-    /// Every case here clears the grace period, so the kind guard is the only
-    /// thing that can explain the difference between them.
-    ///
-    /// Mutant: drop `e.kind == EdgeKind::Dynamic` from the `tft013` guard.
-    /// Applied: the static-edge assertion fails.
     #[test]
     fn never_published_does_not_accuse_static_edges() {
         let stats: [EdgeStats; 0] = [];
@@ -4793,30 +3197,6 @@ mod tests {
 
     /// **`TFT013` waits out the grace period §6's row has always required, and
     /// says so instead of accusing every dynamic edge at bringup.**
-    ///
-    /// The two cases below are the *same* unpublished edge. The only thing that
-    /// differs is how long the arena's other publisher has been running — one
-    /// millisecond inside the grace period, and one millisecond outside it — so
-    /// nothing but the grace term can explain the difference in outcome. That is
-    /// the shape `the_rate_tolerance_band_is_pinned_at_its_edge` uses for
-    /// `RATE_TOLERANCE`, for the same reason: a test pinned to *any* two widely
-    /// separated durations survives a guard that fires on the wrong quantity.
-    ///
-    /// The third case is the arena with no published stream at all, which is a
-    /// robot at bringup and a robot whose every publisher has died, and no fact
-    /// in the arena separates them. A skip is the answer; `TFT017` is the id for
-    /// the second.
-    ///
-    /// **Mutant A**, run: delete the `activity < DECLARATION_GRACE_NS` guard.
-    /// The inside-the-grace case fires and its `Skipped` assertion fails.
-    /// **Mutant B**, run: make the guard `activity < i64::MAX`. The
-    /// outside-the-grace case skips and its `Fired` assertion fails.
-    /// **Mutant C**, run: read the retained span (`newest - oldest` of the
-    /// samples) instead of `(head - 1) x median`. Every fixture in both this
-    /// test and `never_published_does_not_accuse_static_edges` then measures
-    /// 90 ms — the ten samples the observation list holds, whatever `head` says
-    /// — and both tests fail. That is the ring-wrap saturation
-    /// `publish_activity`' doc argues about, reproduced.
     #[test]
     fn an_unpublished_edge_is_not_accused_inside_the_grace_period() {
         let stats: [EdgeStats; 0] = [];
@@ -4856,32 +3236,6 @@ mod tests {
 
     /// **The grace period is measured against the *longest*-running publisher
     /// in the arena, and only against a dynamic one.**
-    ///
-    /// Both clauses are written into `publish_activity`' doc and neither was
-    /// pinned: every other `TFT013` fixture has a single publishing edge, where
-    /// a maximum and a minimum are the same number and a kind filter over one
-    /// dynamic edge does nothing. A review mutated `b.max(span)` to
-    /// `b.min(span)` and dropped the `EdgeKind::Dynamic` guard, and the whole
-    /// crate stayed green.
-    ///
-    /// The direction matters: a minimum means one publisher restarting resets
-    /// the grace for the entire arena, so an edge nothing has ever published to
-    /// is never reported while any publisher is young. And a static edge's
-    /// stream — which a correct arena does not have, but a hand-built or
-    /// corrupt record does — must not be what clears the grace, for the same
-    /// reason `rate_evidence` refuses a static edge's stray nominal rate: the
-    /// check's subject is what dynamic publishers have had time to do.
-    ///
-    /// **Mutant A**, run: `b.min(span)`. Both halves of the first case skip
-    /// inside the grace and the `Fired` assertions fail.
-    /// **Mutant B**, run: drop the `e.kind != EdgeKind::Dynamic` term. The
-    /// static case's `Skipped` assertion fails — the static edge's 10 s of
-    /// samples clears a grace no dynamic publisher had reached.
-    /// **Mutant C**, run: `best.unwrap_or(span)`, i.e. the first edge that
-    /// measures wins. The first ordering fails.
-    /// **Mutant D**, run: `best = Some(span)`, i.e. the last one wins. The
-    /// second ordering fails. Both are why the loop above runs the pair in
-    /// both orders rather than once.
     #[test]
     fn the_grace_period_reads_the_longest_running_dynamic_publisher() {
         const MS: i64 = 1_000_000;
@@ -4949,14 +3303,6 @@ mod tests {
     }
 
     /// **`TFT010` needs the counters, and says so rather than passing.**
-    ///
-    /// With `--no-default-features` every counter reads zero, which is exactly
-    /// what a healthy arena reads. Reporting `pass` would be a clean bill of
-    /// health derived from an absence of instrumentation.
-    ///
-    /// Mutant: return `CheckOutcome::ran(Tft::Tft010, vec![])` instead of
-    /// `skipped` when `!inp.counters`. Applied: the `matches!(..., Skipped)`
-    /// assertion fails.
     #[test]
     fn the_hotspot_check_reports_missing_instrumentation_as_not_run() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -4994,13 +3340,6 @@ mod tests {
     }
 
     /// **The clock is only called a wall clock when the arena agrees with it.**
-    ///
-    /// `EdgeRecord::domain` permits stamps in any time domain. Treating a
-    /// boot-relative arena's stamps as Unix time would make `TFT005` report
-    /// every edge as fifty years stale and `TFT006` flag every stamp as absurd.
-    ///
-    /// Mutant: make `Clock::decide` always return `Clock::Wall`. Applied: the
-    /// boot-relative assertion fails.
     #[test]
     fn the_reference_clock_refuses_to_mix_time_domains() {
         let unix_now = 1_700_000_000_000_000_000;
@@ -5019,21 +3358,6 @@ mod tests {
     }
 
     /// **One broken publisher must not be able to define the reference clock.**
-    ///
-    /// The argument is [`Clock::decide`]'s, and this fixture is it: under an
-    /// extremum estimator the rogue edge is immune and the five healthy ones
-    /// are blamed.
-    ///
-    /// The fixture is non-degenerate on the axis that matters: the five good
-    /// edges carry *distinct* Unix stamps, and the bad edge's stamp is
-    /// `now * 2`, the classic nanoseconds-into-a-seconds-field overshoot, which
-    /// is the arena's maximum by a wide margin.
-    ///
-    /// Mutant: `Clock::decide` → `Clock::Wall`/`NewestStamp` chosen from
-    /// `newest_stamps.iter().max()` as the old single-stamp estimator did.
-    /// Applied: the arena is declared `NewestStamp(3_400_000_000_000_000_000)`,
-    /// `TFT005` skips, and `TFT006` fires on edges 1-5 — the first assertion
-    /// fails.
     #[test]
     fn a_single_units_error_cannot_capture_the_reference_clock() {
         let unix_now = 1_700_000_000_000_000_000;
@@ -5078,23 +3402,6 @@ mod tests {
     }
 
     /// **A claim caught mid-handoff is not a leaked claim.**
-    ///
-    /// `claim` parks the `CLAIMING` sentinel in the record for the few
-    /// instructions between winning it and publishing an identity. `slot_of`
-    /// maps that to no slot, exactly as it maps a dead owner's slot to no slot,
-    /// so `owner_pid` is 0 in both cases. Firing on `owner_pid == 0` alone
-    /// therefore reports a leak on a healthy arena every time `doctor` lands in
-    /// that window — a publisher restart, at warn severity, on an edge that is
-    /// fine. `Tree::reap` may act on `CLAIMING` only because it first probes
-    /// the lock file for liveness; this check takes no such probe and so must
-    /// not draw the conclusion.
-    ///
-    /// The fixture is non-degenerate: the two edges are identical except for
-    /// `claiming`, so the assertion cannot pass by accident of some other
-    /// field, and the genuinely-leaked edge proves the check still fires.
-    ///
-    /// Mutant: drop the `!e.claiming` term from `tft014`'s guard. Applied: both
-    /// edges are reported and the first assertion fails.
     #[test]
     fn a_claim_caught_mid_handoff_is_not_reported_as_a_leak() {
         let obs = Observations::new();
@@ -5128,32 +3435,6 @@ mod tests {
 
     /// **The wedge state: a `LIVE` record whose process is gone, and the claim
     /// it is still holding.** Both halves of `TFT014`'s title, on one arena.
-    ///
-    /// This is the state `docs/decisions/0028` is written about — a `LIVE`
-    /// record over a free lock byte — but **not** the arena issue #184
-    /// measured: #191 gave the owner a hangup reap, so a rendezvous joiner's
-    /// record is released and this shape survives only where that reap cannot
-    /// reach (the enumeration is on [`tft014`]). Which one it came from does
-    /// not change what the check must do with it, so the fixture is built
-    /// directly; the real-process version is
-    /// `crates/tf_tree/tests/rendezvous.rs`'s
-    /// `the_hangup_frees_a_joiners_slot_and_leaves_the_owners_live`.
-    ///
-    /// **The pid is deliberately non-zero**: the previous predicate was
-    /// `owner_pid == 0`, and `owner_pid` comes from
-    /// `ParticipantTable::identity`, which answers for any `LIVE` record
-    /// however dead its process — so the arena the check is named for was the
-    /// one arena it could not see.
-    ///
-    /// Mutant: restore `e.owner_pid == 0` as the claim half's guard. Applied:
-    /// the edge finding disappears and the count assertion fails at 1, while
-    /// the slot finding still fires — which is `doctor` reporting a leaked slot
-    /// and calling the edge it stranded healthy.
-    /// Mutant B: drop the `p.state == SlotState::Live` conjunct from
-    /// [`slot_leak`]'s `(LockByte::Unknown, _)` arm, leaving `!p.alive`.
-    /// Applied: the `Reserved` slot below fires as well and the count
-    /// assertion fails at *left: 3, right: 2* — which on a real no-lock-file
-    /// table is every joiner caught mid-attach reported as a leak.
     #[test]
     fn a_stale_live_slot_and_the_claim_it_stranded_are_both_reported() {
         let obs = Observations::new();
@@ -5231,10 +3512,6 @@ mod tests {
     }
 
     /// One participant slot with the three facts [`slot_leak`] reads.
-    ///
-    /// The two pids agree here, which is the ordinary case; the row where they
-    /// diverge has its own builder in
-    /// [`the_subject_names_the_pid_the_evidence_is_about`].
     fn slot(
         n: u32,
         state: SlotState,
@@ -5260,21 +3537,6 @@ mod tests {
 
     /// **A `RESERVED` record over a free byte is a leak, and the byte is what
     /// makes it visible.**
-    ///
-    /// `docs/decisions/0028` plan step 6 widened clause (a) from `LIVE` to any
-    /// non-`FREE` record, and this is the row that needed the widening:
-    /// `Tree::participant_alive` folds `state == LIVE` in ahead of the probe,
-    /// so `alive` is `false` here whatever the byte says and the old predicate
-    /// could not act on it in either direction. The sibling
-    /// `a_joiner_holding_its_byte_mid_attach_is_not_reported` is the same
-    /// record with the byte held, and the pair is the whole argument for
-    /// carrying the byte separately from `alive`.
-    ///
-    /// Mutant: restore the predicate this check shipped with — replace
-    /// [`slot_leak`]'s whole body with
-    /// `(p.state == SlotState::Live && !p.alive).then_some(SlotLeak::Abandoned)`.
-    /// Applied: `left: Pass, right: Fired` — the `RESERVED` leak goes back to
-    /// being invisible.
     #[test]
     fn a_reserved_record_over_a_free_byte_is_the_leak_a_byte_can_see() {
         let obs = Observations::new();
@@ -5304,42 +3566,6 @@ mod tests {
 
     /// **A byte-less record in a served arena is accused of leaking, and the
     /// accusation is about a process that is running.**
-    ///
-    /// The shipped rustdoc on [`tft014`] said such a record "reaches
-    /// [`slot_leak`]'s `unknown` byte row and is judged by `/proc` alone". It
-    /// does not, and this test is why that sentence is now a quotation of
-    /// itself. [`LockByte::Unknown`] is a fact about the **run** — no lock file
-    /// was read — and a `doctor --attach` reached its arena through the
-    /// rendezvous, so it holds one. What it sees is a `LIVE` record whose byte
-    /// probes free and whose lock-file identity record was never written,
-    /// because a `TreeBuilder::build_shared` creator writes neither.
-    ///
-    /// That is `(Free, Unknown)`, which is [`SlotLeak::Abandoned`]. The
-    /// fixture is built by hand rather than through `slot()` for the one field
-    /// the helper ties together and a real run does not: this row has a probed
-    /// byte *and* no `recorded_pid`.
-    ///
-    /// **`alive` is `false` and no row below reads it**, which is the point —
-    /// the byte-driven arms decide, and they decide wrongly here. The arena
-    /// record's pid names a process this host is still scheduling
-    /// (`docs/decisions/0031`'s measurement, `C: CREATOR STILL PUBLISHING
-    /// AFTER THE SWEEP: true`).
-    ///
-    /// **Mutant, run rather than asserted, and it corrected this note.** Give
-    /// the row `LockByte::Unknown`, which is what the retracted sentence
-    /// claimed it gets. Applied: the finding still **fires** — the
-    /// `(LockByte::Unknown, _)` arm accuses on `state == LIVE && !alive`, which
-    /// this row satisfies — and it is the *second* assertion that fails, on the
-    /// evidence clause. A first draft of this note predicted the finding would
-    /// vanish. So the two rows are not a fire-or-not difference: **both accuse
-    /// a running process**, and what the retracted sentence got wrong is which
-    /// evidence an operator is sent after. Under it the message read *"/proc
-    /// says its process is gone, and no lock file was read on this run"* —
-    /// three claims about a live publisher, one of them about a syscall the run
-    /// did make. *That wording has since gone from the `(Unknown, _)` arm too,
-    /// for a third reason found in review: on an `--attach` run whose probe
-    /// errored, a lock file **was** read, and `alive` can come from the kernel
-    /// rather than from `/proc`, so both of its clauses could be false at once.*
     #[test]
     fn a_byteless_record_in_a_served_arena_is_accused_of_leaking() {
         let obs = Observations::new();
@@ -5391,27 +3617,6 @@ mod tests {
 
     /// **A record caught mid-registration names no pid, and the finding must
     /// not send an operator to check one.**
-    ///
-    /// The sibling above added a clause saying the printed pid is the arena
-    /// record's own, because `tft014`'s remedy is *check the pid is gone before
-    /// you reap*. [`slot_leak`] routes every non-`FREE` state through the byte
-    /// table, and `fill_slot`'s `FREE -> RESERVED -> fields -> Release(LIVE)`
-    /// publication leaves a `RESERVED` record with `pid: 0` if the registrant
-    /// dies inside it; once the kernel releases that process's lock byte the
-    /// record reaches this row with a free byte and no `recorded_pid`. Which is
-    /// what this fixture is, field for field.
-    ///
-    /// **The zero reached three renderings and the first fix caught one.** The
-    /// evidence clause stopped claiming a pid while the message still read
-    /// *"pid 0 left slot 1 registered … CHECK THE PID IS GONE"* and the subject
-    /// still rendered `slot 1 pid 0` — `slot_subject`'s documented defect,
-    /// verbatim, under a rustdoc saying it was being prevented. `named_pid` is
-    /// the one predicate now and the assertions below cover all three.
-    ///
-    /// **Mutant, run:** delete the `p.pid == 0` arm in `abandoned_evidence` so
-    /// this falls through to the sibling's. Applied: the first assertion fails,
-    /// printing *"the pid below is the arena record's own"*. The clauses are
-    /// not interchangeable wording.
     #[test]
     fn a_record_with_no_pid_at_all_is_not_something_to_go_and_check() {
         let obs = Observations::new();
@@ -5457,18 +3662,6 @@ mod tests {
     }
 
     /// **The fork case is its own finding, with its own remedy.**
-    ///
-    /// `0028` plan step 6 clause (b), and the reason it is a *distinct* message
-    /// rather than a second producer of the first one: the byte is held, so
-    /// nothing may reclaim this slot — the kernel's answer is *alive* and
-    /// overruling it with `/proc` is the inversion `PHASE2.md` §5.1 forbids.
-    /// An operator told "the lock byte is free" here would go looking for a
-    /// reaper that must not run.
-    ///
-    /// Mutant: return `SlotLeak::Abandoned` from the `(Held, Gone)` arm.
-    /// Applied: it panicked on the first `contains` — *"the fork case must be
-    /// named as itself"* — with the abandoned wording, which tells an operator
-    /// to reap a slot the kernel says is held.
     #[test]
     fn a_held_byte_over_a_dead_pid_is_the_fork_case_and_says_so() {
         let obs = Observations::new();
@@ -5500,21 +3693,6 @@ mod tests {
     }
 
     /// **A joiner mid-attach, holding its byte, is not reported — either way.**
-    ///
-    /// The negative `0028` plan step 6 asks for by name, and the one that stops
-    /// this becoming a check that always fires. §3.3's order is identity, then
-    /// byte, then the arena record's `FREE -> RESERVED` CAS, so *every* healthy
-    /// registrant passes through exactly this state.
-    ///
-    /// Both facts are needed to stay silent and the fixture proves it: a
-    /// `Running` process behind a held byte, and an `Unknown` one behind a held
-    /// byte (a `/proc` that would not answer, which must never read as death).
-    ///
-    /// Mutant: widen the fork arm to `(LockByte::Held, _)`. Applied:
-    /// `left: Fired, right: Pass` — every healthy joiner and every participant
-    /// on a `/proc`-less host reported as a fork inheritor. The same mutation
-    /// fails `doctor_is_silent_about_a_joiner_that_is_mid_attach` in
-    /// `tests/attach.rs`, which is the end-to-end half of this claim.
     #[test]
     fn a_joiner_holding_its_byte_mid_attach_is_not_reported() {
         let obs = Observations::new();
@@ -5538,16 +3716,6 @@ mod tests {
 
     /// **A process `/proc` says is running is not called leaked, whatever its
     /// byte says.**
-    ///
-    /// The one row where this check is deliberately quieter than the reclaimer,
-    /// and `slot_leak`'s doc says why in as many words: what produces the
-    /// combination is a participant with a record and no byte, which `0028`
-    /// open question 1 ruled out and step 0b removed the producer of.
-    ///
-    /// Mutant: fold the `(Free, Running)` arm into the `Abandoned` one.
-    /// Applied: `left: Fired, right: Pass`, with a finding whose evidence
-    /// clause reads *"the lock byte is free, and /proc could not say what became
-    /// of the process…"* about a process `/proc` had just said was running.
     #[test]
     fn a_running_process_over_a_free_byte_is_not_called_leaked() {
         let obs = Observations::new();
@@ -5564,24 +3732,6 @@ mod tests {
     }
 
     /// **A message never claims a syscall the run did not make.**
-    ///
-    /// Clause (a) is reached by two *evidence sets*, and mapping them onto two
-    /// **sources** is the shortcut this module keeps making: an `--attach` run
-    /// usually has a probed byte and a fixture or `--from-bag` never does, but
-    /// `slot_facts` (`crates/tf_tree_cli/src/lib.rs`) also answers
-    /// `LockByte::Unknown` when the probe itself errors, so an `--attach` run
-    /// reaches the second set too — see [`slot_leak`]'s note on that row. What
-    /// this test pins is the evidence, which is what the message is about. The
-    /// wording that shipped before step 6 — *"the lock byte is free"* —
-    /// predates `doctor` opening a lock file at all, so on the second source it
-    /// asserted a probe nobody performed and sent an operator looking for a
-    /// holder.
-    ///
-    /// Mutant: return the `LockByte::Free` string from every arm of
-    /// `abandoned_evidence`. Applied: it panicked on the second `contains`,
-    /// printing a no-lock-file source's finding claiming *"the lock byte is
-    /// free and /proc has no running process for it"* — a probe that run never
-    /// made.
     #[test]
     fn the_evidence_clause_names_the_facts_the_run_actually_had() {
         let obs = Observations::new();
@@ -5634,24 +3784,6 @@ mod tests {
 
     /// **A slot nobody holds is not a leak, and neither is a read-only
     /// consumer that is running.**
-    ///
-    /// [`ParticipantInfo::alive`] is `false` for every `FREE` record in a real
-    /// table — the predicate short-circuits on `state != LIVE` before it probes
-    /// anything — and a 64-slot arena with one publisher has 63 of them. A
-    /// check that read `alive` alone would report a healthy robot as leaking 63
-    /// slots, which is the false positive that gets a warn suppressed for good.
-    ///
-    /// **The fixture's `/proc` answer was `Gone` and has been corrected to
-    /// `Running`, which is what the comment beside it always claimed.** A
-    /// read-only consumer holding its own byte is `Running`; `FREE` + held +
-    /// *gone* is not that shape at all — it is the read-only participant's fork
-    /// inheritor, the byte held on behalf of a process that has exited, and
-    /// [`a_free_record_over_a_held_byte_for_a_dead_pid_is_the_fork_case`] is
-    /// where it now belongs. Asserting `Pass` over the old fixture was
-    /// asserting that `doctor` stays silent about the likeliest leak a Python
-    /// deployment produces. The two halves below keep the row non-degenerate on
-    /// the axis the old comment cared about: 31 slots nobody holds at all, and
-    /// 32 held by running readers.
     #[test]
     fn a_free_slot_is_not_a_leak() {
         let obs = Observations::new();
@@ -5684,18 +3816,6 @@ mod tests {
 
     /// **A `FREE` record over a held byte whose pid is gone is the fork case,
     /// and it is the one `doctor` most needs to report.**
-    ///
-    /// The read-only participant D18 makes the consumer default writes **no**
-    /// arena record: it takes a lock byte, writes a lock-file identity record,
-    /// and leaves the participant table `FREE`. `fork` it — which is what
-    /// Python's `multiprocessing` does by default on Linux — and let the parent
-    /// die, and the child's inherited open file description keeps the byte held
-    /// for a pid that no longer exists, with a `FREE` row over it.
-    ///
-    /// Mutant: restore the bare `if p.state == SlotState::Free { return None }`
-    /// in `slot_leak`. Applied: `left: Pass, right: Fired` here, while
-    /// `a_free_slot_is_not_a_leak` still passes — the silence being total is
-    /// exactly why no existing test caught it.
     #[test]
     fn a_free_record_over_a_held_byte_for_a_dead_pid_is_the_fork_case() {
         let obs = Observations::new();
@@ -5735,15 +3855,6 @@ mod tests {
 
     /// **The subject names the pid the evidence is about, and names the arena
     /// record's separately when they differ.**
-    ///
-    /// `doctor` shipped `"subject": "slot 8 pid 0"` on a `RESERVED` row: the
-    /// `0` is the arena record's `pid` field, still unwritten because
-    /// `fill_slot` fills it after the `FREE -> RESERVED` CAS.
-    ///
-    /// Mutant: build the subject from `p.pid` again
-    /// (`format!("slot {} pid {}", p.slot, p.pid)`). Applied: it panicked on
-    /// the first assertion with *left: "slot 8 pid 0"* — the shipped string,
-    /// verbatim.
     #[test]
     fn the_subject_names_the_pid_the_evidence_is_about() {
         let obs = Observations::new();
@@ -5794,30 +3905,6 @@ mod tests {
     }
 
     /// **An out-of-order stream is not a dropout.**
-    ///
-    /// The `median <= 0` guard only catches a *wholly* non-monotone stream. A
-    /// few inverted pairs leave a healthy positive median, but the jump back to
-    /// the true timeline after an inversion becomes `worst` — so `TFT009`
-    /// reports a gap of several times the median that never happened. The real
-    /// fault fires too, as the id-less `out-of-order` check at error severity,
-    /// and the operator then also gets a warn sending them to look for a lost
-    /// publisher instead of a reordered one.
-    ///
-    /// The stream below is non-degenerate on both axes: its median interval is
-    /// a healthy 100 ms (so the old guard does not catch it) and its recovery
-    /// jump is 350 ms, comfortably past `GAP_FACTOR` x median (so the old code
-    /// really did fire).
-    ///
-    /// Mutant: drop [`ShapeGap::NotMonotone`] and let a negative interval fall
-    /// through to the median test alone. Applied: `TFT009` fires with
-    /// "largest gap 350.0 ms is 3.5x the median period 100.0 ms" and the first
-    /// arm panics.
-    ///
-    /// **Second mutant**, which is what the `match` below is for rather than an
-    /// `assert_ne!`: fold [`ShapeGap::NotMonotone`] into
-    /// [`ShapeGap::TooFewIntervals`] in [`gap_evidence_skip`]. The status is
-    /// still `Skipped` and the reason then tells the operator to wait for a
-    /// ring to fill on an arena whose fault is a reordered publisher.
     #[test]
     fn an_out_of_order_stream_is_not_reported_as_a_dropout() {
         const MS: i64 = 1_000_000;
@@ -5885,19 +3972,6 @@ mod tests {
     /// **`TFT017` and `TFT018` report at the severity their Phase 1 checks
     /// assign, and the two answers are compared here because nothing else
     /// compares them.**
-    ///
-    /// Before they had ids, `checks::run` took each finding's severity from
-    /// [`doctor::Finding`], next to the code that knows why the condition is
-    /// serious. An id owns its severity instead (`--exit-code` is only a usable
-    /// gate if the set of ids that can fail it is knowable from the
-    /// documentation), so the value is now stated twice — and `TFT018` is an
-    /// *error*, so a drift would silently change what `doctor --exit-code`
-    /// fails on.
-    ///
-    /// Mutant: give `Tft::Tft018` `Severity::Warn` in `catalogue::severity`.
-    /// Applied: the out-of-order comparison fails with `left: Warn, right:
-    /// Error`. Mutant B: make `doctor::check_unclaimed_dynamic` return
-    /// `Finding::error`. Applied: the unclaimed comparison fails.
     #[test]
     fn the_two_new_ids_keep_their_phase_1_severities() {
         let unclaimed = Snapshot {
@@ -5970,14 +4044,6 @@ mod tests {
 
     /// A stream on `edge` at [`PERIOD_NS`] that runs forward, has its clock
     /// stepped back by `back_ns`, and then keeps publishing at the same rate.
-    ///
-    /// That is the shape a real clock step leaves, and it is not the same shape
-    /// as one misplaced sample: the publisher does not stop, so invariant 6
-    /// rejects every push until the clock climbs back past the newest accepted
-    /// stamp. The run is therefore `back_ns / PERIOD_NS` consecutive rejected
-    /// arrivals — the quantity `TFT019`'s concentration condition reads — while
-    /// the *adjacent* inversion count `TFT018` reports stays 1 either way. A
-    /// test that wants a stray inversion instead asks for a small `back_ns`.
     fn stepped_back(edge: u32, back_ns: i64) -> Vec<PushSample> {
         let mut stamps: Vec<i64> = (0..10).map(|i| i * PERIOD_NS).collect();
         let last = stamps[stamps.len() - 1];
@@ -6025,20 +4091,6 @@ mod tests {
 
     /// **`TFT019` attributes a backwards run to a clock step only on tag 0, and
     /// on any other tag it says which tag rather than guessing.**
-    ///
-    /// The argument is `tft019`'s: [`Domain`](tf_tree::Domain) is an open
-    /// trait, so a user-declared tag carries no way to state "this clock can
-    /// step".
-    ///
-    /// Mutant: make the wall-clock arm `Some((_, e))` (attribute every tag).
-    /// Applied: the tag-3 edge is attributed and the first assertion fails —
-    /// "only the wall-clock edge may be attributed", `left: [Some(1), Some(2)]`,
-    /// `right: [Some(1)]`.
-    /// Mutant B: `const WALL_CLOCK_TAG: u8 = 3`. Applied: the same assertion
-    /// fails with `left: [Some(2)]`, `right: [Some(1)]`.
-    /// Mutant C: give the `SimDomain` arm of `tag_refusal` the steady arm's
-    /// text. Applied: the last assertion fails — "sim time must be sent to
-    /// 0012, not told its clock cannot step".
     #[test]
     fn tft019_fires_only_on_the_wall_clock_tag_and_names_the_tag_it_refuses() {
         const MS: i64 = 1_000_000;
@@ -6122,24 +4174,6 @@ mod tests {
     }
 
     /// **A single stray inversion on a wall clock is not a clock step.**
-    ///
-    /// `docs/PHASE5.md` §6 asks for "a run of rejections *concentrated in a
-    /// short window*" and `docs/API.md` §5.3 for "a run of rejected pushes".
-    /// Firing on one misplaced sample is the same fabricated attribution the
-    /// tag refusal exists to prevent, pointed the other way: it tells an
-    /// operator the clock stepped when what actually happened is a publisher
-    /// hiccup, and `TFT018` alone is the honest answer there.
-    ///
-    /// The threshold ([`CLOCK_STEP_MIN_REJECTED_RUN`], in arrivals) is this
-    /// implementation's and not the spec's, so what this pins is the *shape* of
-    /// the rule: below it, `TFT019` passes and discloses; at it, it fires.
-    ///
-    /// Mutant: `run.longest_rejected_run >= CLOCK_STEP_MIN_REJECTED_RUN` ->
-    /// `run.regressions > 0`. Applied: the stray-inversion case is attributed
-    /// and the first assertion fails with `left: Fired`, `right: Pass`.
-    /// Mutant B: `>= CLOCK_STEP_MIN_REJECTED_RUN` -> `> CLOCK_STEP_MIN_REJECTED_RUN`.
-    /// Applied: the exactly-at-threshold stream is no longer attributed and the
-    /// last assertion fails with `left: Pass`, `right: Fired`.
     #[test]
     fn tft019_needs_a_run_of_rejections_not_a_single_inversion() {
         let snap = chain_with_domains(0, 0);
@@ -6187,24 +4221,6 @@ mod tests {
 
     /// **`TFT019` inherits `TFT018`'s live-arena skip rather than working around
     /// it**, which `docs/PHASE5.md` §6's amendment requires in those words.
-    ///
-    /// The next-lap artifact [`PushStream::RingsUnderWriter`] describes has
-    /// exactly this check's signature, and attributing it to an NTP step would
-    /// put a fabricated cause on a fabricated effect — worse than `TFT018`'s
-    /// silence, because it names a culprit.
-    ///
-    /// **And the skip names the source that can answer instead.** An operator
-    /// who only ever meets a `skip` line has to be told where the evidence
-    /// lives — a check whose silence reads as an all-clear is worse than no
-    /// check.
-    ///
-    /// Mutant: `if let Some(why) = inp.stream.no_rejected_arrivals()` ->
-    /// `if let Some(why) = None::<&str>` in `tft019`. Applied: the `Skipped`
-    /// match panics with "expected a skip on a replayed stream, got Fired".
-    /// Mutant B: delete the `--from-bag` sentence from
-    /// `PushStream::RingsUnderWriter`'s `no_rejected_arrivals` reason. Applied:
-    /// the second assertion fails — "the skip has to point at the source that
-    /// can answer".
     #[test]
     fn tft019_inherits_tft018s_replayed_stream_skip() {
         const MS: i64 = 1_000_000;
@@ -6244,20 +4260,6 @@ mod tests {
 
     /// **A stream replayed from an arena at rest cannot show an inversion, so
     /// `TFT018` skips there too rather than passing.**
-    ///
-    /// This is the finding that made [`PushStream`] a four-valued enum instead
-    /// of a `live: bool`. A frozen `.tft` has no concurrent writer, so the
-    /// live-arena skip reason — a torn window — does not apply to it, and
-    /// keying on liveness would have run the check and passed **every** `.tft`.
-    ///
-    /// The stream below is deliberately the *same* inverted one the recorded
-    /// case fires on — it is not reachable from a real arena, and that is the
-    /// point: even handed the evidence, this variant must refuse it, because in
-    /// production it would never have it.
-    ///
-    /// Mutant: make `PushStream::RingsAtRest` return `None` from
-    /// `no_rejected_arrivals`. Applied: both `Skipped` matches panic with
-    /// "expected a skip on an arena at rest, got Fired".
     #[test]
     fn tft018_and_tft019_skip_on_an_arena_at_rest_rather_than_passing_vacuously() {
         const MS: i64 = 1_000_000;
@@ -6286,15 +4288,6 @@ mod tests {
 
     /// **`TFT001` skips on a recording because a bag has no publisher identity,
     /// and the reason says which of the two facts is missing.**
-    ///
-    /// `docs/PHASE4.md` §1.3 makes multi-publisher conflict the falsifiable
-    /// prediction about real stacks, so this is the check a stranger's bag is
-    /// most wanted for — and it is the one a bag cannot answer. Saying "a live
-    /// arena's rings remember the current owner" there would be a true sentence
-    /// about the wrong source.
-    ///
-    /// Mutant: make `PushStream::Recorded` return the `RingsAtRest` reason from
-    /// `no_writer_identity`. Applied: the `PHASE4.md §1.3` assertion fails.
     #[test]
     fn tft001_skips_on_a_recording_for_the_recordings_own_reason() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -6314,18 +4307,6 @@ mod tests {
     }
 
     /// **`TFT019` explains `TFT018`; it does not demote it.**
-    ///
-    /// `docs/PHASE5.md` §6's amendment is explicit: rejected pushes are lost
-    /// data whatever caused them, so `TFT018` stays an error and keeps failing
-    /// `doctor --exit-code` while `TFT019` is a warn beside it. The failure this
-    /// pins is the tempting one — deciding that an explained fault is not a
-    /// fault — which would silently stop a fleet's CI gating on lost transforms.
-    ///
-    /// Mutant: move `Tft::Tft019` into the `Severity::Error` arm of
-    /// `catalogue::severity`. Applied: the first assertion fails with
-    /// `left: Error`, `right: Warn`.
-    /// Mutant B: move `Tft::Tft018` into the `Severity::Warn` arm. Applied: the
-    /// second assertion fails with `left: Warn`, `right: Error`.
     #[test]
     fn tft019_explains_tft018_without_demoting_it() {
         const MS: i64 = 1_000_000;
@@ -6363,32 +4344,6 @@ mod tests {
 
     /// **`TFT019` fires on exactly `TFT018`'s evidence — the same function, not
     /// a second scan written to the same rule.**
-    ///
-    /// The amendment calls it "an attribution, not a second detector". Two
-    /// independent walks of `obs` would agree on the day they were written and
-    /// drift on the first change to either, at which point `doctor` would report
-    /// a clock step on an edge it did not report as out of order, or the
-    /// reverse.
-    ///
-    /// **The fixture is sized to the shipped threshold, and that is the whole
-    /// design of this test.** Invariant 6 *accepts* a repeated stamp — replay is
-    /// idempotent — so a stream of identical stamps is one the real producer
-    /// finds nothing in at all. A producer that had drifted by one character to
-    /// `<=` counts every repeat as a rejection, so the stream is
-    /// [`CLOCK_STEP_MIN_REJECTED_RUN`]` + 1` samples long: exactly enough for
-    /// the drifted count to clear [`CLOCK_STEP_MIN_REJECTED_RUN`] and be
-    /// *attributed*. A shorter stream is not equivalent — the drifted run would
-    /// land in `diffuse` instead, and the only thing left to notice it would be
-    /// the wording of a coverage note, which is not the invariant this pins.
-    ///
-    /// Mutant: in [`ClockStepEvidence::capture`], replace
-    /// `doctor::out_of_order_runs(obs)` with a local re-derivation over
-    /// `obs.by_edge()` — the body of [`doctor::out_of_order_runs`] copied in
-    /// with both of its `<` stamp tests written `<=`. Applied: `TFT018` still
-    /// passes on the equal-stamps stream, because it still calls the real
-    /// producer, while `TFT019` attributes it, and the `tft019` assertion fails
-    /// with `left: Fired`, `right: Pass` — the two had drifted apart by one
-    /// character.
     #[test]
     fn tft019_considers_exactly_the_edges_tft018_fired_on() {
         const MS: i64 = 1_000_000;
@@ -6441,16 +4396,6 @@ mod tests {
 
     /// **`TFT018` skips on a live arena instead of reporting an inversion the
     /// publisher never made.**
-    ///
-    /// A live push stream is reconstructed from a ring that is being written
-    /// while it is read, so a slot at the old end of the window can already hold
-    /// the next lap's sample — a forward jump followed by a step back, which is
-    /// this check's exact signature. Before the id, the live case was silently
-    /// not run and the report said nothing about it.
-    ///
-    /// Mutant: make `PushStream::RingsUnderWriter` return `None` from
-    /// `no_rejected_arrivals`. Applied: the status is `Fired` and the `Skipped`
-    /// match panics.
     #[test]
     fn tft018_skips_on_a_live_arena_and_says_so() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -6484,25 +4429,6 @@ mod tests {
 
     /// **`TFT007` compares only where a rate was declared, and an undeclared
     /// edge is not compared against zero.**
-    ///
-    /// `EdgeRecord::nominal_rate_mhz == 0` means *not declared*, not *declared
-    /// as 0 Hz*. Treating it as a rate makes every undeclared edge deviate by
-    /// infinity, so a correct arena where nobody wrote a `rate_hz` would report
-    /// a warn on every edge — the fabricated finding this catalogue exists to
-    /// avoid, and the reason the field went unread until now.
-    ///
-    /// The fixture is non-degenerate on both axes: three edges, two declaring
-    /// and one not, and the two declaring differ in whether they hold their
-    /// rate. The declared value is not the observed one by accident — the slow
-    /// edge runs at exactly half.
-    ///
-    /// Mutant: read the declaration as `e.nominal_rate_mhz.unwrap_or(0)` in
-    /// `rate_evidence` and drop the `NotDeclared` arm. Applied: undeclared
-    /// edge#3 fires at `+inf%` and the assertion about which edges fired fails.
-    /// Mutant B: invert the `effect` selection to `if ratio < 1.0`. Applied: the
-    /// slow edge is told its ring "retains proportionally less history" — the
-    /// opposite diagnosis — and the assertion on the explanation fails. The
-    /// numbers alone do not catch it; the sentence is what an operator acts on.
     #[test]
     fn tft007_compares_only_where_a_rate_was_declared() {
         const MS: i64 = 1_000_000;
@@ -6572,17 +4498,6 @@ mod tests {
 
     /// **An arena where nothing declares a rate skips `TFT007` with a reason
     /// instead of passing.**
-    ///
-    /// A `pass` here would be an active claim that every edge publishes at its
-    /// intended rate, made by a check that had no intended rate to consult.
-    /// That is the difference `Status::Skipped` carries a mandatory reason for.
-    ///
-    /// Mutant: replace `if declared == 0` with `if false` in `tft007`. Applied:
-    /// the status is `Pass` and the `match` panics with "expected a skip".
-    /// Mutant B: drop the `e.kind != EdgeKind::Dynamic` guard from
-    /// `rate_evidence`. Applied: the static-edge case below counts as declared,
-    /// the check reports `Pass` instead of skipping, and its `match` panics —
-    /// a `pass` earned by an edge that cannot publish at all.
     #[test]
     fn tft007_skips_when_no_edge_declares_a_rate() {
         const MS: i64 = 1_000_000;
@@ -6629,21 +4544,6 @@ mod tests {
     /// **`TFT007` skips rather than passing when every declaring edge is
     /// unmeasurable — a `pass` that compared nothing is a fabricated
     /// assurance.**
-    ///
-    /// This is the state an operator is in seconds after bringup, during a
-    /// publisher restart, and — worst — on an edge whose publisher has stopped
-    /// dead, which reaches `rate_evidence` with no samples at all. A declaration
-    /// exists, so the "nothing declares" skip does not fire; nothing is
-    /// comparable, so no finding is produced and [`rate_coverage_note`] stays
-    /// silent too. Reporting `pass` there would tell a fleet operator that a
-    /// stopped publisher is publishing at its intended rate.
-    ///
-    /// Mutant: restore the guard to `if declared == 0`. Applied: the status is
-    /// `Pass` and the first `match` panics with "expected a skip".
-    /// Mutant B: make the `TooFewIntervals` arm `continue` instead of counting.
-    /// Applied: `declared` stays 0, the skip reason becomes the "no edge
-    /// declares a nominal rate" one — false, two of them do — and the assertion
-    /// on "retained intervals" fails.
     #[test]
     fn tft007_skips_rather_than_passing_when_it_compared_nothing() {
         const MS: i64 = 1_000_000;
@@ -6700,18 +4600,6 @@ mod tests {
 
     /// **`RATE_TOLERANCE` is the band, and one milli-hertz either side of it
     /// decides fired from passed.**
-    ///
-    /// The constant is offered as the spec owner's dial, so a change to it must
-    /// be visible in a test rather than silently widening what `doctor`
-    /// certifies as healthy. Both cases run the *same* 25 Hz stream and differ
-    /// only in the declared rate by 1 mHz — 25 Hz is 20.0019% above 20.833 Hz
-    /// and 19.9962% above 20.834 Hz — so nothing but the threshold can explain
-    /// the difference in outcome.
-    ///
-    /// Mutant: `RATE_TOLERANCE: f64 = 0.35`. Applied: the first case reports
-    /// `Pass` and its assertion fails. Mutant B: `0.10`. Applied: the second
-    /// case fires and its assertion fails. A test pinned only to `(0.10, 0.50)`
-    /// deviations survives both.
     #[test]
     fn the_rate_tolerance_band_is_pinned_at_its_edge() {
         // 25 Hz exactly: 40 ms is representable, so the observed side carries
@@ -6736,22 +4624,6 @@ mod tests {
 
     /// **A `TFT007` pass says which edges it covered, whenever it covered fewer
     /// than all of them.**
-    ///
-    /// The report has three statuses and none of them is "ran, half blind", so
-    /// a partial run is disclosed through `Meta.notes` — the same mechanism
-    /// `TFT015`'s missing participants row uses. Without it, an arena where one
-    /// edge declares a rate and eleven do not reports a bare `pass` for
-    /// `TFT007`, which reads as a statement about all twelve.
-    ///
-    /// Mutant A: make `rate_coverage_note` return `None` unconditionally.
-    /// Applied: the `expect` fires. Mutant B: drop the `comparable == 0` term
-    /// from its guard. Applied: the last assertion fails — the report would
-    /// then carry a skip reason and a coverage note that contradict each other.
-    /// Mutant C: drop the `e.kind != EdgeKind::Dynamic` guard from the note's
-    /// own loop. Applied: the static edge below lands in the `undeclared`
-    /// bucket and the note reads "compared 1 of 4 dynamic edge(s)" — a sentence
-    /// whose noun contradicts its arithmetic, and the reason the note counts
-    /// its denominator itself instead of using `snap.edges.len()`.
     #[test]
     fn the_rate_coverage_note_states_what_a_pass_did_not_cover() {
         const MS: i64 = 1_000_000;
@@ -6818,20 +4690,6 @@ mod tests {
     }
 
     /// **An arena that has served no lookups must not read as a healthy one.**
-    ///
-    /// `TFT010`'s evidence is entirely the §5 counters, which a bag-built arena
-    /// leaves at zero on every edge — so the finding loop never runs and the
-    /// check reported `pass`, an all-clear on an extrapolation hotspot nothing
-    /// could have detected. See [`no_counter_evidence`].
-    ///
-    /// The gate is on the evidence, not on the source, so the *second* half of
-    /// this test is the real one: one lookup anywhere in the arena makes a zero
-    /// mean zero, and the check must run again. It is the same defect `TFT007`
-    /// had against an undeclared rate — see `tft009`'s doc, which names the
-    /// family.
-    ///
-    /// Mutant: delete the `lookups == 0` arm of `no_counter_evidence`. Applied:
-    /// the first assertion fails with `Pass`.
     #[test]
     fn an_unexercised_counter_sheet_skips_tft010_rather_than_passing_it() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -6880,12 +4738,6 @@ mod tests {
     }
 
     /// **`TFT011` skips only when *both* of its halves are blind.**
-    ///
-    /// A bag loses both halves at once: no lookups have been served, and a
-    /// recording carries no arrival delay.
-    ///
-    /// Mutant: make the guard `if counters.is_some() || delays.is_some()`.
-    /// Applied: the `Observed` case skips and the last assertion fails.
     #[test]
     fn tft011_skips_when_neither_half_has_evidence_and_runs_when_either_does() {
         let snap = two_frame_snapshot(edge(1, 1, 2, 100));
@@ -6930,14 +4782,6 @@ mod tests {
     }
 
     /// **A build without `counters` keeps its own reason.**
-    ///
-    /// The feature check has to come first because a build without counters
-    /// also reads zero everywhere — reporting *that* as "this arena has served
-    /// no lookups" would send a reader to run a consumer against an engine that
-    /// will never count it.
-    ///
-    /// Mutant: swap the two arms of `no_counter_evidence`. Applied: the first
-    /// assertion fails.
     #[test]
     fn the_counters_feature_and_an_unexercised_arena_are_different_skips() {
         let off = no_counter_evidence(false, &[]).expect("a build without counters has no verdict");

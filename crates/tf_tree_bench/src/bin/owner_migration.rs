@@ -10,101 +10,56 @@
 //!
 //! # Why this binary exists
 //!
-//! §3.5's ownership migration landed on 2026-08-28 — `Tree::owner_lost`,
-//! `Tree::inherit_ownership`, `Session::take_over_ownership`. Its *correctness*
-//! is covered by `crates/tf_tree/tests/rendezvous.rs` and the `join-heir` arm of
-//! `crates/tf_tree/src/bin/rendezvous_child.rs`. Its **latency** was covered by
-//! nothing: before this file, `inherit_ownership` and `owner_lost` appeared
-//! nowhere under `crates/tf_tree_bench/`, `docs/benchmarks/EVIDENCE.md` carried
-//! no row for gate 4b, and both §12.2 rows above held a dash. So a *normative*
-//! criterion of a phase recorded **Implemented** had no artifact that could
-//! produce its number. This is that artifact.
+//! §3.5's ownership migration (`Tree::owner_lost`, `Tree::inherit_ownership`,
+//! `Session::take_over_ownership`) is covered for correctness by
+//! `crates/tf_tree/tests/rendezvous.rs`; this is the artifact that produces gate
+//! 4b's **latency** number. It prints the quotient and the verdict and does not
+//! decide whether a host passes.
 //!
-//! It does not decide whether the gate passes on any given host — it prints the
-//! quotient and the verdict.
+//! # The roles
 //!
-//! # The shape, and why each role is a separate process
+//! Five roles, since collapsing any two measures something else:
 //!
-//! Five roles, because collapsing any two of them measures something else:
-//!
-//! * **`owner`** — creates the arena and serves the rendezvous. It is the
-//!   process this benchmark kills, and it does **nothing else**. The obvious
-//!   shortcut — let the owner also publish, as `shm_torture`'s driver does —
-//!   makes the kill stop the data stream, so every reader would start reporting
-//!   `Extrapolation` a few hundred milliseconds later and the "zero failed
-//!   lookups" half of 4b would be measuring the *writer's* death rather than
-//!   the owner's.
-//! * **`writer`** — joins read-write, claims the chain and publishes at a fixed
-//!   rate for the whole run. Never killed, so the rings stay fed across the
-//!   migration and a failed lookup means what 4b says it means.
-//! * **`heir`** — joins read-write and runs §3.5's caller-driven trigger: poll
-//!   `Tree::owner_lost`, call `Tree::inherit_ownership` when it answers true.
-//!   Separate from the readers on purpose: gate 4b is the claim that the
-//!   *control* plane does not disturb the *data* plane, and a reader that also
-//!   polled the control plane could not tell the two apart.
-//! * **`reader` × N** — join **read-only** (D18's default) and do nothing but
-//!   `Plan::at` in a tight loop, emitting one histogram line per window. No
-//!   control-plane call of any kind, so what they time is only the mapping.
-//! * **the driver** — spawns the four kinds, waits for steady state, `SIGKILL`s
-//!   the owner, and times the recovery.
+//! * **`owner`**: creates the arena and serves the rendezvous; the process that is
+//!   killed, and it does nothing else (an owner that also published would make the
+//!   kill stop the data stream, so "zero failed lookups" would measure the
+//!   *writer's* death).
+//! * **`writer`**: joins read-write, claims the chain and publishes at a fixed rate
+//!   for the whole run; never killed, so a failed lookup means what 4b says.
+//! * **`heir`**: joins read-write and runs §3.5's caller-driven trigger (poll
+//!   `Tree::owner_lost`, call `Tree::inherit_ownership`). Separate from the readers
+//!   because 4b claims the *control* plane does not disturb the *data* plane.
+//! * **`reader` x N**: join **read-only** (D18) and only `Plan::at` in a tight loop,
+//!   one histogram line per window, with no control-plane call.
+//! * **the driver**: spawns the rest, waits for steady state, `SIGKILL`s the owner
+//!   and times the recovery.
 //!
 //! # How the two numbers are taken
 //!
-//! **"owner kill -> new owner serving"** is measured from the outside, because
-//! that is the only place the question is meaningful: a *fresh* process trying
-//! to join is exactly what an arena with no owner refuses. The driver stamps the
-//! instant it sends `SIGKILL`, then attempts `Open::new().create(Never)` in a
-//! tight retry until one succeeds; the delta is the row. Before the heir binds,
-//! those attempts fail with `ArenaHeldButUnreachable` — §3.4's split-brain check
-//! meeting the survivors' held participant bytes — which is the state
-//! `docs/decisions/0037` and `0043` exist to end.
+//! **"owner kill -> new owner serving"** is measured from outside: the driver
+//! stamps the `SIGKILL`, then retries `Open::new().create(Never)` until one
+//! succeeds. Before the heir binds those fail with `ArenaHeldButUnreachable`
+//! (§3.4's split-brain check; `docs/decisions/0037` and `0043`).
 //!
-//! **"lookup latency across a migration"** is measured from inside the readers,
-//! and the clock-domain problem is solved by not sharing a clock at all. Each
-//! reader emits a line per `WINDOW` of wall time; the driver timestamps each
-//! line **on arrival, in its own clock**, and knows when it sent the signal. So
-//! "before" and "during" are decided by the driver, from the driver's own two
-//! facts, and no cross-process clock is ever compared. Pipe latency biases a
-//! window boundary by microseconds against a window of 50 ms.
-//!
-//! Percentiles are merged across windows from **bucket counts, not from
-//! per-window percentiles** — averaging a p99.9 is not a p99.9. `BUCKET_NS`
-//! carries the bucket width and why it is not 10 ns.
+//! **"lookup latency across a migration"** is measured inside the readers with no
+//! shared clock: each emits a line per `WINDOW`, the driver timestamps it on
+//! arrival in its own clock and classifies it against its own `SIGKILL` instant.
+//! Percentiles merge from **bucket counts**, not per-window percentiles
+//! (`BUCKET_NS`).
 //!
 //! # What the ratio can and cannot detect
 //!
-//! **Read this before quoting the ratio.** The during-histogram covers
-//! `MIGRATION_WINDOW` of wall time, and the migration inside it is one event a
-//! millisecond or two wide. So the overwhelming majority of the samples in
-//! *both* phases are ordinary steady-state lookups, and the p99.9 quotient is
-//! therefore **structurally near 1.000**. It is a real measurement of *sustained*
-//! degradation — if a migration left the mapping, the page tables or a lock in a
-//! worse state, thousands of subsequent lookups would move and the quotient would
-//! show it — and it is **blind to a single stall**: one lookup that paused for a
-//! millisecond is p99.9999 in a window of a million.
+//! The during-histogram covers `MIGRATION_WINDOW` and the migration in it is one
+//! event a millisecond or two wide, so the p99.9 quotient is **structurally near
+//! 1.000**: a real measure of *sustained* degradation, **blind to a single stall**
+//! (one pause is p99.9999 in a window of a million). A gate that cannot fail is
+//! vacuous, so **the stall count** (lookups at or above 10x the steady p99.9, per
+//! million) is printed for **both** phases, and `gate_arithmetic_is_not_vacuous`
+//! injects a tail and asserts the verdict flips to FAIL.
 //!
-//! The first revision of this file used a 750 ms window and reported exactly
-//! `1.000` on three consecutive runs. That is not a passing gate, it is a gate
-//! that cannot fail, and it is the same vacuous-green shape as `shm_torture`'s
-//! first revision. Two things answer it, and both are printed:
-//!
-//! * the window is `MIGRATION_WINDOW`, not 750 ms; and
-//! * **the stall count** — lookups at or above 10x the steady p99.9, per
-//!   million, reported for **both** phases so the comparison is like-with-like
-//!   rather than against a constant.
-//!
-//! `gate_arithmetic_is_not_vacuous` in this file's tests injects a tail into a
-//! synthetic during-histogram and asserts the verdict flips to FAIL, so the
-//! arithmetic is demonstrated to be capable of failing rather than assumed to be.
-//!
-//! # Reading a result honestly
-//!
-//! The migration window contains a few hundred milliseconds of *one* event, so
-//! its p99.9 rests on far fewer samples than the steady-state figure it is
-//! divided by. `--repeat` exists for that reason: it performs N migrations in
-//! one run — each with a fresh owner — and merges every migration window into
-//! one histogram, so the tail is drawn from N events rather than one. A single
-//! migration is a probe; the default of 5 is the smallest thing worth quoting.
+//! `--repeat` performs N migrations, each with a fresh owner, merged into one
+//! histogram so the tail is drawn from N events; the default 5 is the smallest
+//! thing worth quoting.
 //!
 //! Run: `just owner-migration` (needs `--features shm`, Linux).
 
@@ -138,8 +93,7 @@ mod imp {
     use tf_tree_ipc::CreatePolicy;
 
     /// The chain every role agrees on: four dynamic edges over five frames, so a
-    /// `map -> tool` lookup composes all four and the reader's loop is a
-    /// realistic depth-3-plus query rather than a single interpolation.
+    /// `map -> tool` lookup composes all four.
     const CHAIN: &[(&str, &str)] = &[
         ("map", "odom"),
         ("odom", "base"),
@@ -147,27 +101,17 @@ mod imp {
         ("arm", "tool"),
     ];
 
-    /// Ring slots per edge. Large enough that the writer's rate and the reader's
-    /// query offset leave a comfortable retained window — this benchmark is
-    /// about the control plane, and a ring that wraps under the reader would put
-    /// `Extrapolation` into the "failed lookups" count for a reason that has
-    /// nothing to do with ownership.
+    /// Ring slots per edge: large enough that the ring does not wrap under the
+    /// reader, which would put `Extrapolation` in the "failed lookups" count.
     const SLOTS: u32 = 4096;
 
     /// Publish rate of the never-killed writer, per edge.
     const PUBLISH_HZ: f64 = 500.0;
 
-    /// How far behind the shared clock a reader queries.
-    ///
-    /// Comfortably more than one publish interval so an ordinary read is
-    /// interpolating between two retained samples rather than racing the
-    /// writer's newest push, and comfortably less than the retained span
-    /// (4096 slots at 500 Hz is ~8 s).
-    ///
-    /// **50 ms rather than 20** because the writer shares this host with the
-    /// readers: the margin has to absorb a scheduling gap, or the run measures
-    /// the scheduler. The catch-up loop in [`run_writer`] is the other half of
-    /// that, and the two are sized together.
+    /// How far behind the shared clock a reader queries: more than one publish
+    /// interval, less than the retained span (4096 slots at 500 Hz is ~8 s). 50 ms
+    /// because the writer shares the host and the margin must absorb a scheduling gap;
+    /// sized with the catch-up loop in [`run_writer`].
     const QUERY_LAG_NS: i64 = 50_000_000;
 
     /// Wall time covered by one reader histogram line.
@@ -175,24 +119,15 @@ mod imp {
 
     /// Linear buckets; index `HIST_BUCKETS` is the overflow.
     const HIST_BUCKETS: usize = 65_536;
-    /// Nanoseconds per histogram bucket.
-    ///
-    /// **2 ns, not 10, and the difference is a third of the gate.** A lookup's
-    /// p99.9 lands in the high hundreds of nanoseconds on this fixture, where
-    /// 10 ns buckets quantize the answer at ~2.3% — against a gate stated at
-    /// 5%, so the instrument would be spending half the budget it is measuring
-    /// against. At 2 ns the quantization is ~0.5% and the tail still fits:
-    /// 2 ns x 65 536 is 131 us, and anything past that lands in the overflow
-    /// with `max_ns` tracked exactly.
+    /// Nanoseconds per histogram bucket. **2 ns, not 10**: a p99.9 in the high
+    /// hundreds of ns quantizes at ~2.3% with 10 ns buckets, against a 5% gate. 2 ns x
+    /// 65 536 is 131 us; beyond that is the overflow, with `max_ns` tracked exactly.
     const BUCKET_NS: u64 = 2;
 
-    /// How long after the kill a window still counts as "during the migration".
-    ///
-    /// Wide enough to cover the vacancy, the heir's `F_OFD_SETLK` and its bind —
-    /// measured at 0.4-2.2 ms on this host — with room for the settling after
-    /// it, and **no wider**: the first revision's 750 ms made the
-    /// during-histogram 99.7% ordinary steady-state samples. See *What the ratio
-    /// can and cannot detect* in the module header.
+    /// How long after the kill a window still counts as "during the migration": wide
+    /// enough for the vacancy, the heir's `F_OFD_SETLK` and its bind (0.4-2.2 ms
+    /// measured) plus settling, **no wider** (see *What the ratio can and cannot
+    /// detect*).
     const MIGRATION_WINDOW: Duration = Duration::from_millis(250);
 
     struct Args {
@@ -264,12 +199,8 @@ mod imp {
         b
     }
 
-    /// Wall-clock nanoseconds — the shared stamp domain, as in `shm_torture`.
-    ///
-    /// Writers and readers are different processes with no channel between them,
-    /// so the stamp has to come from something both can name. A per-process
-    /// counter gives two unrelated timelines and every lookup lands outside the
-    /// ring.
+    /// Wall-clock nanoseconds, the shared stamp domain (as `shm_torture`): the
+    /// processes have no other channel.
     fn now_nanos() -> i64 {
         let d = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -336,12 +267,8 @@ mod imp {
             self.count == 0
         }
 
-        /// Nearest-rank percentile, in nanoseconds.
-        ///
-        /// Returns the **upper edge** of the containing bucket, so the answer is
-        /// never smaller than the truth. An overflow sample answers `max_ns`,
-        /// which is exact — the maximum is tracked outside the buckets for
-        /// exactly this reason.
+        /// Nearest-rank percentile in nanoseconds: the **upper edge** of the containing
+        /// bucket, never below the truth; an overflow sample answers the exact `max_ns`.
         fn pct(&self, p: f64) -> u64 {
             if self.count == 0 {
                 return 0;
@@ -357,11 +284,8 @@ mod imp {
             self.max_ns
         }
 
-        /// How many samples landed at or above `ns`.
-        ///
-        /// The statistic a percentile cannot give: one stalled lookup in a
-        /// window of a million is p99.9999, invisible to every percentile this
-        /// gate quotes, but it moves this count by exactly one.
+        /// How many samples landed at or above `ns`: the statistic a percentile cannot
+        /// give (one stall in a million moves this by one).
         fn at_or_above(&self, ns: u64) -> u64 {
             let first = (ns / BUCKET_NS) as usize;
             let tail: u64 = self.buckets.iter().skip(first).map(|c| u64::from(*c)).sum();
@@ -413,9 +337,7 @@ mod imp {
             .open()
             .context("owner could not create or join the arena")?;
         say("ready");
-        // **Hold the tree.** Dropping it would stop serving the rendezvous, so
-        // the binding below is what keeps this process an owner; the loop only
-        // keeps the scope alive.
+        // **Hold the tree**: dropping it stops serving the rendezvous.
         let _owner = tree;
         loop {
             std::thread::sleep(Duration::from_secs(3600));
@@ -424,17 +346,15 @@ mod imp {
 
     /// Joins read-write, claims the chain, and publishes for the whole run.
     fn run_writer() -> Result<()> {
-        // `claim_owned` is defined on `Arc<Tree>` (`0017`): an owned writer
-        // outlives the borrow a scoped `claim` would take, which is what lets the
-        // publish loop below hold four of them at once.
+        // `claim_owned` (`0017`): an owned writer outlives a scoped `claim`, so the
+        // loop can hold four.
         let tree = std::sync::Arc::new(join_rw("writer")?);
         let mut writers = Vec::new();
         for (parent, child) in CHAIN {
             let p = tree.frame(parent).context("interning a parent frame")?;
             let c = tree.frame(child).context("interning a child frame")?;
             writers.push(
-                // **`(child, parent)`, in that order** — a claim is keyed on
-                // the child, because an edge is named by the frame it attaches.
+                // `(child, parent)`, in that order: a claim is keyed on the child.
                 tree.claim_owned(c, p)
                     .with_context(|| format!("claiming {parent}->{child}"))?,
             );
@@ -442,18 +362,10 @@ mod imp {
         let period = Duration::from_secs_f64(1.0 / PUBLISH_HZ);
         let period_ns = (1e9 / PUBLISH_HZ) as i64;
 
-        // **Backfill before reporting ready, and this is load-bearing.** A
-        // reader queries `now - QUERY_LAG_NS`; if the writer says `ready` and
-        // *then* starts publishing, every reader spends the first
-        // `QUERY_LAG_NS` of its life querying a stamp older than the oldest
-        // sample and getting `Extrapolation` back. Those are real refusals, and
-        // they would land in gate 4b's "zero failed lookups" as a startup
-        // artefact that has nothing to do with ownership — the first run of this
-        // binary reported 295 854 of them and every one was this.
-        //
-        // Stamps are wall-clock, so the fill is written *at* the past instants
-        // it claims: monotonic within each edge, and indistinguishable from a
-        // writer that had simply been running already.
+        // **Backfill before reporting ready, load-bearing**: else each reader's first
+        // `QUERY_LAG_NS` queries a stamp older than the oldest sample and gets
+        // `Extrapolation`, polluting "zero failed lookups". Stamps are wall-clock, so the
+        // fill is written at the past instants it claims.
         let start = now_nanos();
         let mut stamp = start - 3 * QUERY_LAG_NS;
         while stamp < start {
@@ -464,15 +376,9 @@ mod imp {
         }
         say("ready");
 
-        // **Catch up, do not skip.** A writer that publishes "now" once per wake
-        // leaves a hole exactly as wide as however long the scheduler kept it
-        // off-CPU; the reader, querying `now - QUERY_LAG_NS`, then gets
-        // `Extrapolation` with `newest` behind its stamp. Measured on a loaded
-        // host that produced 102 409 such refusals in one run — every one of
-        // them a statement about this machine's scheduler and none about the
-        // arena. Backfilling the gap on wake keeps the ring covering
-        // `[now - lag, now]` whatever the scheduler did, so what the gate sees
-        // is the arena.
+        // **Catch up, do not skip**: publishing "now" once per wake leaves a hole as
+        // wide as the scheduler's off-CPU time, and readers get `Extrapolation` for a
+        // reason about the scheduler, not the arena.
         let mut next = now_nanos();
         loop {
             let now = now_nanos();
@@ -498,15 +404,13 @@ mod imp {
                     Err(e) => say(&format!("inherit error {e}")),
                 }
             }
-            // ~1 kHz. The vacancy this is watching for is milliseconds wide.
+            // ~1 kHz; the vacancy is milliseconds wide.
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    /// Read-only, tight `Plan::at` loop, one histogram line per [`WINDOW`].
-    ///
-    /// **No control-plane call appears in this function** — that is what makes its
-    /// numbers an answer to 4b rather than a measurement of the poll.
+    /// Read-only, tight `Plan::at` loop, one histogram line per [`WINDOW`]. **No
+    /// control-plane call appears here**, so its numbers answer 4b, not the poll.
     fn run_reader() -> Result<()> {
         let tree = tf_tree::Open::new()
             .mode(AttachMode::ReadOnly)
@@ -532,12 +436,8 @@ mod imp {
             let dt = t0.elapsed();
             match r {
                 Ok(_) => hist.record(u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX)),
-                // **The kind is kept, not just the count.** "Zero failed
-                // lookups" is gate 4b's claim about the *migration*; a refusal
-                // whose reason is "the writer has not published recently enough"
-                // is a statement about the host's scheduler, and conflating the
-                // two would let a loaded machine fail the arena, or let a real
-                // refusal hide behind a plausible excuse.
+                // **The kind is kept, not just the count**: a `stale` refusal (writer not
+                // publishing recently enough) is about the host's scheduler, not the migration.
                 Err(e) => {
                     fails += 1;
                     let kind = match e {
@@ -545,34 +445,12 @@ mod imp {
                             if stamp.nanos() > newest {
                                 "stale"
                             } else if oldest > newest {
-                                // **A torn bounds pair, from one ring — not,
-                                // as this comment first claimed, an empty
-                                // intersection across the composed path.**
-                                // `LookupError::Extrapolation` names a single
-                                // `edge` (`tf_tree_core::error`), so these are
-                                // one ring's bounds and never an intersection.
-                                //
-                                // `SampleCursor::sample` reads them with two
-                                // independent `Relaxed` loads —
-                                // `stamp_at(lo_logical)` then
-                                // `stamp_at(newest)`, no seqlock, deliberately,
-                                // because they are bounds probes rather than
-                                // sample reads. A writer that laps the ring
-                                // between the two leaves the older slot holding
-                                // a *newer* stamp than the one already read,
-                                // and the pair inverts by however many slots it
-                                // advanced: two, at the 4 ms seen against a
-                                // 2 ms publish period.
-                                //
-                                // The refusal is still correct; only the
-                                // reported pair is inconsistent. Roughly one in
-                                // 4e7 lookups, and as common in the steady
-                                // phase as in the migration window - which is
-                                // what makes it a property of the ring rather
-                                // than anything ownership did. Counted and
-                                // printed separately; never silently dropped.
-                                // `docs/PHASE2.md` §12.3 carries the analysis
-                                // and why the fix is a decision record.
+                                // **A torn bounds pair from one ring, not an empty intersection across the
+                                // path.** `SampleCursor::sample` reads the two bounds with independent `Relaxed`
+                                // loads (bounds probes, no seqlock), so a writer lapping the ring between them
+                                // inverts the pair. The refusal is still correct; roughly one in 4e7 lookups,
+                                // equally common in both phases, so a property of the ring. Counted and printed
+                                // separately (`docs/PHASE2.md` §12.3 has the analysis).
                                 "torn-bounds"
                             } else {
                                 "early"
@@ -624,7 +502,7 @@ mod imp {
             .with_context(|| format!("{who} could not join"))
     }
 
-    /// One line to stdout, flushed — the driver reads these as they happen.
+    /// One line to stdout, flushed: the driver reads them as they happen.
     fn say(msg: &str) {
         let out = std::io::stdout();
         let mut lock = out.lock();
@@ -682,18 +560,13 @@ mod imp {
         }
     }
 
-    /// One reader's stream, drained on its own thread into timestamped windows.
-    ///
-    /// The arrival stamp is taken **in the driver's clock**, which is what lets
-    /// the driver classify windows against its own `SIGKILL` instant.
+    /// One reader's stream, drained on its own thread into windows stamped on
+    /// arrival in the driver's clock.
     type Window = (Instant, u64, u64, u64, Hist);
 
-    /// `sink` is taken **by value on purpose**, against
-    /// `clippy::needless_pass_by_value`: `send` only needs `&self`, but this
-    /// thread owning the `Sender` is what closes the channel when it returns.
-    /// Borrowing it would leave the driver's `recv_timeout` unable to tell a
-    /// reader that exited from one that is merely quiet, which is the difference
-    /// between `Disconnected` and `Timeout` in [`drive`].
+    /// `sink` is taken **by value on purpose** (`clippy::needless_pass_by_value`): this
+    /// thread owning the `Sender` is what closes the channel, so [`drive`] can tell
+    /// `Disconnected` from `Timeout`.
     #[allow(clippy::needless_pass_by_value)]
     fn drain_reader(
         mut reader: BufReader<std::process::ChildStdout>,
@@ -749,8 +622,7 @@ mod imp {
             let ok = tf_tree::Open::new()
                 .mode(AttachMode::ReadOnly)
                 .create(CreatePolicy::Never)
-                // Short, because this is a poll: a long timeout here would
-                // measure the timeout rather than the recovery.
+                // Short: a long timeout would measure the timeout.
                 .timeout(Duration::from_millis(20))
                 .open()
                 .is_ok();
@@ -823,19 +695,11 @@ mod imp {
         let mut recoveries: Vec<Duration> = Vec::new();
         let mut inherited = 0usize;
 
-        // **Every window is classified by its own arrival stamp, in every
-        // phase.** An earlier revision decided a window's phase by *which loop
-        // received it*, which is wrong whenever recovery outruns
-        // `MIGRATION_WINDOW`: `time_to_serving` may spend up to 10 s, so
-        // `killed_at + MIGRATION_WINDOW` can already be in the past when the
-        // migration loop starts, its body never runs, and the settle loop then
-        // charges the migration's own samples to `steady`. That inflates the
-        // denominator of the 4b quotient and biases the gate toward PASS on
-        // exactly the loaded hosts where a regression would show.
-        //
-        // A window belongs to the migration if it arrived inside
-        // `[killed_at, killed_at + MIGRATION_WINDOW)`, whoever is reading the
-        // channel at the time. `None` means no migration has happened yet.
+        // **Every window is classified by its own arrival stamp**, in every phase: a
+        // window belongs to the migration if it arrived in `[killed_at, killed_at +
+        // MIGRATION_WINDOW)`. Classifying by receiving loop charges migration samples to
+        // `steady` when recovery outruns the window, biasing the gate toward PASS on
+        // loaded hosts. `None` means no migration yet.
         let mut killed_at: Option<Instant> = None;
 
         macro_rules! take {
@@ -892,9 +756,7 @@ mod imp {
                 }
             }
 
-            // ---- drain the migration window, then settle ------------------
-            //
-            // One loop for both: `take!` files each window by its arrival stamp.
+            // Drain the migration window, then settle; `take!` files each window by arrival.
             let window_end = killed_at.unwrap_or_else(Instant::now) + MIGRATION_WINDOW;
             let until = window_end.max(Instant::now()) + a.settle;
             while Instant::now() < until {
@@ -902,9 +764,8 @@ mod imp {
             }
 
             if round < a.repeat {
-                // The heir that just inherited is the owner now. Kill it next
-                // round: re-point `owner` at it and start a fresh heir, so every
-                // round kills a *serving* owner rather than the same process.
+                // The heir is the owner now: re-point `owner` at it and start a fresh heir, so
+                // every round kills a *serving* owner.
                 inherited += 1;
                 let mut next_heir = Kid::spawn(&exe, &dir, "heir")?;
                 next_heir
@@ -995,15 +856,9 @@ mod imp {
         let ratio = if s999 > 0.0 { d999 / s999 } else { f64::NAN };
         let fails = steady_fails + during_fails;
 
-        // **Exactly 10x the steady p99.9, with no floor.** This carried a
-        // `.max(10_000)` floor, and on this fixture the floor always won:
-        // `s999` lands in the high hundreds of nanoseconds, so 10x is ~4 300 ns
-        // and every run printed `10000 ns` while labelling it "10x steady
-        // p99.9" — roughly 23x, less sensitive than documented and mislabelled
-        // in the output, in `docs/benchmarks/EVIDENCE.md` and in
-        // `docs/PHASE2.md`. A constant would mean something different on
-        // every machine, which is the thing the multiplier exists to avoid.
-        // `report` has already refused an empty phase, so `s999` is non-zero.
+        // **Exactly 10x the steady p99.9, with no floor**: a `.max(10_000)` floor always
+        // won on this fixture and made the gate ~23x while labelled 10x. `report` has
+        // refused an empty phase, so `s999` is non-zero.
         let stall_ns = (s999 as u64).saturating_mul(10);
         let s_stalls = steady.at_or_above(stall_ns);
         let d_stalls = during.at_or_above(stall_ns);
@@ -1043,14 +898,9 @@ mod imp {
             MIGRATION_WINDOW.as_millis()
         );
 
-        // **A starved writer invalidates the run; it does not fail the gate.**
-        // A `stale` refusal means the reader's stamp was newer than the newest
-        // sample — the writer had not published recently enough — which is a
-        // statement about this host's scheduler and not about the arena.
-        // Reporting it as a 4b failure would attribute the machine's behaviour
-        // to the code, which is the exact misattribution this project has
-        // shipped before. It is loud and non-zero either way: an unusable
-        // measurement must not look like a pass.
+        // **A starved writer invalidates the run; it does not fail the gate.** A `stale`
+        // refusal is about this host's scheduler, not the arena. Loud and non-zero either
+        // way.
         if stale > 0 {
             println!("\n  INVALID");
             bail!(
@@ -1063,12 +913,10 @@ mod imp {
             );
         }
 
-        // **The torn bounds pair, stated rather than absorbed.** `disjoint`
-        // counts the inverted-window refusals `run_reader` analyses: one ring's
-        // two bounds, not an empty intersection across the composed path, and
-        // equally common in both phases. Subtracting it from the 4b count is a
-        // judgement, so the arithmetic is printed and the unsubtracted totals
-        // appear above it.
+        // **The torn bounds pair, stated rather than absorbed**: `disjoint` counts the
+        // inverted-window refusals `run_reader` analyses, equally common in both phases.
+        // Subtracting it is a judgement, so the arithmetic is printed with the
+        // unsubtracted totals above it.
         if disjoint > 0 {
             println!(
                 "\n  note: {disjoint} refusal(s) reported a torn bounds pair (oldest > \
@@ -1113,11 +961,8 @@ mod imp {
             h
         }
 
-        /// **The negative control for the gate's arithmetic.**
-        ///
-        /// A gate that has never been observed to fail is a gate nobody has
-        /// tested. This drives the same quotient the run prints: a clean pair
-        /// passes, and a during-phase whose tail is dragged past 5% fails.
+        /// **The negative control for the gate's arithmetic**: a clean pair passes and a
+        /// during-phase with a tail dragged past 5% fails.
         #[test]
         fn gate_arithmetic_is_not_vacuous() {
             let steady = flat(100_000, 300);
@@ -1126,8 +971,7 @@ mod imp {
                 "a phase compared against itself must pass"
             );
 
-            // 0.5% of the during-phase stalled well past the steady tail: more
-            // than the 0.1% a p99.9 looks at, so the percentile moves.
+            // 0.5% of the during-phase stalled: more than the 0.1% a p99.9 looks at.
             let mut during = flat(99_500, 300);
             for _ in 0..500 {
                 during.record(50_000);
@@ -1147,8 +991,7 @@ mod imp {
             assert!(!gate_4b_holds(1.0, 1));
         }
 
-        /// The stall count sees what the percentile cannot: one slow sample in
-        /// a million moves no percentile this gate quotes.
+        /// The stall count sees what the percentile cannot.
         #[test]
         fn the_stall_count_sees_a_single_stall_that_no_percentile_does() {
             let clean = flat(1_000_000, 300);
@@ -1165,8 +1008,7 @@ mod imp {
             assert_eq!(stalled.at_or_above(10_000), 1);
         }
 
-        /// `pct` answers the upper edge of the containing bucket, so it never
-        /// under-reports, and the overflow keeps an exact maximum.
+        /// `pct` answers the containing bucket's upper edge; the overflow keeps an exact maximum.
         #[test]
         fn percentiles_round_outward_and_the_overflow_keeps_its_max() {
             let h = flat(1_000, 301);

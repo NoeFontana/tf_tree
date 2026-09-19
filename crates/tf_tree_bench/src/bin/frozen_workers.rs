@@ -1,59 +1,32 @@
-//! **`docs/PHASE5.md` §12 gate 4**, which nothing has ever run: *16 workers
-//! sharing one `.tft`, total Pss within 1.2× of one worker.*
+//! **`docs/PHASE5.md` §12 gate 4**: *16 workers sharing one `.tft`, total Pss
+//! within 1.2x of one worker.*
 //!
-//! # Why this had never been measured
+//! `just bench-report`'s `tft_16_workers_rss` row is `UNAVAILABLE` because the
+//! report binary is built without `shm`, hence this separate binary; and Pss is not
+//! a timing measurement (`report.rs`'s `Sensitivity::Memory`), so sixteen workers
+//! on fewer cores share the same pages. `S`, `p` and the criterion are defined in
+//! `docs/PHASE5.md` §12 criterion 4; `--robots`/`--history` default to a shape in
+//! range.
 //!
-//! `just bench-report`'s `tft_16_workers_rss` row has always been `UNAVAILABLE`,
-//! and for two reasons that both dissolved:
+//! # The vacuous pass avoided
 //!
-//! * the report binary is built without `shm`, so there is no `Tree::open_frozen`
-//!   in it to call — true, and the reason it is a separate binary here;
-//! * the core budget refused it, on the grounds that sixteen consumers on four
-//!   physical cores measure the scheduler. `report.rs`'s `Sensitivity::Memory`
-//!   axis retired that: **sixteen workers mapping one `.tft` share exactly the
-//!   pages they would share on sixteen cores.** Pss is not a timing measurement.
+//! `open_frozen` is an `mmap`; a worker that never reads it has `S ~ 0` and a
+//! meaningless ratio. **Every worker sweeps lookups across the whole stamp window
+//! before reporting.** `--no-touch` shows the difference and warns. The default arm
+//! re-executes this binary with `--worker`; `--python <interpreter>` uses
+//! `python/gate4_worker.py` instead.
 //!
-//! # What the gate is actually asking, and why the `.tft` must be big
+//! # `--gate`
 //!
-//! `docs/PHASE5.md` §12 criterion 4, which defines `S` and `p`: *Three things
-//! about this measurement* and *Amendment — 1.024× is a statement about a Rust
-//! worker*. `--robots`/`--history` default to a shape that lands in range.
+//! `docs/PHASE5.md` §12 criterion 4. The gate is stated over the Rust arm and the
+//! Python arm reports without gating (§12 gate 4's amendment), so gating is a flag:
+//! `just gate4` passes `--gate`, `just gate4-python` does not. Refused at parse:
 //!
-//! # The vacuous pass this deliberately avoids
+//! * `--gate --python`: the deferred second gated arm needs a record;
+//! * `--gate --no-touch`: the control is documented to FAIL at 5.32x.
 //!
-//! `open_frozen` is an `mmap`. A worker that maps the file and never reads it
-//! has almost no resident share of it, `S ≈ 0`, and the ratio collapses to
-//! `16p/p = 16` — or, if the private cost were also small, to a meaningless
-//! pass. **Every worker sweeps lookups across the whole stamp window before
-//! reporting**, so the pages counted are pages actually read. `--no-touch`
-//! exists only to show the difference, and prints a warning saying so.
-//!
-//! The default arm is this binary re-executed with `--worker`; `--python
-//! <interpreter>` runs the same measurement with `python/gate4_worker.py` as
-//! the worker instead.
-//!
-//! # `--gate` — the caller says whether this run is a gate
-//!
-//! `docs/PHASE5.md` §12 criterion 4, *Correction — until 2026-09-04 this
-//! criterion was measured and not gated*.
-//!
-//! **The exit status is not the binary's to guess**, because §12 gate 4 is
-//! stated over the Rust arm and the Python arm deliberately reports without
-//! gating (§12 gate 4's amendment: "giving the gate a second *gated* arm is a
-//! decision and needs a record"). So gating is a flag the caller passes:
-//! `just gate4` passes `--gate` and `just gate4-python` does not. Two
-//! combinations are refused at argument parse rather than left to a recipe's
-//! discipline:
-//!
-//! * `--gate --python` — that is the second gated arm the amendment defers, and
-//!   a flag pair is exactly how it would arrive without a record;
-//! * `--gate --no-touch` — the control measures unread mappings and is
-//!   *documented* to FAIL at 5.32x, so gating on it asserts a number nobody
-//!   claims.
-//!
-//! Under `--gate`, a run that cannot evaluate the criterion (no N = 1 row, no
-//! N = 16 row) **refuses** rather than returning 0 having printed why: a gate
-//! that cannot check its property must not look like one that checked it.
+//! Under `--gate`, a run with no N = 1 or N = 16 row **refuses** rather than
+//! exiting 0.
 //!
 //! # Usage
 //!
@@ -79,14 +52,8 @@ use tf_tree_bench::workload::{Backing, QuerySpec, Topology, Workload};
 /// §12 gate 4's threshold.
 const GATE: f64 = 1.2;
 
-/// §12 gate 4's criterion, as one expression both the verdict line and the exit
-/// status are taken from.
-///
-/// A free function rather than an inline comparison so that
-/// `gate_arithmetic_is_not_vacuous` can drive it without spawning sixteen
-/// processes — `owner_migration.rs`'s `gate_4b_holds` is the same shape, for
-/// the same reason: a gate that has never been observed to fail is a gate
-/// nobody has tested.
+/// §12 gate 4's criterion, one expression for the verdict line and exit status;
+/// a free function so `gate_arithmetic_is_not_vacuous` can drive it.
 fn gate_4_holds(ratio: f64) -> bool {
     ratio <= GATE
 }
@@ -94,14 +61,9 @@ fn gate_4_holds(ratio: f64) -> bool {
 /// Worker counts the gate is stated over.
 const DEFAULT_WORKERS: &[usize] = &[1, 16];
 
-/// The stamp window a sweep walks, in nanoseconds — the default fixture's 40 s
-/// of history.
-///
-/// Passed to a Python worker on its command line rather than restated in that
-/// file, so the two arms cannot drift into sweeping different query sets. It
-/// does *not* track `--history`: a shorter fixture leaves part of the grid
-/// outside every edge's window, which both arms report identically in the
-/// `lookups` column.
+/// The stamp window a sweep walks, in nanoseconds (the default fixture's 40 s).
+/// Passed to a Python worker so the arms sweep the same queries; it does not track
+/// `--history`.
 const SWEEP_WINDOW_NS: i64 = 40_000_000_000;
 
 fn main() -> Result<()> {
@@ -111,15 +73,12 @@ fn main() -> Result<()> {
     let mut history = 40.0f64;
     let mut workers: Vec<usize> = DEFAULT_WORKERS.to_vec();
     let mut touch = true;
-    // Stamps swept per edge — i.e. how much of the arena a worker's working set
-    // covers. **Not a tuning knob for the verdict.** The gate's outcome depends
-    // on it, which is the finding, so the driver reports the curve over several
-    // values rather than one number from one arbitrary pattern.
+    // Stamps swept per edge (the working set). Not a tuning knob: the outcome
+    // depends on it, so the driver reports a curve.
     let mut stamps = 64usize;
     let mut interpreter: Option<PathBuf> = None;
     let mut py_worker: Option<PathBuf> = None;
-    // **Whether this run is a gate is the caller's statement, not an inference
-    // from the arm.** See the `--gate` section of this file's header.
+    // Whether this run is a gate is the caller's statement (header, `--gate`).
     let mut gate = false;
 
     let mut args = std::env::args().skip(1);
@@ -196,10 +155,7 @@ fn main() -> Result<()> {
             }
             Arm::Rust
         }
-        // The default is baked in at compile time, so the binary can be run
-        // from anywhere the way the `just gate4` comment suggests. This crate
-        // is `publish = false`, so the absolute build-machine path costs
-        // nobody anything.
+        // Baked in at compile time so the binary runs from anywhere (`publish = false`).
         Some(interpreter) => Arm::Python {
             interpreter,
             script: py_worker.unwrap_or_else(|| {
@@ -208,9 +164,7 @@ fn main() -> Result<()> {
         },
     };
 
-    // **The two `--gate` combinations that are refused rather than obeyed.**
-    // Both are decisions this binary is not entitled to make, and both would
-    // arrive as a flag pair in a recipe rather than as a record.
+    // The two `--gate` combinations refused rather than obeyed; both need a record.
     if gate {
         if let Arm::Python { .. } = arm {
             bail!(
@@ -244,25 +198,17 @@ enum Mode {
     Drive,
 }
 
-/// What every worker is asked to do, carried as one value.
-///
-/// The two travel together everywhere — the driver hands both to each child on
-/// its command line, and both belong to the *measurement* rather than to the
-/// verdict, which is why `gate` is not in here.
+/// What every worker is asked to do; belongs to the measurement, not the verdict.
 #[derive(Clone, Copy)]
 struct Sweep {
     /// Whether workers read the mapping they open. `false` is the control.
     touch: bool,
-    /// Stamps swept per edge — how much of the arena a worker's working set
-    /// covers.
+    /// Stamps swept per edge.
     stamps: usize,
 }
 
-/// Which program the driver spawns as a worker.
-///
-/// The two arms differ in the worker and in nothing else — same fixture, same
-/// stamp grid, same barrier, same `smaps_rollup` read — because the finding
-/// they exist to separate is that `p` belongs to the worker.
+/// Which program the driver spawns. The arms differ only in the worker: `p`
+/// belongs to the worker.
 enum Arm {
     Rust,
     Python {
@@ -272,9 +218,7 @@ enum Arm {
 }
 
 impl Arm {
-    /// The word the verdict line is cited with. §12 gate 4's amendment: a
-    /// qualification that does not travel with the number it qualifies has not
-    /// been written down anywhere useful.
+    /// The word the verdict line is cited with (§12 gate 4's amendment).
     fn language(&self) -> &'static str {
         match self {
             Arm::Rust => "Rust",
@@ -283,12 +227,8 @@ impl Arm {
     }
 }
 
-/// A fleet workload big enough for the gate to be about sharing.
-///
-/// Constructed here rather than taken from `workload::by_name`, because the
-/// named table tops out at `extreme_wide` (512 robots × 1 s ≈ 46 MiB) and the
-/// arithmetic above needs roughly five times that. The shape is a `Fleet`
-/// exactly like `fleet_64`; only the history is longer.
+/// A fleet workload big enough for the gate to be about sharing: `fleet_64`'s
+/// shape with longer history, since `workload::by_name` tops out near 46 MiB.
 fn spec(robots: usize, history: f64) -> Workload {
     Workload {
         name: "gate4_fleet",
@@ -315,9 +255,7 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
         est.arena_bytes as f64 / (1024.0 * 1024.0)
     );
     let built = w.build(tf_tree::InterpPolicy::LerpSlerp, Backing::Heap)?;
-    // `source_digest` all-zero and `source` None: this arena came from a
-    // synthesized workload, not a recording, which is exactly the `--from-live`
-    // case `freeze_to` documents.
+    // All-zero `source_digest`, `source` None: synthesized, as `freeze_to` documents.
     let header = built
         .tree
         .freeze_to(path, None, [0u8; 32], 0)
@@ -332,31 +270,17 @@ fn build(path: &Path, robots: usize, history: f64) -> Result<()> {
     Ok(())
 }
 
-/// One worker: map the `.tft`, read it, report Pss, then hold the mapping open
-/// until stdin closes.
-///
-/// **Holding it open is the whole point.** The driver measures while every
-/// worker is alive; a worker that exited would have its pages unmapped and the
-/// sum would be of processes that no longer share anything.
+/// One worker: map the `.tft`, read it, report Pss, then hold the mapping until
+/// stdin closes; an exited worker would unmap and the sum would share nothing.
 fn worker(path: &Path, touch: bool, stamps: usize) -> Result<()> {
     let tree = Tree::open_frozen(path).map_err(|e| anyhow!("opening {}: {e:?}", path.display()))?;
 
     let read = if touch { sweep(&tree, stamps)? } else { 0 };
 
-    // **Two phases, and the barrier between them is not optional.**
-    //
-    // Pss divides each shared page by the number of processes *currently*
-    // mapping it. A worker that reports as soon as it finishes sweeping is
-    // measured while later workers have not faulted the pages in yet, so its
-    // share is divided by three rather than by sixteen — and the total comes out
-    // inflated. The first version of this binary did exactly that, and the tell
-    // was that the solved-for private cost per worker *grew with sweep length*
-    // (3.4 MiB at 16 stamps/edge to 10.8 MiB at 4096), which is not a thing
-    // private memory does. Longer sweep, more skew between first and last
-    // finisher, more inflation.
-    //
-    // So: announce readiness, block until the driver has heard from all of
-    // them, and only then read `smaps_rollup`.
+    // Two phases with a barrier. Pss divides a shared page by the processes
+    // *currently* mapping it, so a worker that reports early is divided by too few
+    // and the total inflates. So: announce readiness, block until the driver has
+    // heard from all, then read `smaps_rollup`.
     println!("ready {read}");
     std::io::stdout().flush()?;
 
@@ -378,21 +302,13 @@ fn worker(path: &Path, touch: bool, stamps: usize) -> Result<()> {
     Ok(())
 }
 
-/// Read across the whole tree so the pages counted are pages actually touched.
-///
-/// A dataloader worker's access pattern is the reason this is a *sweep* rather
-/// than a hot loop on one pair: it walks every plan across the full stamp
-/// window, which is what faults in the sample rings. Returns the number of
-/// successful lookups, printed so a run that silently answered nothing cannot
-/// be mistaken for a run that shared everything.
+/// Read across the whole tree so the pages counted are pages touched. Returns
+/// the successful lookup count, printed so a silent no-op is visible.
 fn sweep(tree: &Tree, stamps: usize) -> Result<u64> {
     let mut ok = 0u64;
     let guard = tree.guard();
-    // `Tree::edges()` — every declared `(parent, child)`. Better than walking
-    // frames: one plan per edge reads that edge's ring, so the sweep touches
-    // every sample region in the file rather than only those on paths back to
-    // some chosen root. That is what makes `S` the whole `.tft` and not a
-    // fraction of it.
+    // `Tree::edges()`: one plan per edge reads every edge's ring, so `S` is the
+    // whole `.tft`.
     let edges = tree
         .edges()
         .map_err(|e| anyhow!("enumerating the frozen tree's edges: {e:?}"))?;
@@ -404,11 +320,8 @@ fn sweep(tree: &Tree, stamps: usize) -> Result<u64> {
             continue;
         };
         let Ok(plan) = tree.plan(t, s) else { continue };
-        // Stamps spread across the whole history rather than one: a single
-        // stamp lands in one cache line of the ring and would leave most of it
-        // unread, which is the vacuous-pass failure this binary exists to
-        // avoid. The step shrinks as `stamps` grows, so a larger count means a
-        // denser walk of the same window, not a longer one.
+        // Stamps spread across the whole history: a single stamp touches one cache line
+        // of the ring.
         let step = (SWEEP_WINDOW_NS / stamps.max(1) as i64).max(1);
         for k in 0..stamps as i64 {
             let stamp = tf_tree::Stamp::<tf_tree::SystemDomain>::from_nanos(k * step);
@@ -429,9 +342,8 @@ fn drive(
     arm: &Arm,
     gate: bool,
 ) -> Result<()> {
-    // Checked before anything is built or spawned: a missing script otherwise
-    // presents as sixteen tracebacks and a driver complaining about a `ready`
-    // line it never got.
+    // Checked before building or spawning: a missing script otherwise presents as
+    // sixteen tracebacks.
     if let Arm::Python { script, .. } = arm {
         if !script.exists() {
             bail!(
@@ -487,12 +399,8 @@ fn drive(
     }
     println!();
 
-    // The gate is stated against one worker, so it needs the N = 1 row.
-    //
-    // **Under `--gate` an unevaluable run is a refusal**, not a zero exit with
-    // an explanation printed above it: `just gate4` pins `--workers 1,16`, so
-    // arriving here at all means the criterion was not evaluated, and a job
-    // that goes green on that is the vacuity this flag exists to remove.
+    // The gate needs the N = 1 row. **Under `--gate` an unevaluable run is a
+    // refusal**, not a zero exit.
     let Some(&(_, one)) = totals.iter().find(|(n, _)| *n == 1) else {
         println!("  no N = 1 row, so the gate cannot be evaluated — include 1 in --workers");
         if gate {
@@ -517,11 +425,8 @@ fn drive(
         arm.language()
     );
 
-    // The decomposition, because a bare ratio does not say *why*, and the two
-    // terms have completely different remedies: more sharing is a design
-    // property, less private is a process-count question.
-    //
-    // total(N) = S + N.p, so two rows solve for both.
+    // The decomposition, since a bare ratio does not say why: total(N) = S + N.p,
+    // so two rows solve for both.
     let n1 = 1.0;
     let n16 = 16.0;
     let private = (sixteen - one) / (n16 - n1);
@@ -547,11 +452,9 @@ fn drive(
         );
     }
 
-    // **This is the difference between a gate and a report**, and the caller
-    // chose which one this run is. `just gate4` passes `--gate`, so a
-    // regression of criterion 4 fails `nightly.yml`'s `gate4` job;
-    // `just gate4-python` does not, so it exits 0 on the FAIL it prints, which
-    // §12 gate 4's amendment states in as many words.
+    // The difference between a gate and a report: `just gate4` (`--gate`) fails
+    // `nightly.yml`'s `gate4` job; `just gate4-python` exits 0 on its FAIL (§12 gate 4's
+    // amendment).
     if gate && !holds {
         bail!(
             "PHASE5 §12 criterion 4 is not met on this host: {sixteen:.1} MiB / \
@@ -564,12 +467,7 @@ fn drive(
 }
 
 /// Spawn `n` workers, wait for every one to report, sum their Pss, then stop
-/// them.
-///
-/// **Every worker is alive when the sum is taken.** The children each print one
-/// line and then block on stdin, so the driver reads `n` lines before closing
-/// any of them; measuring as they exit would sum processes that had already
-/// dropped the mapping.
+/// them. Every worker is alive when the sum is taken.
 fn spawn_and_measure(
     me: &Path,
     tft: &Path,
@@ -579,10 +477,8 @@ fn spawn_and_measure(
 ) -> Result<(u64, u64)> {
     let mut kids = Vec::with_capacity(n);
     for _ in 0..n {
-        // Spawned in both arms, never forked. A forked Python worker inherits
-        // the parent's heap and measures a `p` no `DataLoader` on CPython 3.14
-        // pays — §4.3's amendment — and the Rust arm has never had another
-        // shape.
+        // Spawned, never forked: a forked Python worker inherits the parent's heap
+        // (§4.3's amendment).
         let (program, mut cmd) = match arm {
             Arm::Rust => {
                 let mut cmd = Command::new(me);
@@ -614,8 +510,7 @@ fn spawn_and_measure(
         kids.push(child);
     }
 
-    // Phase 1: every worker maps, sweeps and announces. Readers are kept so the
-    // second phase can go on reading the same pipes.
+    // Phase 1: every worker maps, sweeps and announces.
     let mut outs = Vec::with_capacity(n);
     let mut reads = 0u64;
     for (i, kid) in kids.iter_mut().enumerate() {
@@ -630,10 +525,8 @@ fn spawn_and_measure(
         let mut f = line.split_whitespace();
         match (f.next(), f.next()) {
             (Some("ready"), Some(r)) => reads += r.parse::<u64>().context("worker read count")?,
-            // An empty line is end-of-pipe: the worker died before reporting,
-            // and its own diagnosis is already on the inherited stderr above.
-            // For the Python arm that is almost always an interpreter with no
-            // extension installed in it.
+            // An empty line is end-of-pipe: the worker died before reporting; its
+            // diagnosis is on the inherited stderr.
             (None, _) => bail!(
                 "worker {i} exited without reporting — its stderr is above (Python arm: is \
                  the extension installed in that interpreter? `just gate4-python` does it)"
@@ -643,8 +536,7 @@ fn spawn_and_measure(
         outs.push(rdr);
     }
 
-    // The barrier. Every worker now holds the same pages, so every Pss taken
-    // after this divides by the same N.
+    // The barrier: every Pss after this divides by the same N.
     for (i, kid) in kids.iter_mut().enumerate() {
         let stdin = kid
             .stdin
@@ -679,17 +571,9 @@ fn spawn_and_measure(
 mod tests {
     use super::{gate_4_holds, GATE};
 
-    /// **The negative control for the gate's arithmetic.**
-    ///
-    /// `owner_migration.rs` states the reason and it applies verbatim here: a
-    /// gate that has never been observed to fail is a gate nobody has tested.
-    /// Until `--gate` existed this file's verdict was a string in a `println!`,
-    /// so there was no expression to drive and nothing to assert about.
-    ///
-    /// The three ratios are the measured ones, cited rather than invented:
-    /// 1.024x is §12 gate 4's **MET** with a Rust worker, 1.806x is
-    /// `just gate4-python`'s reading on the same file, and 5.32x is the
-    /// `--no-touch` control.
+    /// **The negative control for the gate's arithmetic**, as `owner_migration.rs`.
+    /// Ratios: 1.024x is §12 gate 4's **MET** with a Rust worker, 1.806x is `just
+    /// gate4-python`'s reading, 5.32x the `--no-touch` control.
     #[test]
     fn gate_arithmetic_is_not_vacuous() {
         assert!(gate_4_holds(1.024), "the measured Rust arm must PASS");
@@ -697,13 +581,8 @@ mod tests {
         assert!(!gate_4_holds(5.32), "the no-touch control must FAIL");
     }
 
-    /// The boundary is closed, and which side is which is stated rather than
-    /// left to a reader of `<=`.
-    ///
-    /// No tolerance: these are exact `f64` literals compared against the same
-    /// `f64` constant the run compares against, so the question is which way
-    /// the comparison rounds at the boundary and not whether two measurements
-    /// agree. `GATE` itself passes; one ULP above it does not.
+    /// The boundary is closed: `GATE` itself passes, one ULP above does not (exact
+    /// `f64` literals against the run's own constant).
     #[test]
     fn the_threshold_is_inclusive_and_one_ulp_above_it_fails() {
         assert!(gate_4_holds(GATE), "1.2x exactly is within 1.2x");

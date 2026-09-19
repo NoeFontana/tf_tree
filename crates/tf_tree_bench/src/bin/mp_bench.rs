@@ -1,24 +1,14 @@
 //! Multi-process evaluation: N consumer nodes, one publisher, both engines.
 //!
-//! The question this answers is the deployment question — *sixteen nodes each
-//! need transforms at their own rate; what does each experience, and what does
-//! it cost the machine?* — rather than `shm_scaling`'s roofline question, *how
-//! many lookups can N processes extract in total?*
+//! The deployment question (*N nodes each need transforms at their own rate; what
+//! does each experience and what does it cost the machine?*), not `shm_scaling`'s
+//! roofline. What differs is documented in `src/mp.rs`: open-loop schedule, live
+//! publisher, per-consumer tail latency and CPU, and PSS instead of summed RSS.
 //!
-//! What is different, and why, is documented in `src/mp.rs`. In one line each:
-//! an open-loop schedule so a slow tick shows up as latency instead of as fewer
-//! samples; a live publisher so the seqlock and tf2's mutex are actually
-//! exercised; per-consumer tail latency instead of one aggregate mean; CPU per
-//! consumer, because "O(1) in the number of consumers" was a claim nobody had
-//! measured; and PSS instead of summed RSS.
-//!
-//! **Run pinned and idle.** `taskset` the whole thing, and expect the rows above
-//! the physical core count to be scheduler noise rather than engine behaviour.
-//!
-//! Usage: `just mp-bench` (tf_tree) or `just mp-bench-tf2` (both, in the
-//! container).
-// This binary's output IS its result, and its refusal message must reach a
-// terminal even when stdout is piped into a report.
+//! **Run pinned and idle**: `taskset` it, and expect rows above the physical core
+//! count to be scheduler noise. Usage: `just mp-bench` (tf_tree) or `just
+//! mp-bench-tf2` (both, in the container).
+// Output IS the result; the refusal message must reach a terminal when piped.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -128,10 +118,8 @@ fn collect(child: &mut std::process::Child) -> Report {
 fn main() {
     let engine = std::env::args().nth(1).unwrap_or_else(|| "tf_tree".into());
 
-    // Refuse before doing any work. Latency here is largely a measurement of
-    // the scheduler, so a run taken against somebody else's workload describes
-    // that workload. The first run of this harness was taken on a machine
-    // carrying an unrelated 600%-CPU job and nothing in the output said so.
+    // Refuse before any work: latency here largely measures the scheduler, so a
+    // run on a busy machine describes that workload.
     let baseline_busy = match require_quiet_machine() {
         Ok(b) => b,
         Err(msg) => {
@@ -181,13 +169,9 @@ fn main() {
     );
 
     for &n in CONSUMERS {
-        // A publisher runs for the whole window. It must write into the *same*
-        // arena the consumers read — an earlier draft built a second one, which
-        // would have measured readers against a tree nobody was touching, i.e.
-        // exactly the quiescent-tree flaw this harness exists to remove.
-        //
-        // `thread::scope` is what lets the writer borrow the coordinator's tree
-        // while `shared_fd()` keeps being used to spawn consumers.
+        // The publisher writes into the *same* arena the consumers read; a second one
+        // would measure readers against a quiescent tree. `thread::scope` lets the writer
+        // borrow the tree while `shared_fd()` spawns consumers.
         let stop = std::sync::atomic::AtomicBool::new(false);
         let (reports, _) = std::thread::scope(|scope| {
             let stop_ref = &stop;
@@ -231,8 +215,7 @@ fn main() {
             (reports, pushed)
         });
 
-        // Worst tail across the fleet — the number an integrator lives with is
-        // the unluckiest node's, not the average node's.
+        // Worst tail across the fleet: the unluckiest node's, not the average's.
         let (mut svc, mut cyc) = (Histogram::new(), Histogram::new());
         let (mut worst_svc_p999, mut worst_cyc_p999) = (0u64, 0u64);
         let (mut cpu_total, mut pss_total) = (0u64, 0u64);
@@ -247,20 +230,15 @@ fn main() {
         let cpu_pct_per_node = (cpu_total as f64 / n as f64) / (SECONDS * 1e9) * 100.0;
         let us = |v: u64| v as f64 / 1000.0;
 
-        // Per-row noise, sampled right after the row. A row taken while the
-        // machine was busy is a different experiment, and it must be visible in
-        // the output rather than inferable only from the operator's memory.
+        // Per-row noise, sampled right after the row so a busy-machine row is visible.
         let row_busy = busy_fraction(Duration::from_millis(200));
-        // The harness's own load is a fraction of one core, so subtract the
-        // consumers' measured CPU to leave what somebody *else* was doing.
+        // Subtract the consumers' CPU to leave what somebody else was doing.
         let ours = cpu_total as f64 / (SECONDS * 1e9) / cores as f64;
         let foreign = (row_busy - ours).max(0.0);
         let flag = if foreign > 0.10 { " <-- NOISY" } else { "" };
 
         println!(
-            // CPU %/node gets three decimals, not one: the column exists to
-            // show whether per-node cost *rises* with n, and at ~0.1% a single
-            // decimal renders a doubling and a flat line identically.
+            // CPU %/node gets three decimals so a rise with n is visible.
             "{n:>6} | {:>9.2} {:>9.2} {:>10.2} | {:>9.1} {:>9.1} {:>10.1} | {:>10.3} {:>9.2}  {:>5.0}%{flag}",
             us(svc.quantile(0.50)),
             us(svc.quantile(0.99)),

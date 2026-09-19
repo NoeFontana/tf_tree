@@ -1,68 +1,25 @@
 //! Host facts behind `TFT016` — `docs/PHASE5.md` §6.
 //!
-//! Properties of the machine that change how an arena behaves and that nothing
-//! in the arena can see:
+//! Machine properties that change how an arena behaves and that nothing in the
+//! arena can see: THP for anonymous mappings (§2.3's 2 MiB alignment buys
+//! nothing under `never`), THP for *shmem* mappings (a separate knob; the one
+//! that governs the live arena), and `RLIMIT_MEMLOCK`.
 //!
-//! * **Transparent huge pages, for anonymous mappings.** §2.3 aligns a frozen
-//!   arena to 2 MiB precisely so the mapping is THP-eligible, and cites the
-//!   arithmetic: a 115 MB index on 4 KiB pages needs ~28 000 TLB entries and 55
-//!   on 2 MiB pages. On a host with THP set to `never` that alignment buys
-//!   nothing, and the p99 lookup latency an operator measures will not match the
-//!   one in the benchmark report.
-//! * **Transparent huge pages, for *shmem* mappings** — a **separate** sysfs
-//!   knob, and the one that governs the live arena. See [`ShmemThp`]: reading
-//!   only the first file reported a host as healthy while `MADV_HUGEPAGE` on the
-//!   arena's `MAP_SHARED` `memfd` was a silent no-op, which is the failure
-//!   `TFT016` exists to catch.
-//! * **`RLIMIT_MEMLOCK`.** Pinning the arena is how a hard-real-time consumer
-//!   keeps a page fault out of its control loop. A limit below the arena size
-//!   means the pinning fails, and it fails at the worst possible moment — during
-//!   the first deadline miss, when somebody is trying to work out why.
+//! `tf_tree` never calls `mlock`; the limit is reported for the consumer to act
+//! on (`docs/decisions/0049-the-flag-that-prefaults-the-arena.md`). The check
+//! compares the limit against the *arena* only, so silence is not a clearance:
+//! `mlockall` charges the whole address space.
 //!
-//!   **`tf_tree` never calls `mlock`, and this row does not imply that it does.**
-//!   `docs/PHASE2.md` §7.4 specifies a `LockPolicy::Locked` that exists nowhere
-//!   in this codebase (§0.0 carries the row), and
-//!   `docs/decisions/0049-the-flag-that-prefaults-the-arena.md` is why it is not
-//!   simply missing work: locking memory on a caller's behalf spends an
-//!   `RLIMIT_MEMLOCK` budget this library cannot see, and the arena is
-//!   deliberately over-provisioned. Pinning a whole address space is
-//!   `mlockall(MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT)` in the *embedding
-//!   application*, which is the only place that can see the budget it is
-//!   spending. So this is a limit reported **for the consumer to act on**, not
-//!   for us.
-//!
-//!   **This paragraph said `MLOCK_ONFAULT` "adds nothing over §7.1" and
-//!   recommended `mlockall(MCL_CURRENT|MCL_FUTURE)` until 2026-09-05**, both
-//!   copied from `docs/API.md` §8.3 in the PR that wrote it. Measured by
-//!   `crates/tf_tree_bench/examples/mlock_probe.rs`: `MCL_ONFAULT` is what
-//!   stops the call prefaulting the whole arena, which is per-arena population
-//!   at address-space scope and the thing `docs/decisions/0024` removed at
-//!   5.2×. `0049` carries the measurements and the one clause that stays
-//!   undetermined.
-//!
-//!   **What this row cannot see is the other term.** `mlockall` charges the
-//!   process's whole address space; this compares a limit against the *arena*.
-//!   Measured, the call fails `ENOMEM` at limits well above a small arena while
-//!   this check is silent, so silence here is not a clearance — the finding
-//!   says so.
-//!
-//! # Why `/proc/self/limits` rather than `getrlimit`
-//!
-//! `tf_tree_cli` is `#![forbid(unsafe_code)]` and has no `libc` dependency, so
-//! `getrlimit(2)` is not available to it — and `docs/decisions/0007`'s unsafe
-//! budget has four boundaries, none of which is "the CLI wanted a syscall".
-//! `/proc/self/limits` is the same number, from the same kernel, as text. The
-//! only cost is parsing, which is why both parsers here are pure functions over
-//! `&str` with their own tests: they can be checked against a captured file
-//! rather than against whatever this host happens to be configured as.
+//! `/proc/self/limits` is read instead of `getrlimit(2)` because the crate is
+//! `#![forbid(unsafe_code)]` with no `libc` (`docs/decisions/0007`). Both parsers
+//! are pure functions over `&str`.
 
 /// The kernel's transparent-huge-page policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Thp {
     /// `always` — every eligible mapping gets huge pages.
     Always,
-    /// `madvise` — only mappings that asked. §2.4's `MADV_HUGEPAGE` is
-    /// meaningful, so this is a perfectly good setting.
+    /// `madvise` — only mappings that asked (§2.4).
     Madvise,
     /// `never` — the 2 MiB alignment buys nothing on this host.
     Never,
@@ -70,50 +27,25 @@ pub enum Thp {
     Unknown,
 }
 
-/// The kernel's transparent-huge-page policy **for shmem mappings**, which is a
-/// different knob from [`Thp`] with a different vocabulary.
-///
-/// # Why this exists separately, and why reading only [`Thp`] was a defect
-///
-/// A live tf_tree arena is a sealed `memfd` mapped `MAP_SHARED` — shmem, not
-/// anonymous memory — and shmem THP is **not** governed by
-/// `transparent_hugepage/enabled`. It is governed by
-/// `transparent_hugepage/shmem_enabled`, whose default on a stock distribution
-/// is `never`:
-///
-/// ```text
-/// enabled:       always [madvise] never
-/// shmem_enabled: always within_size advise [never] deny force
-/// ```
-///
-/// So a host reads as perfectly healthy on `enabled` while
-/// `MappedArena`'s `MADV_HUGEPAGE` (`mapped.rs`) is silently a no-op and the
-/// arena gets 4 KiB pages. `TFT016` reported that host as passing, which is the
-/// one thing a diagnostic must not do.
-///
-/// The frozen `.tft` path is a file mapping and is governed by neither of these
-/// two files, which is why [`HostFacts`] reports both settings rather than
-/// collapsing them into one verdict.
+/// The kernel's THP policy **for shmem mappings** — a different sysfs knob
+/// (`shmem_enabled`, stock default `never`) from [`Thp`], and the one that
+/// governs the live arena's `MAP_SHARED` `memfd`. Reading only [`Thp`] reports a
+/// host healthy while `MADV_HUGEPAGE` is a silent no-op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmemThp {
     /// `always` — every shmem mapping large enough gets huge pages.
     Always,
-    /// `within_size` — huge pages only up to the file's size. An arena is mapped
-    /// whole, so this behaves like [`ShmemThp::Advise`] for us.
+    /// `within_size` — behaves like [`ShmemThp::Advise`] for a whole-mapped arena.
     WithinSize,
-    /// `advise` — only mappings that asked. `MADV_HUGEPAGE` is honoured, which
-    /// is what `MappedArena` issues, so this is the setting that makes §2.3's
-    /// alignment mean something.
+    /// `advise` — only mappings that asked; `MADV_HUGEPAGE` is honoured.
     Advise,
-    /// `never` — `MADV_HUGEPAGE` on a shmem mapping does nothing. **The stock
-    /// default.**
+    /// `never` — `MADV_HUGEPAGE` does nothing. The stock default.
     Never,
     /// `deny` — as `never`, and refuses even where it would otherwise apply.
     Deny,
     /// `force` — huge pages everywhere, ignoring the advice.
     Force,
-    /// The file was absent or in a shape this does not recognise. Absent is the
-    /// normal reading on a kernel built without `CONFIG_TRANSPARENT_HUGEPAGE`.
+    /// The file was absent (no `CONFIG_TRANSPARENT_HUGEPAGE`) or unrecognised.
     Unknown,
 }
 
@@ -127,11 +59,7 @@ impl ShmemThp {
         )
     }
 
-    /// The policy as the kernel spells it, for a diagnostic that quotes it back.
-    ///
-    /// Round-trips with [`parse_shmem_thp`], so the string a finding prints is
-    /// the string an operator can write into the sysfs file — which is the whole
-    /// point of quoting it.
+    /// The policy as the kernel spells it; round-trips with [`parse_shmem_thp`].
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -160,12 +88,9 @@ pub enum MemLock {
 /// What the host says about itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostFacts {
-    /// Transparent huge pages for **anonymous** mappings. Governs the frozen
-    /// `.tft` path's eligibility, not the live arena's.
+    /// THP for **anonymous** mappings (the frozen `.tft` path).
     pub thp: Thp,
-    /// Transparent huge pages for **shmem** mappings — the live arena's `memfd`.
-    /// See [`ShmemThp`] for why this is a separate knob and why reading only
-    /// `thp` reported a broken host as healthy.
+    /// THP for **shmem** mappings (the live arena's `memfd`); see [`ShmemThp`].
     pub shmem_thp: ShmemThp,
     /// Soft `RLIMIT_MEMLOCK`.
     pub memlock: MemLock,
@@ -190,10 +115,8 @@ pub fn probe() -> HostFacts {
 
 /// Parse `/sys/kernel/mm/transparent_hugepage/shmem_enabled`.
 ///
-/// Same bracketed-token shape as [`parse_thp`], different vocabulary — six
-/// policies rather than three — so it cannot share that parser without silently
-/// mapping `advise` and `within_size` to [`Thp::Unknown`], which would report
-/// "policy unknown" on a correctly configured host.
+/// Separate from [`parse_thp`]: six policies, and sharing it would map `advise`
+/// and `within_size` to `Unknown`.
 #[must_use]
 pub fn parse_shmem_thp(s: &str) -> ShmemThp {
     match bracketed(s) {
@@ -214,12 +137,8 @@ fn bracketed(s: &str) -> Option<&str> {
     Some(&rest[..rest.find(']')?])
 }
 
-/// Parse `/sys/kernel/mm/transparent_hugepage/enabled`.
-///
-/// The file lists every policy and brackets the active one:
-/// `always [madvise] never`. Matching on the *bracketed* token rather than on
-/// `contains("never")` is the whole job — every host's file contains all three
-/// words.
+/// Parse `/sys/kernel/mm/transparent_hugepage/enabled` (`always [madvise] never`).
+/// Matches the *bracketed* token; every file contains all three words.
 #[must_use]
 pub fn parse_thp(s: &str) -> Thp {
     match bracketed(s) {
@@ -234,12 +153,9 @@ pub fn parse_thp(s: &str) -> Thp {
 ///
 /// ```text
 /// Limit                     Soft Limit           Hard Limit           Units
-/// Max locked memory         8388608              8388608              bytes
-/// ```
+/// Parse the `Max locked memory` row of `/proc/self/limits`.
 ///
-/// The limit *names* contain spaces, so the row cannot be split on whitespace
-/// and indexed — the prefix has to be stripped first, which is why this is not
-/// a one-liner.
+/// The limit names contain spaces, so the prefix is stripped before splitting.
 #[must_use]
 pub fn parse_memlock(s: &str) -> MemLock {
     const NAME: &str = "Max locked memory";
@@ -264,12 +180,9 @@ mod tests {
 
     use super::*;
 
-    /// **The active policy is the bracketed one, and every file contains all
-    /// three words.**
+    /// The active policy is the bracketed one.
     ///
-    /// Mutant: replace the bracket scan with `s.contains("never")` ⇒ the
-    /// `[always]` and `[madvise]` cases both report `Never`, and `TFT016` fires
-    /// on every correctly configured host. Applied and confirmed.
+    /// Mutant: `s.contains("never")` ⇒ `[always]` and `[madvise]` report `Never`.
     #[test]
     fn thp_parsing_reads_the_bracketed_policy_not_the_menu() {
         assert_eq!(parse_thp("[always] madvise never\n"), Thp::Always);
@@ -280,22 +193,11 @@ mod tests {
         assert_eq!(parse_thp("[bogus]"), Thp::Unknown);
     }
 
-    /// **`shmem_enabled` is a different knob with a different vocabulary**, and
-    /// it is the one that governs the live arena.
+    /// `shmem_enabled` has six policies, not the three of `enabled`.
     ///
-    /// A live arena is a sealed `memfd` mapped `MAP_SHARED`, so its huge-page
-    /// eligibility comes from `shmem_enabled`, not from `enabled`. This host
-    /// reads `always [madvise] never` on the first and
-    /// `always within_size advise [never] deny force` on the second — healthy by
-    /// the wrong file, and `MADV_HUGEPAGE` a silent no-op by the right one. Both
-    /// real strings are pinned below.
-    ///
-    /// Mutant: route `shmem_enabled` through `parse_thp` ⇒ `advise` and
-    /// `within_size` both become `Unknown`, so a correctly configured host is
-    /// reported as "policy unknown" instead of passing. Applied and confirmed.
+    /// Mutant: route it through `parse_thp` ⇒ `advise`/`within_size` become `Unknown`.
     #[test]
     fn shmem_thp_parsing_covers_all_six_policies_not_the_three_of_enabled() {
-        // The two files as this host actually reports them.
         assert_eq!(parse_thp("always [madvise] never\n"), Thp::Madvise);
         assert_eq!(
             parse_shmem_thp("always within_size advise [never] deny force\n"),
@@ -332,10 +234,7 @@ mod tests {
             assert_eq!(parse_shmem_thp(s), want, "parsing {s:?}");
         }
 
-        // Only these four let `MappedArena`'s MADV_HUGEPAGE do anything. Getting
-        // this set wrong is the whole check: `never` is the stock default, so a
-        // predicate that accepted it would restore the defect this test exists
-        // to pin.
+        // Only these four let MADV_HUGEPAGE do anything.
         for p in [
             ShmemThp::Always,
             ShmemThp::WithinSize,
@@ -348,9 +247,7 @@ mod tests {
             assert!(!p.honours_madvise(), "{p:?} must not honour madvise");
         }
 
-        // `name()` must round-trip through the parser: the finding quotes the
-        // policy back at the operator, and a string they cannot write into the
-        // sysfs file is worse than no string at all.
+        // `name()` round-trips: operators can write it back into sysfs.
         for p in [
             ShmemThp::Always,
             ShmemThp::WithinSize,
@@ -363,14 +260,9 @@ mod tests {
         }
     }
 
-    /// **The limit names contain spaces**, so a whitespace split and an index
-    /// reads the wrong column — and `Max locked memory` sits directly above
-    /// `Max address space` in real files, whose value is `unlimited` on most
-    /// hosts. Reading the neighbouring row would report no limit at all.
+    /// The limit names contain spaces, so a whitespace split reads the wrong column.
     ///
-    /// Mutant: strip the prefix `"Max locked"` instead of the full name ⇒
-    /// `"memory"` becomes the first token and the parse returns `Unknown`.
-    /// Applied and confirmed.
+    /// Mutant: strip `"Max locked"` instead of the full name ⇒ `Unknown`.
     #[test]
     fn memlock_parsing_handles_the_multi_word_limit_names() {
         let real = "\

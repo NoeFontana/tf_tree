@@ -8,78 +8,51 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-# **Not published, and the reason is the artifact shape, not maturity alone.**
-# What a C or C++ consumer needs is the generated headers plus a built
-# `staticlib`/`cdylib` — none of which arrives through `cargo add`. Publishing
-# would put a crate on crates.io whose only Rust-visible surface (`rlib`) exists
-# for this repository's own integration tests. It also carries an ABI version
-# (`docs/PHASE4.md` §3.1) that is pre-1.0 and still moving; an ABI on crates.io
-# is a promise, and this one is not ready to make. Distribution is release
-# artifacts plus the CMake package, per `docs/PHASE5.md` §10.
+# Not published: C consumers need the headers plus a built `staticlib`/`cdylib`,
+# which `cargo add` does not deliver, and the ABI version (`docs/PHASE4.md` §3.1)
+# is pre-1.0. Distribution is release artifacts plus the CMake package
+# (`docs/PHASE5.md` §10).
 publish = false
 
 [lib]
-# `staticlib` and `cdylib` are the shipped artifacts; `rlib` exists so the
-# integration tests in `tests/` can link the crate as a normal Rust dependency
-# and drive the same entry points a C caller would.
+# `rlib` exists only so `tests/` can drive the entry points a C caller would.
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-# `features = ["unstable"]` — `docs/API.md` §2.6. `src/unstable.rs`'s
-# introspection entry points read the arena tables through `Tree::arena_view`,
-# which is now Rust-side unstable. The two tiers line up exactly: this crate's
-# *stable* header needs nothing from it.
+# `unstable` (`docs/API.md` §2.6): `src/unstable.rs` reads arena tables through
+# `Tree::arena_view`. The stable header needs nothing from it.
 tf_tree = { workspace = true, features = ["unstable"] }
-# Optional, behind `bridge`. `tf_tree_bridge` depends only on `tf_tree`, so this
-# adds no third-party code to the C ABI's dependency graph — but it is still
-# weight a C caller who only reads transforms should not link, which is why the
-# feature is off by default.
+# Optional, behind `bridge`: weight a transform-only C caller should not link.
 tf_tree_bridge = { workspace = true, optional = true }
 
 [features]
-# Test-only hook that forces a panic inside an `extern "C"` body, so §6.1's
-# "the process must survive" claim is testable rather than asserted.
+# Test-only: forces a panic inside an `extern "C"` body (§6.1).
 test-hooks = []
-# Pass through to tf_tree: tft_tree_open needs the shared-memory rendezvous.
+# `tft_tree_open` needs the shared-memory rendezvous.
 shm = ["tf_tree/shm"]
-# The ROS 2 ingest-bridge seam — `docs/PHASE4.md` §5, the half that is not
-# `rclcpp`. Default-off: it is `docs/PHASE4.md` §3.1's *unstable* tier, and a
-# consumer that only reads transforms should not link the decision pipeline.
+# The ingest-bridge seam (`docs/PHASE4.md` §5); the *unstable* tier of §3.1.
 bridge = ["dep:tf_tree_bridge"]
 
 [lints]
 workspace = true
 
-# Needs the fixture constructor, so it cannot build in a default `--all-targets`
-# pass. Declaring it here is what keeps `just lint` (which builds every target
-# with no features) from failing on it.
+# Needs the fixture constructor; keeps a no-feature `--all-targets` build green.
 [[example]]
 name = "abi_cost"
 required-features = ["test-hooks"]
 
-# Same reason, one feature over: it drives the §5 seam, which is default-off.
+# Same reason: drives the default-off §5 seam.
 [[example]]
 name = "bridge_cost"
 required-features = ["bridge"]
 
-# The second **process** in `tests/bridge_shared.rs` — `docs/decisions/0015`'s
-# multi-process arm. `required-features` for the same reason as the two examples
-# above: `shm` is default-off, so a plain `--all-targets` build must not try it.
-#
-# It needs `shm` and not `bridge`: it is an ordinary `tf_tree` consumer and links
-# none of the C ABI, which is the record's *"no new consumer API"* being shown
-# rather than asserted. `just shm-check`'s
-# `cargo nextest run -p tf_tree_c --features bridge,shm` builds it (cargo builds
-# a package's binaries for its integration tests, which is also what defines
-# `CARGO_BIN_EXE_bridge_reader`), and the `clippy ... --features bridge,shm
-# --all-targets` line above it is what lints it.
+# The second process in `tests/bridge_shared.rs` (`docs/decisions/0015`). Needs
+# `shm`, not `bridge`: it is an ordinary `tf_tree` consumer and links no C ABI.
 [[bin]]
 name = "bridge_reader"
 required-features = ["shm"]
 
-# The owner `tests/recovery.rs` kills. A separate **process**, because owner
-# death is what `docs/decisions/0044` is about and a thread cannot be killed
-# the way the kernel kills a process — releasing its locks with no cooperation.
+# The owner `tests/recovery.rs` kills (`docs/decisions/0044`); must be a process.
 [[bin]]
 name = "arena_owner"
 required-features = ["shm"]

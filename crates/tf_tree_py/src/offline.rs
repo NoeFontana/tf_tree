@@ -1,36 +1,13 @@
 //! The offline API — `docs/PHASE5.md` §4.
 //!
-//! # There is no offline API
+//! §4.1 (NORMATIVE): a `.tft` opens into the **same** [`PyTree`](crate::PyTree) a live arena
+//! does. This module adds only [`open_file`], [`freeze_impl`] (behind `Tree.freeze`), and the
+//! queries §4.2/§4.4 cannot phrase online: [`span_impl`] and the *names* half of `edges`.
 //!
-//! That is the point of §4.1, which is NORMATIVE: a `.tft` opens into the
-//! **same** [`PyTree`](crate::PyTree) a live arena does, so `plan`, `at`,
-//! `at_into`, `adaptive` and `latest` are the objects that were already there.
-//! What this module adds is a way in ([`open_file`]), a way out
-//! ([`freeze_impl`], behind `Tree.freeze`), and the one query in §4.2 that
-//! cannot be phrased in terms of the online API ([`span_impl`]).
-//!
-//! # What of §4.2 is here, and what deliberately is not
-//!
-//! §4.2 lists five helpers. `span` is in the module and so, since §4.4, is the
-//! *names* half of `edges`; the omissions are decisions rather than a backlog:
-//!
-//! * `resample(t0, t1, hz)` is `plan.at(np.arange(t0, t1, 10**9 // hz))` — one
-//!   line of NumPy over the vectorised call §4.1 insists is the same one. A
-//!   binding for it would be a second spelling of an existing path, which is
-//!   exactly what §4.1 forbids.
-//! * **`edges()` is two different queries and only one of them ships.** §4.4's
-//!   `tree.edges()` is the *identities* of the edges — a list of name pairs,
-//!   and [`edges_impl`] below. §4.2's `ds.edges()` promises per-edge rate,
-//!   jitter, gaps and count, and that half still needs §3's counting pass: the
-//!   ring knows what it *retained*, which is not what the source produced (see
-//!   `tf_tree::Tree::manifest`'s amendment), and dividing the one by the other
-//!   is the 4-kHz-off-a-1-kHz-edge error §2.3's `samples`/`pushes_total`
-//!   amendment already had to correct once. **The names must not acquire the
-//!   statistics by adjacency**, which is §4.4's own instruction and the reason
-//!   the two are named apart here rather than left to look like one feature
-//!   half-built.
-//! * `gaps()` needs the same counting pass, and `manifest` needs a CBOR
-//!   *reader* where the crate has only a writer.
+//! Not shipped: `resample` (a second spelling of `plan.at(np.arange(...))`); per-edge rate,
+//! jitter, gaps and count (§4.2's `ds.edges()`), and `gaps()`, which need §3's counting pass
+//! — and the names must not acquire the statistics by adjacency (§4.4); `manifest`, which
+//! needs a CBOR reader.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -47,29 +24,15 @@ use crate::tree::PyTree;
 
 /// Open a frozen `.tft` and read it through the ordinary `Tree` (§4.1).
 ///
-/// Opening is an `mmap`: microseconds, and no parse. Sixteen dataloader workers
-/// that each open the same file share one set of clean page-cache pages, which
-/// is the whole argument of §2.2 — so **open it inside the worker**, not once in
-/// the parent.
+/// Opening is an `mmap`: microseconds, no parse. Workers that open the same file share one set
+/// of clean page-cache pages (§2.2), so **open it inside the worker**, not in the parent.
 ///
-/// A `Tree` cannot be pickled, and a `DataLoader` with `num_workers > 0` sends
-/// the dataset object to its workers by pickle under `spawn` *and* under
-/// `forkserver`, which is CPython 3.14's default start method on Linux. So the
-/// §4.3 pattern holds a `None` until the first `__getitem__`. Under a plain
-/// `fork` an inherited mapping does keep working — it is `MAP_PRIVATE |
-/// PROT_READ` and deliberately not fork-poisoned, unlike a shared-memory attach
-/// — which is why the rule is about picklability and not, as §4.3 says, about
-/// the arena going away.
+/// A `Tree` cannot be pickled, and a `DataLoader` with `num_workers > 0` pickles its dataset
+/// under `spawn` and `forkserver`. Hold a `None` until the first `__getitem__` (§4.3). Under
+/// `fork` an inherited mapping keeps working: it is `MAP_PRIVATE | PROT_READ` and not
+/// fork-poisoned.
 ///
-/// **This text is duplicated in `_core.pyi`, on purpose.** The stub is what an
-/// IDE shows; this is what `help(tf_tree.open_file)` shows at a REPL, and the
-/// reader in front of a dataloader that has just deadlocked is at the REPL.
-///
-/// `path` is any `os.PathLike`, not only a `str`: this and `Tree.freeze` are the
-/// binding's first filesystem-path arguments, so there is no earlier spelling to
-/// stay consistent with, and a dataloader is precisely where paths arrive as
-/// `pathlib.Path`. PyO3's `PathBuf` extractor also accepts the non-UTF-8 paths a
-/// `&str` parameter cannot represent at all.
+/// `path` is any `os.PathLike`, including non-UTF-8 paths.
 #[pyfunction]
 #[pyo3(signature = (path, /))]
 pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
@@ -78,50 +41,22 @@ pub fn open_file(path: PathBuf) -> PyResult<PyTree> {
 
 /// The interval over which a plan is answerable, or `None` when it is unbounded.
 ///
-/// The arithmetic is [`tf_tree::Plan::span`] and **this is a forwarder**, which
-/// is the whole point: an earlier revision re-derived the window intersection
-/// here, in the one crate the workspace's `just test`, `just miri` and
-/// `just loom` never build. `tf_tree/src/frozen.rs` makes the same argument
-/// about the same arithmetic — the definition of a ring's readable window has
-/// already changed once, and a private copy of it does not move when the
-/// definition does. Read that method for the three answers `span` distinguishes
-/// and why an empty intersection is returned rather than raised.
-///
-/// Going through `Plan` also buys the two checks a hand-rolled view walk did not
-/// have: a plan compiled against an older topology raises
-/// `TopologyChangedError`, and a fork-poisoned guard raises rather than reading
-/// an arena the child has been detached from.
+/// A forwarder to [`tf_tree::Plan::span`], so a stale-topology plan raises
+/// `TopologyChangedError` and a fork-poisoned guard raises rather than reading a detached arena.
 ///
 /// # Errors
 ///
-/// Everything `Plan::span` reports, mapped by [`lookup_err`] — except
-/// `LookupError::NoData`, which is re-raised with **where on the path** the
-/// silent edge sits. §4.2's premise is that this query answers "why did my
-/// lookup fail at t", and an edge named on its own does not finish the
-/// sentence: `map -> lidar` is what the caller asked for, `base_link -> lidar`
-/// is what is silent, and the message has to join the two.
-///
-/// This arm used to exist to resolve the *names* as well, because `lookup_err`
-/// printed `EdgeId(2)`. It no longer does — every arm of it goes through
-/// [`crate::errors::edge_label_in`] now — so what is left here is only the path
-/// phrasing, and falling through would lose that and nothing else.
-///
-/// Both mapper calls go through [`crate::errors::lookup_err_untagged`], which is
-/// the entry point for a caller that holds no time-domain tag: neither
-/// `Tree::plan` nor `Plan::span` can return `Extrapolation`, the one variant
-/// that carries one.
-///
-/// **One [`ArenaView`] for the whole message**, for the reason
-/// [`crate::errors::edge_label_in`] gives: the label and the `.edge` attribute
-/// are one resolution of one edge, and this arm built a view for each.
+/// Everything `Plan::span` reports, mapped by [`lookup_err_untagged`] (neither call can return
+/// `Extrapolation`, the one variant carrying a time-domain tag) — except
+/// `LookupError::NoData`, re-raised with **where on the path** the silent edge sits. One
+/// [`ArenaView`] serves the whole message.
 pub(crate) fn span_impl(
     py: Python<'_>,
     tree: &Tree,
     target: &str,
     source: &str,
 ) -> PyResult<Option<(i64, i64)>> {
-    // [`resolve_frame`] rather than `Tree::frame`, which interns: `span` is a
-    // question about an arena and must not add a frame to it.
+    // `resolve_frame`, not the interning `Tree::frame`: `span` must not add a frame.
     let t = resolve_frame(py, tree, target)?;
     let s = resolve_frame(py, tree, source)?;
     let plan = tree
@@ -146,22 +81,10 @@ pub(crate) fn span_impl(
 
 /// `(parent, child)` frame names for an edge, or `None` if either is missing.
 ///
-/// Only ever called on an error path or a listing, so the two `String`s it
-/// allocates are not a hot-path allocation — the rule they would otherwise
-/// violate.
-///
-/// **Takes the view, and there is no `&Tree` spelling of it any more.** The
-/// enumerators below call this per edge, and building an `ArenaView` per
-/// iteration to throw it away would be the kind of loop that reads as free
-/// because each step is cheap. [`crate::errors::lookup_err`] wants it for the
-/// same reason from the other direction: one message can name three frames, and
-/// `Tree::view` re-runs `detached()`, `as_participant`, `with_liveness` and
-/// `is_writable` on every call. The two `&Tree` wrappers that used to sit here
-/// had exactly one caller left between them once the error layer took a view of
-/// its own, and it was `edge_label`, which is gone with its last caller.
+/// Takes the view so per-edge callers build it once. Allocates, but only on error paths and
+/// listings.
 pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(String, String)> {
-    // One observation of the record: re-reading `view.edge(edge)` for the child
-    // could name a parent and a child that never belonged to the same edge.
+    // One observation of the record: two reads could name a parent and child of different edges.
     let rec = view.edge(edge)?;
     let name = |raw: u32| named_frame_in(view, FrameId::new(raw)?);
     Some((name(rec.parent)?, name(rec.child)?))
@@ -169,40 +92,16 @@ pub(crate) fn named_edge_in(view: &ArenaView<'_>, edge: EdgeId) -> Option<(Strin
 
 /// One frame's stored name, or `None` if this arena has no usable record there.
 ///
-/// The single-frame half of [`named_edge_in`], split out rather than duplicated
-/// because the error layer needs it alone: `LookupError::Disconnected` carries
-/// three `FrameId`s and no edge at all, and spelling them `FrameId(4)` is the
-/// defect [`crate::errors`] exists to keep out of Python.
+/// `None` means "no usable record at that index". Three checks:
 ///
-/// # The three record-validity checks live here, not in the callers
+///  1. `FrameId::new` rejects 0, the root sentinel.
+///  2. `id <= frame_count`, which excludes the zeroed headroom slots `frame_record` would hand
+///     back (they would render as `""`).
+///  3. `name_hash != 0`, which excludes a slot counted by a concurrent interner before its
+///     record exists.
 ///
-/// `ArenaView::frame_record` bounds against `max_frames`, which is
-/// `frame_count + 1 + frame_headroom` — so it hands back a **zeroed headroom
-/// slot** as readily as a frame, and `stored_name` renders that as `""`. Two
-/// callers already knew this and one did not: [`frames_impl`] filtered it and
-/// said why, while this function — the one the error layer reaches through —
-/// let it past. A `Disconnected` naming a headroom id would then read *no path
-/// from "" to "sensor_c"; the chain stops at ""*, and
-/// [`crate::errors::edge_label_in`]'s fallback — the sentence that says *why* a
-/// name is missing — would never fire, because a name was produced.
-///
-/// **No id reaching here today comes from outside `1..=frame_count`**: every one
-/// is a field of a `LookupError` or a `ClaimApiError`, and those are read from
-/// the topology and edge tables. So this is the contract being made true rather
-/// than a reported failure being fixed — but the contract is exactly what the
-/// fallback rests on (**`None` is "no usable record at that index"**), it costs
-/// one `Relaxed` load on an error path, and the alternative is three callers
-/// each remembering a rule that only one of them wrote down.
-///
-///  1. `FrameId::new` rejects 0, the root sentinel — the type does it, so the
-///     caller cannot skip it.
-///  2. `id <= frame_count`, which is what excludes the headroom slots.
-///  3. `name_hash != 0`, which excludes a slot counted by a concurrent interner
-///     one instant before its record exists ([`frames_impl`] argues that race).
-///
-/// `Relaxed` for the same reason [`frames_impl`] states: `frame_count` is bumped
-/// *before* the record is written, so no acquire here would order the read that
-/// follows it. Check 3 is the guard, not the ordering.
+/// `Relaxed`: `frame_count` is bumped *before* the record is written, so acquire orders
+/// nothing useful; check 3 is the guard.
 pub(crate) fn named_frame_in(view: &ArenaView<'_>, frame: FrameId) -> Option<String> {
     if frame.get() > view.header().frame_count.load(Ordering::Relaxed) {
         return None;
@@ -214,13 +113,8 @@ pub(crate) fn named_frame_in(view: &ArenaView<'_>, frame: FrameId) -> Option<Str
     Some(stored_name(&rec.name, rec.name_len))
 }
 
-/// A frame record's stored — and therefore possibly truncated — name.
-///
-/// `FrameRecord` keeps 48 bytes and a length; a longer name was cut at intern
-/// time and the cut is not recoverable here. `from_utf8_lossy` rather than a
-/// refusal because a truncation can land mid-codepoint, and a frame listing
-/// that raises on one bad byte tells the caller nothing about the other ninety
-/// frames.
+/// A frame record's stored — possibly truncated — name. Lossy UTF-8: a cut can land
+/// mid-codepoint, and one bad byte must not fail a whole listing.
 fn stored_name(bytes: &[u8], len: u8) -> String {
     let n = (len as usize).min(bytes.len());
     String::from_utf8_lossy(&bytes[..n]).into_owned()
@@ -228,116 +122,33 @@ fn stored_name(bytes: &[u8], len: u8) -> String {
 
 /// The frame names on this tree, in `FrameId` order, behind `Tree.frames`.
 ///
-/// # Why this walks the arena when [`span_impl`] refuses to
+/// Follow-up: `tf_tree::Tree::frames` (`docs/API.md` §2.6) applies the same three checks, so
+/// this body should become a forwarder; not done because `tests/python/test_api.py`, which pins
+/// the `('', '')` case, runs only under `just py-test`.
 ///
-/// `span` is a forwarder because the thing it forwards to is *arithmetic* — the
-/// retained-window intersection — whose definition has already changed once,
-/// and a private copy of it in the one crate `just test`, `just miri` and
-/// `just loom` never build does not move when the definition does
-/// (`docs/PHASE5.md` §4.2's amendment). There is no arithmetic here: the frame
-/// table is append-only and the enumeration is `1..=frame_count`, three lines
-/// `tf_tree doctor`'s `Snapshot::capture` and `tf_tree_c`'s unstable
-/// enumerators already state independently — though not identically, which is
-/// the next paragraph.
-///
-/// **That is a reason it was tolerable here, not a reason it is right here, and
-/// the condition it was waiting on has been met.** `tf_tree::Tree::frames` now
-/// exists on the *stable* tier (`docs/API.md` §2.6) and applies exactly the
-/// three checks [`named_frame_in`] states, with the same `Relaxed` load and the
-/// same refusal on a detached tree — so this body should become
-/// `tree.frames().map_err(|_| detached_err())`, a forwarder like `span_impl`.
-///
-/// **It has not been, and the reason is a gate rather than a doubt.** This crate
-/// is excluded from the workspace, so `just test`, `just lint` and
-/// `cargo nextest run --workspace` do not build it, and the suite that would
-/// catch a behavioural difference — `tests/python/test_api.py`, which pins the
-/// `('', '')` case this walk exists to avoid — runs only under `just py-test`,
-/// which needs a maturin venv. Changing a binding's behaviour in the one crate
-/// no host recipe compiles is the defect class this file's own history is made
-/// of, so the conversion is filed for a change that can run that suite.
-///
-/// # The snapshot is a snapshot
-///
-/// On a live shared arena another process may intern a frame while this loop
-/// runs, so the list is what was true at some instant inside the call — exactly
-/// as `Plan::latest` and `Tree::span` already are. Frames are append-only, so
-/// what the list *does* promise is that nothing in it will ever be removed or
-/// renumbered.
-///
-/// **It does *not* promise that a name appears once, and append-only is not
-/// what rules that out.** When a rescuer judges a stalled interner dead and
-/// publishes the same name first, the loser's id is abandoned:
-/// `tf_tree_core::frame`'s `finish` states that the record "stays written but
-/// unreferenced, and `frame_count` over-counts by one" — the deliberate trade,
-/// because giving the id back could alias two frames onto one record. That
-/// abandoned record was written by `FrameRecord::for_name`, so it carries the
-/// real name and a non-zero `name_hash`; it passes all three checks below and
-/// lands in this list at a second id. So `len()` of the result is an upper
-/// bound on the tree's frames and `dict(zip(frames, ...))` can silently drop an
-/// entry. It takes the A8 liveness-rescue path — a claimant that stalled long
-/// enough to be judged dead and then published anyway — so it is rare, not
-/// impossible, and it is stated here because the section above would otherwise
-/// read as exhaustive.
-///
-/// A tree inherited across a `fork()` has no snapshot to take: its mapping is
-/// gone (`MADV_DONTFORK`) and [`Tree::view`](tf_tree::Tree) substitutes a
-/// one-frame poison arena, which would make this answer `[]`. See the guard.
+/// The result is a snapshot: on a live shared arena a frame may be interned mid-call, and
+/// nothing listed is ever removed or renumbered. It does **not** promise unique names: a
+/// rescued interner's abandoned record (`tf_tree_core::frame`'s `finish`) keeps its real name
+/// and lands at a second id, so `len()` is an upper bound.
 ///
 /// # Errors
 ///
 /// [`detached_err`] on a tree inherited across a `fork()`.
 pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
-    // **Refuse a fork-detached tree rather than describing the poison arena.**
-    // `Tree::view` swaps in a one-frame, zero-edge heap arena for a detached
-    // tree so that no accessor reads the vanished mapping; every count below
-    // then reads 0 and this would hand a `multiprocessing` worker `[]` — which
-    // reads as an empty or corrupt arena, not as the fork it is. `span_impl`
-    // gets this for free by going through a `Guard`; a walk of the view has to
-    // say so itself. `docs/PHASE5.md` §4.3 makes `fork` the *expected* way in.
+    // Refuse a fork-detached tree: the poison arena reads 0 frames, which would hand a
+    // `multiprocessing` worker `[]` (`docs/PHASE5.md` §4.3).
     if tree.detached() {
         return Err(detached_err());
     }
     let view = tree.arena_view();
-    // Usable frame ids are `1..=frame_count`; slot 0 is the root sentinel.
-    //
-    // **`Relaxed`, and that is the justified ordering, not the cheap one.**
-    // `tf_tree_core::frame`'s `finish` does `frame_count.fetch_add`, *then*
-    // `write_record`, then the Release publish into the intern table. An
-    // `Acquire` load here would therefore synchronize with everything the
-    // interner did *before* it took its id and with nothing it did after —
-    // which is precisely the record we are about to read. Acquire would buy
-    // ordering that reads like a guarantee and is not one; the `name_hash`
-    // filter below is the actual guard. (The other three copies disagree about
-    // this; see the doc comment's second section.)
+    // Ids are `1..=frame_count`. `Relaxed` on purpose: `finish` bumps `frame_count` before
+    // writing the record, so `Acquire` would order nothing here; the `name_hash` filter guards.
     let count = view.header().frame_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count as usize);
     for raw in 1..=count {
-        // Three checks, the strictest set any of the four copies of this loop
-        // applies (`tf_tree_c::unstable::tft_tree_frame_name` states them as
-        // one chain; `tf_tree_cli`'s `Snapshot::capture` applies only the
-        // first) — and they are [`named_frame_in`]'s now rather than this
-        // loop's, because the error layer needs the same three and had none of
-        // them. The bound below is still this loop's: `count` is read once so
-        // the enumeration does not chase a concurrent interner.
-        //
-        // **`frame_count` is bumped *before* the record is written**, so a
-        // concurrent interner in another process can be counted here one
-        // instant before its name exists, and the slot still reads as zeros. A
-        // written record's `name_hash` is BLAKE3 of the name — non-zero for
-        // every name including `""`, which hashes to `0xa6a1f9f5b94913af`; a
-        // zeroed one is zero always. Skipping it reports that frame one call
-        // later, where taking it would report it as `""` — a name no caller can
-        // act on and one that looks like our bug rather than like a race they
-        // lost by a microsecond.
-        //
-        // That is a filter, not a synchronization edge: the arena's model is
-        // that a record is written before its id is ever *published* and a
-        // shared read of a published record races nothing
-        // (`ArenaView::frame_record`'s SAFETY note). Enumerating by index steps
-        // outside that model — the id came from a counter, not from a publish —
-        // and no ordering available here puts it back inside. That is an
-        // argument for the enumeration living on `Tree`, where `just loom` and
-        // `just miri` can see it, which is the filed follow-up.
+        // `count` is read once so the loop does not chase a concurrent interner. A counted slot
+        // whose record is not yet written reads as zeros (`name_hash == 0`); skipping it reports
+        // the frame one call later instead of as `""`.
         let Some(id) = FrameId::new(raw) else {
             continue;
         };
@@ -351,77 +162,28 @@ pub(crate) fn frames_impl(tree: &Tree) -> PyResult<Vec<String>> {
 
 /// The edges on this tree as `(parent, child)` name pairs, behind `Tree.edges`.
 ///
-/// # `(parent, child)`, in that order, because `build` takes that order
-///
-/// `tf_tree.build([...])` and `tf_tree.open(create=[...])` both take
-/// `(parent, child)` pairs, so a caller can hand this list straight back to
-/// either. Choosing `(child, parent)` — `Tree.publisher`'s order — would have
-/// made that hand-back build a tree that is upside down and still valid, which
-/// is the quaternion-order trap in the topology axis.
-///
-/// # It is the parent/child graph, and **not** a round trip
-///
-/// An earlier revision of this doc said `tf_tree.build(tree.edges())`
-/// "reconstructs the topology". It reconstructs the *graph*, and only for an
-/// all-dynamic tree it reconstructs anything usable: `tf_tree.build` has no way
-/// to declare a static edge and this list does not report an edge's kind, so on
-/// the surfaces this call is actually aimed at — a `.tft` from bag ingest, or a
-/// shared arena a Rust or C peer built with `TreeBuilder::static_edge` — every
-/// static edge comes back as a dynamic edge with an empty ring, and every lookup
-/// crossing one raises `NoData` instead of returning the constant it had.
-///
-/// Reporting the kind is surface `docs/PHASE5.md` §4.4 does not authorise, and
-/// declaring a static edge from Python is surface that does not exist at all, so
-/// the promise is withdrawn rather than half-kept. A documented limit beats a
-/// round trip that holds only on the case a test can reach.
-///
-/// # The pair is the edge's *declared* endpoints
-///
-/// `Tree::reparent` moves a child under a new parent by rewriting the topology
-/// block; `EdgeRecord::parent`, which is what this reads, keeps the frame the
-/// edge was declared under. The two agree on every tree that was never
-/// reparented, which is every tree Python can build — the binding exposes no
-/// `reparent` — and they can disagree on a shared arena a peer process has
-/// reparented. This reads the record because [`named_edge_in`], `tf_tree doctor`'s
-/// `Snapshot` and the CLI's edge listing all already do: one wrong-after-reparent
-/// answer beats two answers that disagree with each other.
-///
-/// # Names only — see the module docs
-///
-/// No rate, no jitter, no gap count, no sample count. That is §4.2's `ds.edges()`
-/// and it stays held back until §3's counting pass exists.
+/// `(parent, child)` is the order `tf_tree.build` and `open(create=...)` take. This is the
+/// graph, **not** a round trip: it does not report an edge's kind and Python cannot declare a
+/// static edge, so a rebuilt tree turns every static edge dynamic. The pair is the *declared*
+/// endpoints (`EdgeRecord::parent`), which differ from the live topology only on an arena a
+/// peer has reparented. Names only; statistics wait on §3's counting pass (§4.2).
 ///
 /// # Errors
 ///
 /// [`detached_err`] on a tree inherited across a `fork()`.
 pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
-    // See [`frames_impl`]: the poison arena a detached tree reads has zero
-    // edges, so without this the answer is a silent `[]`.
+    // A detached tree's poison arena has zero edges: refuse rather than return `[]`.
     if tree.detached() {
         return Err(detached_err());
     }
     let view = tree.arena_view();
-    // `edge_count` is stored as (declared edges + 1 sentinel), so the real ids
-    // are `1..edge_count` — `tf_tree_core::EdgeId`'s own doc comment, and the
-    // off-by-one that cost `tf_tree_c::unstable` a test.
-    //
-    // `Relaxed` needs no argument beyond `frames_impl`'s: unlike `frame_count`
-    // there is no window at all here. The edge table is sized and filled by
-    // `TreeBuilder`, and `edge_count` is stored exactly once
-    // (`tf_tree/src/tree.rs`) before the arena is ever shared; nothing declares
-    // an edge at runtime.
+    // Real ids are `1..edge_count` (the count includes the sentinel). `Relaxed`: the edge table
+    // is filled and `edge_count` stored once before the arena is shared.
     let count = view.header().edge_count.load(Ordering::Relaxed);
     let mut out = Vec::with_capacity(count.saturating_sub(1) as usize);
     for raw in 1..count {
-        // `None` here means either an id past the edge table — which
-        // `edge_count <= max_edges` makes unreachable — or a slot whose record
-        // is still zeros, because a zeroed record names frame 0, and
-        // `FrameId::new(0)` declines before [`named_frame_in`]'s own two
-        // checks even see it. **That second case is what keeps the
-        // sentinel and any headroom slot out of this list**, not the loop
-        // bound, so the tempting "never drop an entry" refactor into
-        // `Tree::edge_name`'s `<root>` fallback would put `('', '')`-shaped
-        // noise in a notebook. `tests/python/test_api.py` pins it.
+        // `None` means a zeroed record (frame 0), which keeps the sentinel and headroom slots
+        // out of the list; do not swap in an always-Some fallback. Pinned in `test_api.py`.
         if let Some(pair) = named_edge_in(&view, EdgeId(raw)) {
             out.push(pair);
         }
@@ -431,29 +193,12 @@ pub(crate) fn edges_impl(tree: &Tree) -> PyResult<Vec<(String, String)>> {
 
 /// The **dynamic** edges a compiled plan samples, behind `Plan.edges`.
 ///
-/// # A plan does not remember its static edges, and cannot
-///
-/// `Step::Static` is "a folded static edge *or a run of them*", pre-inverted and
-/// composed at compile time (`tf_tree_core::plan::Step`). By the time a plan
-/// exists, the identities of the static edges that went into it are gone — not
-/// hidden, *gone*, which is the whole point of folding them. So this enumerates
-/// the `Step::Dyn` steps and the doc string says so; inventing ids for the
-/// folded ones would be fabricating topology, and returning nothing at all would
-/// be less useful than the answer the plan can actually give.
-///
-/// Fold order, not the order the frames appear in the path: a plan is a sequence
-/// of compositions and that is the sequence.
-///
-/// The direction each step composes in (`Step::Dyn { inverted }`) is not
-/// reported. The pair is the edge's identity — the same identity
-/// [`edges_impl`] hands out — and a plan from `base` to `map` names the same
-/// edge as one from `map` to `base`.
+/// A plan folds static edges into one `Step::Static`, so their identities are gone; only
+/// `Step::Dyn` steps are listed, in fold order, without direction.
 ///
 /// # Errors
 ///
-/// [`detached_err`] on a tree inherited across a `fork()`. The plan's own
-/// [`Guard`](tf_tree::Guard) would refuse too, but a plan is not evaluated here:
-/// nothing but this guard stands between a detached tree and a silent `[]`.
+/// [`detached_err`] on a tree inherited across a `fork()`; nothing else guards a silent `[]`.
 pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String, String)>> {
     if tree.detached() {
         return Err(detached_err());
@@ -473,32 +218,11 @@ pub(crate) fn plan_edges_impl(tree: &Tree, plan: &Plan) -> PyResult<Vec<(String,
 
 /// Write this tree's arena to `path` as a `.tft` (§2.3), behind `Tree.freeze`.
 ///
-/// This is the Python entry §3.3 asks for — the way in for a user whose poses
-/// were never in a bag — and it is also what makes §4.1's claim testable from
-/// Python at all: freeze a tree, reopen the file, and demand the *same* numbers
-/// out of the *same* calls.
+/// `source_digest` is BLAKE3 of the source recording, all-zero when there is none
+/// ([`PyTree::source`](crate::tree::PyTree), `docs/decisions/0046`).
 ///
-/// `source_digest` is the caller's, and is all-zero for a tree with no
-/// recording behind it. §2.3 defines it as BLAKE3 of the source recording, and a
-/// tree assembled in Python has none; inventing a digest of the arena bytes
-/// instead would put a value in a field that means something else, which is
-/// worse than the documented "there was no recording" zero. `Tree.freeze` passes
-/// the ingested recording's digest when there is one and that zero otherwise —
-/// see [`PyTree::source`](crate::tree::PyTree) and `docs/decisions/0046`.
-///
-/// # The GIL is released for the copy
-///
-/// A freeze is one `write` of the *whole* arena — hundreds of milliseconds and
-/// hundreds of megabytes for a tree big enough to be worth freezing, against
-/// CPython's 5 ms switch interval. Holding the GIL across it stops every other
-/// thread in the process dead, which is the rule `PyPlan::at_many_into` already
-/// follows from 1 µs of estimated work upward
-/// ([`GIL_RELEASE_THRESHOLD_NS`](crate::tree::GIL_RELEASE_THRESHOLD_NS)). There
-/// is no size threshold here because there is no cheap case: the smallest useful
-/// arena is still a file write.
-///
-/// Nothing inside the `detach` touches a Python object — `path` and `source` are
-/// already owned Rust values, which is what makes the release sound.
+/// The GIL is released for the copy: it writes the whole arena, and nothing inside the
+/// `detach` touches a Python object.
 #[cfg(target_os = "linux")]
 pub(crate) fn freeze_impl(
     py: Python<'_>,
@@ -512,13 +236,8 @@ pub(crate) fn freeze_impl(
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(0);
-    // **Refuse a fork-detached tree before anything reads it.** `freeze_to`
-    // reads the manifest and the arena's backing bytes directly, not through a
-    // `Guard`, so in a fork child — where the mapping is `MADV_DONTFORK` and
-    // gone — it faulted: `SIGSEGV`, where `docs/PHASE3.md` §8.1 (NORMATIVE)
-    // requires `ChildProcessDetachedError`. The facade's `Tree::freeze_to`
-    // has no such check of its own, so this is the Python caller's guard, not
-    // a second copy of one.
+    // Refuse a fork-detached tree: `freeze_to` reads the backing bytes without a `Guard` and
+    // would `SIGSEGV` where `docs/PHASE3.md` §8.1 (NORMATIVE) requires `ChildProcessDetachedError`.
     if tree.detached() {
         return Err(detached_err());
     }
@@ -550,10 +269,8 @@ fn open_frozen(_path: &Path) -> PyResult<Tree> {
     Err(not_on_this_platform())
 }
 
-/// The whole frozen path is `#[cfg(all(feature = "shm", target_os = "linux"))]`
-/// in the facade, so on any other platform the *method* still exists and
-/// refuses. A missing attribute would make a portable script fail with
-/// `AttributeError` at a line that has nothing to do with the reason.
+/// The frozen path is Linux-only in the facade; the method still exists and refuses, so a
+/// portable script does not fail with `AttributeError`.
 #[cfg(not(target_os = "linux"))]
 fn not_on_this_platform() -> PyErr {
     TfTreeError::new_err(
@@ -564,22 +281,13 @@ fn not_on_this_platform() -> PyErr {
 
 /// Map a `.tft` failure onto Python, keeping the path and the remedy.
 ///
-/// **The errno path becomes a real `OSError` subclass**, because that is what a
-/// Python caller already handles: a missing index raises `FileNotFoundError`,
-/// and a `try: ... except FileNotFoundError:` around the open works without
-/// anyone learning our exception hierarchy. Passing `(errno, strerror,
-/// filename)` is what makes CPython pick the subclass — a bare
-/// `OSError(message)` would not.
-///
-/// The container failures stay `TfTreeError` and carry §2.4's remedy: a
-/// `layout_hash` mismatch names **both** values and says to re-freeze, because
-/// a `.tft` is a cache and not an archive.
+/// An errno failure becomes a real `OSError` subclass (`FileNotFoundError` etc.). Container
+/// failures stay `TfTreeError` and carry §2.4's remedy: re-freeze, because a `.tft` is a
+/// cache and not an archive.
 #[cfg(target_os = "linux")]
 fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
     use tf_tree::{FrozenError, FrozenFileError, ShmError};
-    // `Path` has no `Display`; `display()` is lossy for a non-UTF-8 path, which
-    // is right for a *message*. The `filename` attribute below keeps the real
-    // bytes, because that is the one a caller may reopen with.
+    // `display()` is lossy for non-UTF-8 paths: fine for a message; `filename` keeps the bytes.
     let shown = path.display();
     match e {
         FrozenFileError::Path { raw_os_error } if raw_os_error != 0 => {
@@ -587,12 +295,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
             PyErr::new::<pyo3::exceptions::PyOSError, _>((
                 raw_os_error,
                 io.to_string(),
-                // `OsString`, deliberately, not `PathBuf`. PyO3 converts a
-                // `PathBuf` into a `pathlib.PurePath`, which would make
-                // `e.filename` a `PosixPath` even when the caller passed a
-                // `str` — CPython's own `OSError.filename` is a `str` there.
-                // `OsString` converts with `os.fsdecode` semantics, so it is
-                // the string form *and* survives a non-UTF-8 path.
+                // `OsString`, not `PathBuf`: keeps `e.filename` a `str` and survives non-UTF-8.
                 path.as_os_str().to_owned(),
             ))
         }
@@ -614,21 +317,9 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                      {expected}. Re-freeze the source recording — a .tft is a cache, not \
                      an archive (`tf_tree doctor --explain-version`)"
                 ),
-                // **The rest of `FrozenError`, enumerated, because it can be.**
-                // Unlike `LookupError` and `FrozenFileError` below, `FrozenError`
-                // is *not* `#[non_exhaustive]` — so this match is exhaustive and
-                // a tenth variant is a compile error here rather than a
-                // `SizeMismatch { actual: 4096, expected: 8192 }` shown to a
-                // Python user as if it were a sentence. Nine variants, and only
-                // the three above had prose; the arms below are the other six.
-                //
-                // None of them says "re-freeze the recording", which is the
-                // remedy the three above carry. Those three mean *wrong build*
-                // and re-freezing is the fix; these mean damaged file, wrong
-                // permissions or no memory, and sending someone to re-run an
-                // hour of bag ingest for a truncated write is worse advice than
-                // none. The one exception is the arena header's own layout-hash
-                // mismatch, below, because §2.4 is NORMATIVE about it.
+                // `FrozenError` is exhaustive here on purpose: a new variant is a compile error, not
+                // a raw struct shown to a user. Only the layout/version arms above mean "wrong
+                // build, re-freeze"; damaged-file arms below must not send anyone to re-run ingest.
                 FrozenError::Truncated => {
                     "ends before a structure its own header promises — the write \
                      was interrupted, or the file is still being written"
@@ -644,29 +335,13 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
                     "is {actual} bytes but its header says {expected}; the file is \
                      truncated or has been appended to"
                 ),
-                // The errno is carried through rather than described, because
-                // `EACCES` and `ENOMEM` on the same call want different
-                // responses and only the number distinguishes them.
+                // The errno is carried through: `EACCES` and `ENOMEM` want different responses.
                 FrozenError::Io(errno) | FrozenError::Map(errno) => format!(
                     "could not be read or mapped: {}",
                     std::io::Error::from_raw_os_error(errno.raw_os_error())
                 ),
-                // **The two arms that forward the engine's text.** `ShmError` is
-                // the arena-header check a `memfd` attach makes, with sixteen
-                // variants; enumerating a second enum from this module would
-                // re-spell `check.rs`'s reasons in a place that cannot see them
-                // change. Its `Display` (`docs/decisions/0059`) is one clause
-                // ending in the variant name, and that name is the only handle
-                // anyone has on which check failed: the reader is looking at a
-                // corrupt file. It printed `Debug`, labelled raw, until then.
-                //
-                // `LayoutMismatch` is split out because `PHASE5.md` §2.4 is
-                // NORMATIVE that a `layout_hash` mismatch states that the file
-                // must be re-frozen, and §2.4's read path checks the hash in the
-                // arena header as well as in the container header above
-                // (`docs/decisions/0059` decision 2(d)). The engine's text names
-                // both values; `ShmError`'s own says nothing about re-freezing,
-                // because a `memfd` attach shares it.
+                // Forward the engine's `Display` (`docs/decisions/0059`). `LayoutMismatch` is split
+                // out because §2.4 (NORMATIVE) requires a layout-hash mismatch to say re-freeze.
                 FrozenError::Arena(inner @ ShmError::LayoutMismatch { .. }) => format!(
                     "contains an arena image whose layout hash is not this \
                      build's. Re-freeze the source recording — a .tft is a cache, \
@@ -681,10 +356,7 @@ fn frozen_err(path: &Path, e: tf_tree::FrozenFileError) -> PyErr {
             };
             TfTreeError::new_err(format!("{shown}: {detail}"))
         }
-        // `FrozenFileError` is `#[non_exhaustive]`, so a variant added later
-        // reaches Python as a base `TfTreeError` rather than failing to
-        // compile here — deliberate: this crate is outside the workspace and a
-        // compile error in it is found late.
+        // `FrozenFileError` is `#[non_exhaustive]`: a new variant reaches Python as a base `TfTreeError`.
         other => TfTreeError::new_err(format!("{shown}: {other:?}")),
     }
 }

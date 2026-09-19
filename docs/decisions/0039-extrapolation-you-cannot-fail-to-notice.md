@@ -6,181 +6,29 @@
 
 ## Context
 
-`ExtrapPolicy` has three variants and all three work.
-`crates/tf_tree_core/src/sample.rs` implements `Error`, `Hold` and `ConstantTwist`
-in `sample`, `sample_from`, `sample_with_twist` and `sample_with_twist_from`; the
-`ConstantTwist` arm has its own helper (`constant_twist`), its own documented
-four-case table for the bracket-less outcomes, and tests.
-
-**No consumer can select any of them.** All five fold sites in
-`crates/tf_tree_core/src/plan.rs` pass the `Error` literal, `crates/tf_tree/src/`
-contains zero occurrences of the type, and the facade does not re-export it — so
-the name cannot even be written by a caller of `tf_tree`. The only code that ever
-passes `Hold` is a benchmark example reaching past the facade into
-`tf_tree_core::sample` (`crates/tf_tree_bench/examples/step_cost.rs:264`).
-
-So the engine carries a tested capability that is dead from every shipped surface,
-and the question is whether to delete it or to reach it. This record reaches it,
-because the capability is one a control loop actually wants: a controller running
-at 1 kHz against a 100 Hz state estimate is *always* asking for a stamp past the
-newest sample, and the honest answer is a bounded prediction with its bound
-attached — not a refusal, and not a silent stale pose.
+`ExtrapPolicy::{Error, Hold, ConstantTwist}` worked in `tf_tree_core::sample` but no consumer could select one: every fold site in `plan.rs` passed `Error` and `tf_tree` did not re-export the type (only `crates/tf_tree_bench/examples/step_cost.rs:264` passed `Hold`).
 
 ## Decision
 
-**Extrapolation is selected per query, and its result cannot be read without also
-reading how far it was extrapolated.**
+**Extrapolation is selected per query, and its result cannot be read without also reading how far it was extrapolated.** A `Hold` right for a 10 Hz edge is wrong for a 1 kHz edge on the same route, so the caller who bears the consequence chooses.
 
-### 1. One new return type, whose shape is the safety property
+### 1. `Extrapolated`
 
-```rust
-/// A pose, and how far past the plan's newest common sample it was extrapolated.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Extrapolated {
-    /// The pose.
-    pub pose: Iso3,
-    /// Nanoseconds past the newest stamp every dynamic edge on this plan has
-    /// data for. `0` means every edge bracketed the query — the answer is
-    /// interpolated, not invented.
-    pub by_ns: i64,
-    /// The dynamic edge that ran out of data first: the one whose newest stamp
-    /// is `by_ns` behind the query. Meaningless when `by_ns == 0`.
-    pub edge: EdgeId,
-}
-```
+`Extrapolated { pose: Iso3, by_ns: i64, edge: EdgeId }` is `Copy`. `by_ns` is nanoseconds past the newest stamp every dynamic edge has data for; `0` means every edge bracketed the query. `edge` is the edge that ran out first (meaningless at `by_ns == 0`). There is no accessor yielding the pose alone; a future one deletes the property this record is for.
 
-There is no accessor that yields the pose alone. That is the whole design: a
-caller who wants extrapolation is handed the distance in the same value, so
-"forgot to check the staleness" is not reachable by omission — it takes a
-deliberate `.pose`.
+### 2. Methods
 
-### 2. Two new methods, and the default does not move
+`Plan::at_extrapolating<D: Domain>(&self, g, t: Stamp<D>, policy)` and `Plan::at_extrapolating_tagged(&self, g, nanos, domain, policy)` return `Result<Extrapolated, LookupError>`. `Plan::at` is untouched and still passes `Error`. `ExtrapPolicy` and `Extrapolated` are re-exported from `tf_tree`.
 
-```rust
-impl Plan {
-    pub fn at_extrapolating<D: Domain>(&self, g: &Guard, t: Stamp<D>,
-        policy: ExtrapPolicy) -> Result<Extrapolated, LookupError>;
-    pub fn at_extrapolating_tagged(&self, g: &Guard, nanos: i64, domain: u8,
-        policy: ExtrapPolicy) -> Result<Extrapolated, LookupError>;
-}
-```
+### 3. `by_ns` is measured against `latest_common`, before the fold
 
-The tagged sibling exists for [`0038`](./0038-the-domain-a-binding-cannot-name.md)'s
-reason and is what the bindings call. `Plan::at` is untouched, still passes
-`Error`, and remains what the README's hot loop shows. `ExtrapPolicy` and
-`Extrapolated` are re-exported from `tf_tree` so the facade can name them.
+`by_ns = max(0, t - min over dynamic edges of newest_stamp)`, with the argmin edge, via `newest_common` factored out of `fold_latest_common`. The walk runs **before** the fold: `newest_stamp` is non-decreasing, so a concurrent `push` can only make `by_ns` over-report a bracketed query, never report `0` for a pose the fold invented. It is not `note`d (a second `note` would double `lookups_ok`, which `TFT010`/`TFT011` divide by). Test: `by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented`.
 
-### 3. `by_ns` is measured against `latest_common`, not per edge, and **before
-the fold**
+### 4. The hot path does not pay
 
-> **Amendment (2026-08-29).** This section originally said the distance is
-> derived *"after the fold"*, and §4 below still gives the reason — it keeps
-> `Plan::at`'s generated code unchanged. **After the fold is where it was wrong.**
-> A `push` landing between the fold and the walk, carrying a stamp at or past the
-> query, lifts `common` to `>= nanos`, and `nanos.saturating_sub(common).max(0)`
-> then reports **`by_ns == 0` — "not extrapolated" — for a pose the fold
-> genuinely invented.** That is the single claim this type exists to make
-> unmissable, and a 100 Hz edge under a 1 kHz query crosses the stamp often
-> enough that it is a race a robot runs.
->
-> The walk now runs **before** the fold. `SampleRing::newest_stamp` is
-> non-decreasing — `head` only advances and `push` refuses a stamp strictly older
-> than the newest — so `common_before <= common_during`, and the error inverts
-> into the safe direction: `by_ns` may over-report a query that was in fact
-> bracketed, and `by_ns == 0` means every edge already held data past the query
-> before the fold began. Nothing else moves: still one extra walk, still only on
-> this path, still `Plan::at` untouched, still not `note`d (a second `note` would
-> double the `lookups_ok` that `TFT010`/`TFT011` divide by).
->
-> `by_ns_zero_is_never_claimed_for_a_pose_the_fold_invented` is the test, and the
-> pose is its witness — `by_ns` alone cannot tell an honest `0` from a dishonest
-> one. Its first harness did not discriminate, and its note said it did; the
-> mutant is run.
-
-
-The distance reported is `max(0, t - min over dynamic edges of newest_stamp)` —
-the *worst* edge on the route, which is the number that bounds the answer's
-invention. `Plan::latest_common` already folds exactly that minimum
-(`fold_latest_common`); this reuses the same walk and additionally keeps the
-argmin edge, so nothing new is computed and nothing is estimated.
-
-### 4. The hot path does not pay for this
-
-The distance is derived **after** the fold, from `d` `newest_stamp` loads on the
-extrapolating path only. It is not threaded through `fold_at`, `sample_from` or
-the seqlock read, so `Plan::at`'s generated code is unchanged — verified by the
-existing benchmark gate rather than asserted. Threading an out-parameter through
-the sampler was the obvious alternative and is rejected for exactly this: the
-policy is a runtime enum, so an unused out-parameter would not be optimised away
-on the default path, and the default path is every existing caller.
-
-## Rationale
-
-**Why per query rather than per edge?** A `Hold` that is right for a 10 Hz map
-edge is wrong for the 1 kHz IMU edge on the same route, so per-edge configuration
-makes the property of an *answer* depend on a declaration made by whoever
-published, not by whoever is about to act on it. Per query, the caller who bears
-the consequence makes the choice.
-
-**Why not delete the two variants instead?** That was the smaller change and the
-one this record's alternative proposed: cut `Hold`, `ConstantTwist`,
-`constant_twist` and the `policy` parameter from four sampler signatures, ~130
-lines. It loses a capability the engine already computes correctly and that the
-project's own headline use case needs — and "refuse, the caller can hold the last
-pose themselves" is worse, because a caller holding the last pose *outside* the
-engine does not know how stale it is without asking a second question that the
-API also did not offer.
-
-**Why is `Hold` kept, given that a silently stale pose is the dangerous one?**
-Because it is not silent here. The danger in `Hold` is a pose that looks fresh;
-`Extrapolated` makes freshness a field the caller is handed. Under that shape
-`Hold` is the honest primitive for a consumer that genuinely wants
-zero-order hold (a latched static-ish edge, a display), and `ConstantTwist` is the
-one a controller wants. Both are reported identically.
-
-**Why not report per-edge staleness for every edge?** It would be a slice, which
-is an allocation or a caller-supplied buffer on a path that has neither, and the
-minimum is what bounds the composed answer. A caller who needs the breakdown has
-`Plan::span` and the diagnostics catalogue.
+The distance comes from `d` `newest_stamp` loads on the extrapolating path only, not threaded through `fold_at`, `sample_from` or the seqlock read; `Plan::at`'s code is unchanged (`just bench-check`).
 
 ## Consequences
 
-- The public surface grows by one struct, two methods and two re-exports. The
-  engine loses no code, and ~130 lines that were dead from every shipped surface
-  become reachable.
-- `docs/RUNBOOK.md`'s extrapolation guidance and `docs/PHASE1.md` §3.x can stop
-  describing a policy nobody could select.
-- `Extrapolated` is `Copy` and allocation-free, so R2 and R5 hold. It is not an
-  error type and does not need to be: extrapolation under an explicit policy is a
-  requested outcome, not a failure, and `ExtrapPolicy::Error` remains the way to
-  make it a failure.
-- A future accessor returning only the pose would delete the property this record
-  is for. It is a design smell for `docs/PROJECT.md` §6, and is listed there.
-
-## Implementation plan
-
-1. Re-export `ExtrapPolicy` from `tf_tree`; add `Extrapolated` to
-   `tf_tree_core::plan` and re-export it. Verified by a doctest naming both types
-   through the facade.
-2. A private `newest_common(&self, g) -> Result<Option<(i64, EdgeId)>, LookupError>`
-   on `Plan`, factored out of `fold_latest_common` so the minimum and its argmin
-   edge are computed once and in one place. Verified by `latest_common`'s existing
-   tests continuing to pass unchanged.
-3. `at_extrapolating` and `at_extrapolating_tagged`. Verified by a test that a
-   query 5 ms past the newest sample returns `Err(Extrapolation)` under `Error`,
-   the newest pose with `by_ns == 5_000_000` under `Hold`, and a *different* pose
-   with the same `by_ns` under `ConstantTwist` — the third assertion being what
-   distinguishes the two policies rather than just exercising them.
-4. `Plan::at`'s generated code is unchanged: verified by `just bench-check`
-   against the committed baseline, and reported in the PR rather than assumed.
-5. `docs/API.md` §2 records the new surface against the six rules;
-   `docs/PROJECT.md` §6 gains the smell in step 4's *Consequences*.
-
-## Open questions
-
-None. Two were resolved while writing:
-
-- *Per-edge or per-query?* Per query — the caller who bears the consequence
-  chooses, and a route mixes rates.
-- *Should the pose be reachable without the distance?* No, and that is the point
-  of the type rather than an incidental property of it.
+- `Error` remains the way to make extrapolation a failure; extrapolation under an explicit policy is a requested outcome, not an error.
+- Step 3 test: a query 5 ms past the newest sample gives `Err(Extrapolation)` under `Error`, the newest pose with `by_ns == 5_000_000` under `Hold`, and a different pose with the same `by_ns` under `ConstantTwist`.

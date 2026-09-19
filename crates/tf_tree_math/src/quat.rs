@@ -137,10 +137,8 @@ impl Quat {
 
     /// Component-wise difference.
     ///
-    /// Exists for the chord form `|a − b|² = 2 − 2·(a·b)`, which is how `slerp`
-    /// obtains the angle between two near-parallel quaternions **without**
-    /// forming `1 − dot` — a subtraction that cancels catastrophically exactly
-    /// when the two are close, which is the case that dominates.
+    /// Used by `slerp`'s chord form `|a − b|² = 2 − 2·(a·b)`, avoiding the
+    /// cancelling `1 − dot` for near-parallel inputs.
     #[inline]
     #[must_use]
     pub const fn sub(self, rhs: Self) -> Self {
@@ -176,9 +174,6 @@ impl Quat {
     }
 
     /// Rotate a vector by this (unit) quaternion: `v' = q · v · q⁻¹`.
-    ///
-    /// Uses the two-cross-product form, which needs no explicit quaternion
-    /// product and is numerically well behaved.
     #[inline]
     #[must_use]
     pub fn rotate(self, v: Vec3) -> Vec3 {
@@ -208,9 +203,8 @@ impl Mul for Quat {
 /// SO(3) exponential: map a rotation vector `ω` (axis × angle) to a unit
 /// quaternion.
 ///
-/// `q = (cos(θ/2), sinc(θ/2)·½·ω)` with `θ = |ω|`; the `sin(θ/2)/θ` scale uses a
-/// Taylor series below `EXP_SO3_SMALL` (a private threshold) to stay finite at
-/// `θ = 0`.
+/// `q = (cos(θ/2), sinc(θ/2)·½·ω)` with `θ = |ω|`; a Taylor series keeps the
+/// scale finite at `θ = 0`.
 #[inline]
 #[must_use]
 pub fn exp_so3(w: Vec3) -> Quat {
@@ -219,15 +213,12 @@ pub fn exp_so3(w: Vec3) -> Quat {
 
 /// [`exp_so3`] with the rotation magnitude `theta = ‖w‖` supplied by the caller.
 ///
-/// `exp_se3` already computes `‖w‖` for the `V` coefficients; threading it here
-/// avoids recomputing the `sqrt`. `theta` must equal `w.norm()`.
+/// `theta` must equal `w.norm()`.
 #[inline]
 #[must_use]
 pub(crate) fn exp_so3_theta(w: Vec3, theta: f64) -> Quat {
     let half = 0.5 * theta;
-    // One sincos for both the scalar part and the sin(θ/2)/θ scale.
     let (sin_half, cos_half) = libm::sincos(half);
-    // scale = sin(θ/2)/θ, so that q_v = scale · ω.
     let scale = if theta > EXP_SO3_SMALL {
         sin_half / theta
     } else {
@@ -246,15 +237,12 @@ pub(crate) fn exp_so3_theta(w: Vec3, theta: f64) -> Quat {
 /// SO(3) logarithm: map a unit quaternion to its rotation vector `ω` in the
 /// principal branch `|ω| ∈ [0, π]`.
 ///
-/// **Quaternion form, never the trace.** `θ = 2·atan2(‖q_v‖, q_w)` (after
-/// canonicalizing `q_w ≥ 0`) is accurate to full precision even near `θ = π`,
-/// where `acos((tr R − 1)/2)` loses nine digits.
+/// Quaternion form, never the trace: `θ = 2·atan2(‖q_v‖, q_w)` stays accurate
+/// near `θ = π`, where `acos((tr R − 1)/2)` loses nine digits.
 #[inline]
 #[must_use]
 pub fn log_so3(q: Quat) -> Vec3 {
-    // Canonicalize to the hemisphere w ≥ 0 so θ/2 = atan2(n, w) ∈ [0, π/2] and
-    // the result lands in the principal branch |ω| ∈ [0, π]. q and −q are the
-    // same rotation, so this is free.
+    // w ≥ 0 puts the result in the principal branch.
     let (w, x, y, z) = if q.w < 0.0 {
         (-q.w, -q.x, -q.y, -q.z)
     } else {
@@ -265,8 +253,6 @@ pub fn log_so3(q: Quat) -> Vec3 {
         return Vec3::ZERO;
     }
     let theta = 2.0 * libm::atan2(n, w);
-    // scale = θ/n maps the (unit) axis (x,y,z)/n up to magnitude θ. atan2 keeps
-    // θ ≈ 2n for tiny n, so θ/n stays well conditioned down to n → 0.
     let scale = theta / n;
     Vec3 {
         x: scale * x,
@@ -280,27 +266,13 @@ pub fn log_so3(q: Quat) -> Vec3 {
 /// `r` is `[r00 r01 r02, r10 r11 r12, r20 r21 r22]`, the same order
 /// `tf_tree_c`'s `rot3` emits, so this is exactly its inverse.
 ///
-/// # Why the four branches
+/// Shepperd's method: built around the largest of `w, x, y, z`, so it is
+/// accurate for half-turns where `√(1 + tr R)/2` is `0/0`.
 ///
-/// The textbook one-liner `w = √(1 + tr R)/2` divides the vector part by `4w`,
-/// and `w → 0` as the angle approaches π — precisely the rotations a robot's
-/// `map → odom` yaw spends time near. At `θ = π` it is `0/0`. Shepperd's method
-/// instead builds the quaternion around whichever of `w, x, y, z` is largest in
-/// magnitude, so the divisor is never below `1/√2` of the largest component and
-/// the result is accurate to full precision for every rotation, including the
-/// half-turns.
+/// # Does not validate `r`
 ///
-/// # This does not validate `r`
-///
-/// A non-rotation input produces a quaternion rather than an error — a
-/// reflection (`det R = −1`) yields a *different, valid* rotation, silently.
-/// That check belongs where foreign input arrives, not in the kernel; see
-/// `tf_tree_c::layout::read`, which rejects `|det R − 1| > 1e-6` before calling
-/// this.
-///
-/// The result is not normalized either, for the same reason: a caller that
-/// validated the determinant knows the norm is 1 to rounding, and one that did
-/// not should not be silently rescued.
+/// A reflection yields a different valid rotation, silently, and the result is
+/// not normalized. `tf_tree_c::layout::read` rejects `|det R − 1| > 1e-6` first.
 #[inline]
 #[must_use]
 pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {

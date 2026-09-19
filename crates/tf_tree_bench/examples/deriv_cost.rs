@@ -1,23 +1,13 @@
 //! Cost of `at_with_derivatives` against `at` — `docs/PHASE4.md` §7, last row.
 //!
-//! §2.3 predicts "roughly 2× a plain lookup", and §2.1 claims the derivative adds
-//! **no transcendental call**. Both are checkable here, and neither should be
-//! taken on faith: §2.3's original cost model ("the first derivative costs one
-//! scalar multiply") was false against the shipped code, which is why the section
-//! now carries an amendment.
+//! §2.3 predicts "roughly 2× a plain lookup" and §2.1 claims **no transcendental call** for the
+//! derivative; both are checked here, at two levels because a plan-level ratio mixes two costs:
 //!
-//! Three things are measured, at two levels, because a ratio at plan level mixes
-//! two different costs and would hide which one moved:
-//!
-//! * **interpolation level** — `ScLerp::eval` vs `ScLerp::eval_with_twist` on
-//!   pre-built pose pairs. This isolates ξ-recovery: one `sqrt` plus `φ`, where
-//!   `φ` is a second `sqrt` on the small-angle branch and the already-computed
-//!   `atan2` on the large-arc branch. Swept across the arc regimes so the
-//!   branch's payoff is visible rather than asserted.
-//! * **plan level** — `Plan::at` vs `Plan::at_with_derivatives` at depth 1, 3
-//!   and 8, which adds one adjoint application per step (two `Quat::rotate` and
-//!   one `Vec3::cross`). The slope across depth is the adjoint's real cost.
-//! * **the §7 gate row** — the depth-3 ratio, which is what the spec asks for.
+//! * **interpolation level** — `ScLerp::eval` vs `eval_with_twist` on pre-built pose pairs,
+//!   isolating ξ-recovery, swept across the arc regimes.
+//! * **plan level** — `Plan::at` vs `at_with_derivatives` at depth 1, 3 and 8; the slope across
+//!   depth is the adjoint's cost (two `Quat::rotate` and one `Vec3::cross` per step).
+//! * **the §7 gate row** — the depth-3 ratio.
 //!
 //! Run pinned; unpinned runs migrate cores and swing by >30%:
 //! `taskset -c 2 cargo run --release -p tf_tree_bench --example deriv_cost`
@@ -40,8 +30,7 @@ fn axis_angle(theta: f64, x: f64, y: f64, z: f64) -> Quat {
     Quat::new(half.cos(), s * x, s * y, s * z)
 }
 
-/// Same pair construction as `interp_cost`, so the two benchmarks' numbers are
-/// directly comparable.
+/// Same pair construction as `interp_cost`, so the numbers are comparable.
 fn pairs(theta: f64) -> Vec<(Iso3, Iso3)> {
     (0..N)
         .map(|i| {
@@ -182,8 +171,7 @@ fn main() {
         let dst = tree.frame(&names[depth]).unwrap();
         let plan = tree.plan(src, dst).unwrap();
         let g = tree.guard();
-        // Stamps stay strictly inside the published span and sweep non-monotonically
-        // enough that the galloping cursor is not what is being measured.
+        // Stamps stay inside the published span and sweep non-monotonically, so the cursor is not measured.
         let stamps: Vec<i64> = (0..N)
             .map(|i| 10_000_000 + ((i * 7919) % 480_000_000) as i64)
             .collect();
@@ -226,10 +214,8 @@ fn main() {
     row(8);
 
     // ---- endpoints: the two most-queried stamps on any edge ----
-    // s == 0.0 is an exact hit on a published sample; s == 1.0 is `t == t_new`,
-    // which is what every `latest` query lands on. Both discard the screw power,
-    // so `eval_with_twist` skips it -- this is the row that shows whether that
-    // shortcut is real.
+    // s == 0.0 is an exact hit; s == 1.0 is `t == t_new`, what every `latest` query lands on. Both
+    // discard the screw power, so `eval_with_twist` skips it; this row shows whether that is real.
     println!("\nendpoints — eval_with_twist at s in {{0, 1}} vs interior");
     println!(
         "{:>16} {:>12} {:>12} {:>10}",
