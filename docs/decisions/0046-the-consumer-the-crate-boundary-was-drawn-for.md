@@ -245,11 +245,3 @@ second spelling); where provenance lives (**on the tree**, dropped on mutation);
 which `IngestOptions` fields are keywords (**five**, with `max_record_bytes`
 included for `0010`'s own stated reason); and whether the wheel splits (**no** —
 +174 KiB against numpy's 29.3 MiB).
-
-**Two of this record's own arguments did not survive being implemented**, and
-they are corrected above rather than quietly dropped: the claim that
-`tft::freeze_bag` expresses something the composition cannot (refuted by reading
-it), and the claim that the `ingest` feature earns its place by letting
-`py-cross-check` drop the dependency (refuted by running the recipe). Both were
-load-bearing when written. `docs/decisions/README.md` notes that a `ready`
-record's own next step has falsified its claims before; this is another.

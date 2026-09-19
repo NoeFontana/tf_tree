@@ -102,9 +102,6 @@ All four steps have landed in #114.
 
 ## Resolved questions
 
-Both were open while this record was `draft`; recorded here rather than deleted,
-because the reasoning is the part worth keeping.
-
 **1 — Assert the equality, don't just argue it. Resolved: yes, `debug_assert_eq!`
 in `push`.**
 

@@ -29,9 +29,7 @@ file is what `ready` closes here.
 ## What was measured
 
 **Read *and run*, on this branch.** The instruments are named below so that a
-doubter re-runs them rather than trusting a reading; the earlier revision of this
-section said *"No build; this is an inspection, and it is labelled as one"*, and
-that is no longer the state.
+doubter re-runs them rather than trusting a reading.
 
 **The header fields exist**, exactly as §1.2 promised
 (`crates/tf_tree_arena/src/header.rs`, with `offset_of!` assertions beside them):
@@ -202,28 +200,18 @@ forking the geometry without forking the hash.
    seeded with three entries and carries two. Step 2 below says the same, because
    that is the step a reader re-runs.*
 
-   **A fabricated citation is removed here rather than repaired.** *This part
-   used to attribute to [`0009`](./0009-descoping-phase-6.md) the sentence*
-   *"no bump is queued … so 'wait' means 'indefinitely', which is a decision not*
-   *to build it."* `0009` does not contain it, and neither does anything else in
-   the tree: `grep -rn 'bump is queued'` finds one hit, this file, and
-   `git log -S` finds it entering in this record's own first commit. What `0009`
-   *does* say is adjacent and weaker — that §1 spent the 2 → 3 break "partly to
-   pre-reserve Phase 6's layout, so that *the break happens exactly once*", and
-   that removing a reserved field after Phase 6 populates it is a
-   `FORMAT_VERSION = 4`. That is the cost this ledger exists to schedule, and it
-   carries the argument without a quotation nothing compares.
+   [`0009`](./0009-descoping-phase-6.md) says that §1 spent the 2 → 3 break
+   "partly to pre-reserve Phase 6's layout, so that *the break happens exactly
+   once*", and that removing a reserved field after Phase 6 populates it is a
+   `FORMAT_VERSION = 4`. That is the cost this ledger exists to schedule.
 
 3. **Couple the stride array to the region count**, so the silent edit cannot be
-   missed. The form is the array's own type — `let strides: [u32; N_REGIONS + 1]`
-   — and both halves of that sentence are corrections to this record's own
-   earlier text. *It proposed "a `const` assertion in `layout.rs` relating
-   `strides.len()` to `N_REGIONS`"*: `strides` is a function-local `let` inside a
-   `pub const fn`, so a module-level `const` assertion cannot see it; and the
-   relation is `N_REGIONS + 1`, because `R_TOPO` contributes two stride entries.
-   An implementer following the old text literally writes an assertion that is
-   false on an unmodified tree, and the tempting repair — deleting a stride entry
-   — silently changes `layout_hash` for every participant in the fleet.
+   missed. The form is the array's own type — `let strides: [u32; N_REGIONS + 1]`.
+   A module-level `const` assertion cannot see `strides`, because it is a
+   function-local `let` inside a `pub const fn`; the relation is `N_REGIONS + 1`,
+   because `R_TOPO` contributes two stride entries. The tempting repair —
+   deleting a stride entry — silently changes `layout_hash` for every participant
+   in the fleet.
 
    **What it does not catch, so that nobody over-reads one line.** It is a
    *cardinality* check: it cannot see a stride written at the wrong index or with

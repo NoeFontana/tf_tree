@@ -262,16 +262,9 @@ impl Build {
 ///
 /// # Why a reason needs a ground
 ///
-/// §9.3 is NORMATIVE that a row which cannot be measured fairly must *say why*,
-/// and for most of this file's life the why was free prose. Prose goes stale
-/// silently: two rows explained themselves by saying `docs/PHASE5.md` §2 and §3
-/// "are not implemented" long after both had landed, and the guard written
-/// against that failure was a scan for the three phrases those two sentences
-/// happened to use. **A check keyed on how a claim is worded is defeated by
-/// rewording it**, and four further reasons in this same file had gone stale
-/// without ever using one of the three phrases —
-/// `tests::no_unavailable_reason_rests_on_a_claim_that_has_gone_stale` names
-/// all four.
+/// §9.3 is NORMATIVE that a row which cannot be measured fairly must *say why*.
+/// **A check keyed on how a claim is worded is defeated by rewording it** —
+/// see `tests::no_unavailable_reason_rests_on_a_claim_that_has_gone_stale`.
 ///
 /// So the decisive half of a reason is moved out of the prose and into this
 /// enum, and [`Report::validate`] re-derives it on every run. The prose stays,
@@ -369,17 +362,13 @@ impl Ground {
     /// The stable spelling of the ground, for [`Report::validate`]'s refusal
     /// messages and for the test that seeds a stale ground and greps for it.
     ///
-    /// **No row carries it into `results.json` or `index.html`, and this doc
-    /// comment claimed the opposite until 2026-09-04.** It read "the JSON/HTML
-    /// spelling, so a reader of `results.json` sees the ground and not only the
-    /// prose", in the same commit that decided *not* to emit it: `to_json`
-    /// writes the schema `SCHEMA` names, and adding a key to it is a
-    /// consumer-visible change that rides a schema bump, which this change did
-    /// not take. What a reader of the artifact gets is the prose reason. The
-    /// checkable form of that is the emitter directly above and below: no row
-    /// object written by `to_json` has a `grounds` key. It is *not* checkable by
-    /// grepping the artifact for one of these spellings — a correction this
-    /// paragraph needed twice, because `host_fitness` is also the name of the
+    /// **No row carries it into `results.json` or `index.html`.**
+    /// `to_json` writes the schema `SCHEMA` names, and adding a key to it is a
+    /// consumer-visible change that rides a schema bump. What a reader of the
+    /// artifact gets is the prose reason. The checkable form of that is the
+    /// emitter directly above and below: no row object written by `to_json`
+    /// has a `grounds` key. It is *not* checkable by grepping the artifact for
+    /// one of these spellings, because `host_fitness` is also the name of the
     /// artifact's top-level fitness block, so a grep for it hits and means
     /// nothing. If the ground is wanted in the artifact, that is the bump — not
     /// a quiet extra field.
@@ -1294,13 +1283,8 @@ impl Report {
     ///
     /// # Which of §9.3's five bullets this reaches, and which it does not
     ///
-    /// `docs/PHASE5.md` §0.0 used to say this method "makes the honesty rules
-    /// structural — the tool refuses to write a report that over-claims", while
-    /// four of §9.3's five bullets were reached by no line of it: `validate`
-    /// read `self.rows`, `self.worse` and `self.fitness`, and never
-    /// `self.provenance` or `self.warmup_discarded_s`. The row-by-row map is
-    /// kept here, beside the code, because a claim about what a check covers
-    /// belongs where the check is:
+    /// The row-by-row map is kept here, beside the code, because a claim about
+    /// what a check covers belongs where the check is:
     ///
     /// | §9.3 bullet | Held by |
     /// |---|---|
@@ -1954,42 +1938,19 @@ impl Default for Options {
 /// # The reason is derived from a `cfg`, not written as prose, and that is the
 /// point
 ///
-/// Both rows previously carried a hand-written reason saying `docs/PHASE5.md`
-/// §2 and §3 "are not implemented". **Both are, and §0.0's status table — which
-/// those very strings cited as the source of truth — says so.** So the tool was
-/// printing a false statement, under the section (§9.3) whose whole subject is
-/// that an unmeasurable row must say *why*.
+/// The frozen backend is `#[cfg(all(feature = "shm", target_os = "linux"))]`,
+/// and `just bench-report` builds without `--features shm`, so on the shipped
+/// recipe `Tree::open_frozen` is *not compiled into this binary* — that is the
+/// real blocker, it is checkable by the compiler, and it cannot go stale the
+/// way a sentence about a phase can.
 ///
-/// The fix is to stop asserting anything about the roadmap. The frozen backend
-/// is `#[cfg(all(feature = "shm", target_os = "linux"))]`, and `just
-/// bench-report` builds without `--features shm`, so on the shipped recipe
-/// `Tree::open_frozen` is *not compiled into this binary* — that is the real
-/// blocker, it is checkable by the compiler, and it cannot go stale the way a
-/// sentence about a phase can.
-///
-/// **The `shm` branch had gone stale in turn, and it is the reason this file
-/// stopped trusting prose at all.** It said the remaining blocker was data —
-/// "this harness builds only synthetic fixtures", against §12 gate 2's 233 MB
-/// index. That was true when it was written and is not now:
-/// `crates/tf_tree_bench/src/bin/frozen_workers.rs`, in this same crate, freezes
-/// an index on the order of 338 MiB, re-execs itself as sixteen workers and
-/// reports §12 gate 4 at 1.024x. The binary's own header says both of this
-/// row's reasons "dissolved". So the branch now says what is still true — that
-/// `bench_report` is one process and maps no `.tft`, and that the measurement
-/// lives in a named recipe — and it carries `Ground::MeasuredElsewhere`, which
-/// is one of the three grounds `Report::validate` cannot decide. That is the
-/// honest label: this half of the reason rests on somebody having read the
-/// repository. What checks it here is
+/// The branch carries `Ground::MeasuredElsewhere`, which is one of the three
+/// grounds `Report::validate` cannot decide: this half of the reason rests on
+/// somebody having read the repository. What checks it here is
 /// `every_command_the_report_names_is_a_command_that_exists`, and what that
 /// resolves is the recipe's *name* — not that the recipe measures this row.
-///
-/// **CORRECTION (2026-09-05): the recipe is a parameter now, because one name
-/// was being told to two rows and it was wrong for one of them.** The branch
-/// named `just gate4` for both, describing a binary that "re-execs itself as N
-/// workers and sums their Pss" — true of the Pss row, and false about the
-/// *open timing* the other row is waiting for, because `just gate4` never
-/// starts a clock. Each row names the recipe that takes its own measurement
-/// now (`just gate4`, `just gate2`).
+/// Each row names the recipe that takes its own measurement (`just gate4`,
+/// `just gate2`).
 fn frozen_row_reason(attempt: &str, recipe: &str) -> String {
     if cfg!(all(feature = "shm", target_os = "linux")) {
         format!(
@@ -2081,9 +2042,7 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         // under `--features tf2` this binary links one, and `crate::ratio::measure`
         // and `crate::differential::run_tf2` both call `tf2::BufferCore` in this
         // process — so it lives in the branch below, which fires only when
-        // `no_ros`, and `no_ros` implies `!build.tf2_linked`. An earlier version
-        // of this round asserted "links no second engine … in any build" here,
-        // which was false in exactly the build `docker/tf2` runs. Not
+        // `no_ros`, and `no_ros` implies `!build.tf2_linked`. Not
         // compile-checkable on a host with no ROS 2 install (`cargo check
         // --features tf2` fails in `tf_tree_tf2_sys`'s build script); the split is
         // reasoned off `Build::current()`, whose `tf2_linked` is
@@ -2130,15 +2089,8 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
         .on(&n_way_grounds),
     );
 
-    // **This row's reason was false in the build the container runs, and the
-    // false half was the one that sounded like a fact about the tool.** It said
-    // the tf2 column "needs a ROS 2 install this report cannot reach
-    // in-process; running both halves from one tool would mean linking tf2 into
-    // it" — and `--features tf2` does exactly that: `crate::ratio::measure` and
-    // `crate::differential::run_tf2` both call `tf2::BufferCore` in this
-    // process, and `baseline/results-tf2.json` carries the sentence anyway. The
-    // residual that is true in *both* builds is process count: this row sums
-    // Pss across N consumer processes and `bench_report` is one process.
+    // The residual that is true in *both* builds is process count: this row
+    // sums Pss across N consumer processes and `bench_report` is one process.
     let rss_reason = {
         let mut r = "this row sums Pss across N consumer processes, and `bench_report` is \
              one process — it stands up no consumers and has none to weigh. `just \
@@ -2260,20 +2212,10 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
             // describes it at length. What is genuinely missing is the
             // *instrument*: `dds_report`'s `svc` column times the engine call,
             // not the publish timestamp to the moment a consumer can see it.
-            // **This sentence has counted its own gaps wrong in both
-            // directions, and now does not count them.** It first read
-            // "Two further gaps: this row needs the
-            // `shm` feature and a second process per consumer, which
-            // `bench_report` does not have; and nothing in this repository times
-            // publish-to-visible end to end" — but the process count is the
-            // first clause of `host_reason` itself, so quoting it again as a
-            // *further* gap counted one obstacle twice. It was corrected to
-            // "One further gap", which was wrong the other way in the default
-            // build: the `shm` clause below appends a second one. A numeral in
-            // front of a list whose length is decided by a `cfg!` further down
-            // the function is not a fact the writer can hold, so there is no
-            // numeral — the sentences enumerate themselves, and the ground list
-            // beside them is what `validate` re-derives.
+            // A numeral in front of a list whose length is decided by a `cfg!`
+            // further down the function is not a fact the writer can hold, so
+            // there is no numeral — the sentences enumerate themselves, and the
+            // ground list beside them is what `validate` re-derives.
             ptv_reason,
             "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
         )
@@ -2481,9 +2423,6 @@ fn assemble_on(opts: &Options, fitness: Fitness, build: Build, ros_env: bool) ->
 /// `just embed-cost` prints it and writes it to `target/embed-cost/`, and
 /// nothing gates it.
 /// What the two columns of the tf2 ratio row mean, and what they do not.
-///
-/// (The stray first paragraph this doc comment used to open with belonged to
-/// [`EMBEDDING_NOTE`] and described a different constant.)
 const RATIO_NOTE: &str = "Both engines in one process, `LerpSlerp` on both sides (tf2's \
     policy), depth 3 after constant folding, 256 off-grid stamps. `speedup_vs_tf2` is the \
     MEDIAN PER-ROUND quotient, not the quotient of the two medians: the arms are timed back \
@@ -3649,8 +3588,7 @@ mod tests {
     /// lives in `validate` rather than in the gate because the gate would have
     /// to *guess* that a row it skipped was meant to be checked.
     ///
-    /// It binds `indicative` as well as `measured`, and the reason is *not* the
-    /// one an earlier revision of this comment gave. `bench-check` skips every
+    /// It binds `indicative` as well as `measured`. `bench-check` skips every
     /// row whose **baseline** status is not `measured` (`baseline::compare`
     /// short-circuits on it), so an indicative row is compared neither with a
     /// direction nor without one, and "the gate would compare nothing in it" is
@@ -4823,31 +4761,7 @@ mod tests {
     /// **The shipped rows' reasons, checked against the property rather than
     /// against the wording.**
     ///
-    /// # What was here before, and why it caught nothing
-    ///
-    /// Two rows once explained themselves by saying `docs/PHASE5.md` §2 and §3
-    /// "are not implemented", citing §0.0's status table as the source of truth
-    /// while that table recorded §2 as **Done** and §3 as done for MCAP. The
-    /// guard written against that was a substring scan for the three phrases
-    /// those two sentences happened to use. **A check keyed on how a claim is
-    /// worded is defeated by rewording it**, and four further reasons in this
-    /// file had already gone stale using none of the three:
-    ///
-    /// * `total_rss_n_consumers` said the tf2 column "needs a ROS 2 install this
-    ///   report cannot reach in-process" — false in the `--features tf2` build,
-    ///   which times `tf2::BufferCore` in this process, and which prints that
-    ///   sentence into `baseline/results-tf2.json`;
-    /// * `publish_to_visible` said its tf2 counterpart "needs a DDS round trip
-    ///   that no configuration here provides" — false since
-    ///   `ros/tf_tree_bench_ros` and `just dds-bench`;
-    /// * `frozen_row_reason`'s shm branch said "this harness builds only
-    ///   synthetic fixtures" — false since `src/bin/frozen_workers.rs`, in this
-    ///   crate, freezes an index on the order of 338 MiB;
-    /// * `tft_16_workers_rss` told a reader to reproduce it "on >= 16 physical
-    ///   cores", for a [`Sensitivity::Memory`] row that `Report::validate`'s own
-    ///   core-budget exemption was written to release from that requirement.
-    ///
-    /// # What this checks instead
+    /// # What this checks
     ///
     /// Every unavailable row in the *shipped* report rests on at least one
     /// [`Ground`], and every ground it names still holds. `validate` is what
@@ -5088,17 +5002,12 @@ mod tests {
             // **The reason, not only `reproduce:`.** The `Ground` type's docs
             // offer this test as the one partial mitigation for
             // `Ground::MeasuredElsewhere`, "resolves the recipe a
-            // `MeasuredElsewhere` row names" — and until 2026-09-04 it read
-            // `reproduce` alone, while recipes are named in reasons that appear
-            // in no `reproduce` field: `just bench-report`, for one, which
-            // `frozen_row_reason` puts in both `.tft` rows' reason while
-            // neither row's `reproduce` names it. A count of them stood here
-            // and was wrong — it named a closed set that this one was not in —
-            // and no number replaces it: differencing the two fields over the
-            // emitted `results.json` answers it, and the fact this line needs
-            // is that the set is not empty. A recipe in a reason rots exactly as a
-            // recipe in a command does; it is the same prose wearing a
-            // different field name.
+            // `MeasuredElsewhere` row names" — and recipes are named in reasons
+            // that appear in no `reproduce` field: `just bench-report`, for one,
+            // which `frozen_row_reason` puts in both `.tft` rows' reason while
+            // neither row's `reproduce` names it. A recipe in a reason rots
+            // exactly as a recipe in a command does; it is the same prose
+            // wearing a different field name.
             check(&row.reason, row.id);
         }
         let html = r.to_html();
@@ -5120,12 +5029,9 @@ mod tests {
         // from `reproduce` and the HTML block alone, so deleting
         // `check(&row.reason, ...)` or reverting the leading-token trim fails
         // this test; and below what it yields with both, so deleting one
-        // sentence of prose does not. Prose copies of those two counts stood
-        // here and in `docs/PHASE5.md` and are gone — a count in a comment is a
-        // measurement with a date on it, and this one sat in the same file as
-        // the prose it counted, so editing any reason moved it. Re-derive both,
-        // in whichever tree state you are asking about, by replacing this floor
-        // with an unreachable one and reading the panic message.
+        // sentence of prose does not. Re-derive both, in whichever tree state
+        // you are asking about, by replacing this floor with an unreachable
+        // one and reading the panic message.
         assert!(
             checked >= 20,
             "only {checked} commands were checked — the scanner matched nothing"

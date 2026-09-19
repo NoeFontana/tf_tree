@@ -633,7 +633,7 @@ pub enum ChunkDamage {
     /// chunk is complete, so its declared size is compared against what is present
     /// rather than clamped the way a truncated chunk's is.
     ///
-    /// **Not `LengthMismatch`**, which it used to be. Neither number in this fault
+    /// **Not `LengthMismatch`**. Neither number in this fault
     /// is an uncompressed byte count and no decoder has run, so the message that
     /// variant renders ("it declared N uncompressed bytes and produced M") named
     /// the wrong field of the header.
@@ -642,7 +642,7 @@ pub enum ChunkDamage {
     ///
     /// Detected in every build, as `BadChunkKind::StoredSizeMismatch`, because on
     /// an uncompressed chunk the two size fields must agree and this variant makes
-    /// them differ by four. **Not `LengthMismatch`**, which it used to be: neither
+    /// them differ by four. **Not `LengthMismatch`**: neither
     /// number is a decoder's output, and the variant's own docs say why the
     /// distinction is worth a variant.
     ///
@@ -1198,8 +1198,7 @@ fn chunk_body(
     // Moved rather than copied: the records field is the whole chunk and this is the
     // one full-size copy in the writer that costs nothing to remove. It is a move all
     // the way back to the caller's records for an uncompressed fixture, which is what
-    // `compress_records` taking `bytes` by value buys — an earlier revision copied
-    // there and left this comment describing a saving it had undone.
+    // `compress_records` taking `bytes` by value buys.
     body.append(&mut payload);
     Ok(body)
 }
@@ -1590,12 +1589,9 @@ mod tests {
     /// worth pinning. A **long** `compressed_size` is a `CompressedSizeMismatch`
     /// and not a `LengthMismatch`, because no decoder has run and neither number is
     /// an uncompressed byte count. A **short** one is caught by the
-    /// `uncompressed_size == compressed_size` invariant rather than by the CRC —
-    /// which is what closed the "no computed CRC" gap the variant's docs used to
-    /// record as live. And a lying `uncompressed_size` is caught in *every* build,
-    /// including the codec-free one, by that same invariant; an earlier revision of
-    /// this paragraph said it was caught by nothing, which the row at the bottom of
-    /// this test disproves.
+    /// `uncompressed_size == compressed_size` invariant rather than by the CRC.
+    /// And a lying `uncompressed_size` is caught in *every* build,
+    /// including the codec-free one, by that same invariant.
     ///
     /// Mutant: `chunk_body` hashing the records *after* the flip for
     /// `FlippedBitInRecords` — applied, and the `FlippedBitInRecords` row failed

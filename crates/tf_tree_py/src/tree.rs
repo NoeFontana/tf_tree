@@ -2682,9 +2682,8 @@ pub fn push(
 /// `frame_headroom` matters more here than it does on [`build`], and this is the
 /// call it was missing from: a *shared* arena is the one other processes attach
 /// to, and `Tree::frame()` from any of them needs a spare slot to intern a name
-/// into. Zero — which is what this used to be, with no way to say otherwise —
-/// means a Python-created arena refuses every runtime frame name for its whole
-/// life.
+/// into. Zero means a Python-created arena refuses every runtime frame name
+/// for its whole life.
 ///
 /// **Creating requires `mode="rw"`**, and is refused otherwise rather than
 /// quietly ignored. Both of §4.1's reasons for the read-only default survive

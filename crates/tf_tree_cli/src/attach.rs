@@ -1,13 +1,5 @@
 //! Attaching the CLI to a **live** arena — `docs/decisions/0005` step 11.
 //!
-//! # Why this is the milestone's real acceptance test
-//!
-//! Everything else in `0005` is exercised by tests that arrange their own
-//! processes. This is the first consumer that behaves like a user: it resolves
-//! the rendezvous from the environment, joins whatever is running, and prints
-//! what it finds. If `open()` needs a flag nobody would guess, or fails in a way
-//! nobody can act on, that shows up here first.
-//!
 //! # Read-only by default, and it is not a nicety
 //!
 //! `--rw` is opt-in and `--create` defaults to `never`. A diagnostic tool that

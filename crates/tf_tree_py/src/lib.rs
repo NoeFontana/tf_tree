@@ -24,8 +24,7 @@
 //! `Send + !Sync` by design, so [`PyPublisher`] does not hold one directly —
 //! it holds an [`OwnedWriter`](tf_tree::OwnedWriter) behind a `Mutex`, which is
 //! `Sync` because the writer is `Send`. That is what makes exposing it as
-//! `tf_tree.Publisher` sound, and an earlier revision of this paragraph said
-//! it was *not* exposed, which had not been true since it was added.
+//! `tf_tree.Publisher` sound.
 //!
 //! **The `Send + Sync` half is the compiler's, not ours.** A `#[pyclass]`
 //! without `unsendable` expands to an `assert_pyclass_send_sync::<Self>()`

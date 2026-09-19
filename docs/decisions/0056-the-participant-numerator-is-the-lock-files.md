@@ -132,15 +132,14 @@ does not count it either, and will reclaim that participant's record and grant
 its slot away. A numerator that quietly compensated for it would report a
 capacity the protocol does not honour — and would hide the gap.
 
-*This paragraph said "a `build_shared` or `attach_shared` participant" until
-2026-09-19. The `ReadWrite` fd-attach arms have refused since
+The `ReadWrite` fd-attach arms have refused since
 [`0028`](./0028-the-slot-a-killed-participant-keeps.md) step 0b, so that half
 names no constructible shape. The half that remains is narrower than it was
 too: [`0031`](./0031-the-participant-record-with-no-byte.md) put the served
 `build_shared` arena **out of contract** on 2026-09-18, so this blind spot is
 one C shares with every reclaimer, over a population the project does not
 support — which strengthens the argument for stating it rather than
-compensating for it.*
+compensating for it.
 
 **C is also the cheapest and the hardest to drift.** It is one `F_OFD_GETLK` per
 slot over 64 slots, which `top`'s row producer and `doctor`'s `probe_lock_facts`
@@ -156,10 +155,9 @@ both already perform; neither needs a new census.
    This record takes the first reading because the second cannot be answered from
    outside the process, for exactly the reason `0028` gives.
 
-   **This replaces a question posed as "D or E", on the claim that the two differ
-   only on an in-flight joiner.** They do not: they differ on every slot carrying a
-   leftover identity record, which is every slot any participant has ever used.
-   Both are now excluded.
+   D and E do not differ only on an in-flight joiner: they differ on every slot
+   carrying a leftover identity record, which is every slot any participant has
+   ever used. Both are now excluded.
 2. **What the row does when no lock facts were asked.** `doctor --from-bag`,
    `--from-file` and the in-process fixture have no lock file, so every slot's
    `doctor::LockByte` is `Unknown` — which §6.2 already treats as evidence in

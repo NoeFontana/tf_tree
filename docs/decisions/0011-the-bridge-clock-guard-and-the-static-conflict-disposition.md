@@ -240,10 +240,8 @@ and seeding every other edge's guard from it would reintroduce exactly the
 cross-edge contamination this change removes. Not dropping the map: that frees
 the two owned `String` keys per edge, so the first sample on every edge after the
 recreate re-enters the allocating path, while the table's shape was fixed by the
-topology at startup anyway. The draft of this record said "clear the map" and
-"**no** `ClockGuard::forget()` is added"; implementation reversed both, for the
-reason just given. `forget()` is additive on a type the offline product also
-links, so it withdraws nothing.
+topology at startup anyway. `forget()` is additive on a type the offline product
+also links, so it withdraws nothing.
 
 `ResetQuorum::clear()` does go with the recreate: its rows describe regressions
 against high-water marks that no longer exist, and carrying them into the new
@@ -596,9 +594,7 @@ exhaustively across two products.
   the online bridge asks for a second publisher when there could be one. This is
   deliberate, not an oversight: a bag is a finished artifact and stopping to tell
   the operator "edge *X* regresses at *t*" costs nothing but a rerun, whereas a
-  false halt online takes down a running robot. The draft's claim that this
-  change "makes the two halves agree" was true only of scope and is corrected
-  here. Correction B then closes the divergence at exactly the deployment shape
+  false halt online takes down a running robot. Correction B then closes the divergence at exactly the deployment shape
   where it had no argument behind it: with one dynamic edge the online half halts
   on the first regression too. The divergence must be recorded in
   `crates/tf_tree_ingest/src/ingest.rs`'s module doc, which currently opens its

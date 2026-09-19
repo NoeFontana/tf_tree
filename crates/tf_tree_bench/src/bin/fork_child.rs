@@ -9,14 +9,6 @@
 //! not an exception — it is kinds 2 and 5, and `scripts/unsafe-budget.txt` is
 //! where that is written down.
 //!
-//! **This paragraph read *"`docs/PROJECT.md` §5 budgets `unsafe` to
-//! `tf_tree_arena` and `tf_tree_core::{buffer, arena_view}`"* until 2026-09-05
-//! and was wrong twice**: `PROJECT.md` §5 is the decision log and contains no
-//! `unsafe` text at all — the rule is §6's design-smell entry — and the
-//! two-module enumeration it quoted is the pre-`0007` budget, which `0007`
-//! replaced in full. `0005` still records this file's `fork()` exception, and
-//! its Consequences bullet has its own amendment: the count it gives is stale.
-//!
 //! There is no way around it. What has to be tested is `fork()` **without
 //! `exec`** — a child that inherits the parent's address space, its `MADV_DONTFORK`
 //! hole where the arena used to be, and its open file descriptions with the OFD

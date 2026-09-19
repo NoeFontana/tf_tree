@@ -99,14 +99,6 @@
 //!    criterion estimates are two independent measurements, which is the shape
 //!    that was replaced.
 //!
-//! **There used to be a third, and it has been fixed rather than kept:**
-//! `bench_pair` queried `fixture::NOW_NS`, a knot on all three dynamic edges of
-//! the depth-3 path, so `I::eval` never ran there — `docs/decisions/0013`'s
-//! defect, which `stamp_ns` below was written to avoid in advance. That file now
-//! queries `fixture::QUERY_NS` and interpolates like this one. It is recorded
-//! here because a reason that stops being true is how a list like this rots; the
-//! two reasons above are unaffected, since a stamp changes neither.
-//!
 //! The profile is **not** offered as a further reason: `cargo bench` accepts
 //! `--profile`, so a bench target could be built under `[profile.embedder]` too.
 //! The two above are the ones that decide it.

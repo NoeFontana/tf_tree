@@ -6,9 +6,7 @@
 
 **Read this before proposing a design: the sketch in *What this record has to
 settle* is refuted, and the scope of the defect is smaller than *The defect*
-below implies.** Both come from open question 1's prototype (2026-08-22); both
-are stated here rather than only 200 lines down, because a reader who stops at
-the top of this record re-proposes the array and over-states the leak.
+below implies.** Both come from open question 1's prototype (2026-08-22).
 
 - **The obvious `[AtomicI32; N]` fd registry — "appended at registration and
   *read* in the handler" — does not work, and it was refuted by running it, not

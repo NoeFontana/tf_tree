@@ -61,9 +61,7 @@ did not get it. **The in-arena `TopoLockView::acquire` still spins
 `TOPO_LOCK_SPIN_LIMIT` and then calls `is_alive(owner_slot)` and steals** — the
 byte narrows what that inference may authorise, it does not remove it, and
 `PHASE2.md` §0.0 records the path as closed only for a tree that *has* a lock
-file. *This paragraph said A2 "stopped asking whether the holder is alive",
-which is true of `reparent`'s acquisition order and false of the core's.* The
-interning path has no byte at all, and still spins.
+file. The interning path has no byte at all, and still spins.
 
 ## Decision
 
@@ -89,9 +87,7 @@ exactly how `counters`, `pure-hash` and `crash-points` are wired
 **It costs no public surface**, which is the reason to prefer it to threading a
 hook through `ArenaView`: `InternTable`, `intern_core` and `find_core` are all
 `pub` in a publishing crate, so a hook parameter would be an `API.md` §7 change
-and a `0.0.x` break. *Two earlier versions of this section got here by a false
-dilemma — "default-off reaches nobody, default-on unifies `std`" — which omits
-the passthrough and made a surface-costing seam look like the only sound route.*
+and a `0.0.x` break.
 
 `tf_tree_core` keeps `#![no_std]` unconditionally and pure-spins when the
 feature is off — correct on a bare-metal target, where there is no scheduler to
@@ -109,9 +105,7 @@ state.
 A8 constrains *takeover* — "a slow interner is never stolen from" — and a
 refusal steals nothing; the "without limit" sentence is `INTERN_SPIN_LIMIT`'s
 doc comment, not amendment text. What §1 owes is an **added note** that a
-claimant which is neither running nor dead is a class A8 did not consider.
-*This read "This amends A8's 'without limit', and that is why this is a record",
-which question 1 now withdraws.* The
+claimant which is neither running nor dead is a class A8 did not consider. The
 trade it makes: a caller can now be told *"someone holds this name and I cannot
 say when they will finish"* instead of waiting for them. A control loop can act
 on that; it cannot act on a spin.
@@ -170,8 +164,7 @@ is what this layer can express, and its calibration is the same kind of number
 - **A8's text does not change** (question 1): the bound constrains waiting and
   A8 constrains takeover. `docs/PHASE2.md` §1 gains a **note** recorded the way
   §3.5's amendment was — that a claimant neither running nor dead is a class A8
-  did not consider — rather than an edit to A8. *This bullet read "A8's text
-  changes".*
+  did not consider — rather than an edit to A8.
 - The `loom` models that exercise interning gain a reachable `Contended` arm.
   `INTERN_SPIN_LIMIT` is already 2 under `loom` for interleaving reasons; the new
   bound needs the same treatment and its own control, because a model where the
@@ -204,16 +197,13 @@ is what this layer can express, and its calibration is the same kind of number
    `wait_for_publish` resets its spin counter at every round, so the per-round
    reading re-spends the prefix at each boundary and enters the scheduler **less**
    often, by up to `INTERN_SPIN_LIMIT`×, than a per-wait prefix spent once after
-   which every iteration yields. *An earlier version had that direction
-   backwards, which would send an implementer chasing a `bench-check` regression
-   toward up to 10 000× more scheduler entries on the name-resolution path.* Consequences names the prefix as the knob to turn
+   which every iteration yields. Consequences names the prefix as the knob to turn
    on a `bench-check` regression, so which one it is has to be stated. `tf_tree` installs it. Both functions keep yielding under
    `cfg(loom)`, or the models stop scheduling the thread they wait on.
    - **Verified by** `just bench-check` against the committed baseline, reported
      rather than assumed; by `just loom`; and by the existing frame tests passing
      unchanged.
-   - **Two different things, and an earlier version of this step conflated
-     them.** *No hook installed* is a **runtime** state, and it is already
+   - **Two different things.** *No hook installed* is a **runtime** state, and it is already
      exercised: every `tf_tree_core` unit test builds an `ArenaView` with no
      facade, and `just test` runs them. What has **no gate** is a `no_std`
      compile of `tf_tree_core` — `stable-tier-check` compiles `-p tf_tree` and runs `tf_tree_ingest` and `tf_tree_bridge`, none of them `tf_tree_core` `no_std`,
@@ -221,7 +211,7 @@ is what this layer can express, and its calibration is the same kind of number
      `clippy -p tf_tree_core --no-default-features --features crash-points`
      which pulls `extern crate std` in through that feature, and there is no
      bare-metal cross-compile anywhere in the justfile. Step 1 owes that compile
-     gate; it would not have caught the runtime case the earlier text named.
+     gate.
    - **A hosted direct consumer of `tf_tree_core` keeps the unbounded,
      non-yielding spin.** It is one of the five publishing crates, so this is a
      real population, and the seam gives them nothing unless they install a hook
@@ -239,8 +229,7 @@ is what this layer can express, and its calibration is the same kind of number
    `FrameError::InternContended`. **Report the measured round cost — the spin *and*
    the probe syscalls — on both gated architectures, and check N = 8 against it.**
 
-   *An earlier version said "derive N from question 2's rule", which is
-   unfalsifiable as written*: the floor is a constant and the ceiling a
+   The floor is a constant and the ceiling a
    control-loop rate, so no measurement outcome can move N. What the measurement
    *can* do is falsify the **premises** — if a round costs far more than ~0.4 ms
    because the `/proc` fallback dominates, the ceiling is breached at N = 8 and N
@@ -271,10 +260,9 @@ is what this layer can express, and its calibration is the same kind of number
      normal publish path" describes a property the bound makes unobservable.
      Fixing only the timeout leaves a panicking test.
 
-     *The draft reconciled the two with "a limit large enough not to fire", which
-     is a real constraint (N ≳ 625) and contradicts this record's ceiling. This
-     step deleted that clause and asserted the test would pass unchanged, which
-     is false; the resolution is to fix the test's mechanism, not to inflate N.*
+     A limit large enough that the timeout never fires would need N ≳ 625,
+     contradicting this record's ceiling — the resolution is to fix the test's
+     mechanism, not to inflate N.
    - **Verified by** that rewritten control, plus a new test staging a claimant
      that reads alive and never publishes and asserting `InternContended` inside
      the bound.
@@ -293,11 +281,7 @@ is what this layer can express, and its calibration is the same kind of number
    `unresolvable_name` renders *"is being interned right now by a participant
    this arena cannot identify … Retry"*, so a control loop following it retries
    forever against a stopped claimant — relocating the unbounded wait into the
-   caller rather than ending it, and defeating the purpose of step 2. *An earlier
-   version cited `detached_err`'s rustdoc naming the variant "in the retry loop"
-   alongside `SlotContended` and `LeaseContended`; that site is `pub(crate)` and
-   this step's own erratum says it reaches no wheel user, so the paragraph rested
-   on the source it withdraws.* So step 3 covers the variant doc, the `Display`,
+   caller rather than ending it, and defeating the purpose of step 2. So step 3 covers the variant doc, the `Display`,
    `intern_core`'s `# Errors` (which does not mention the variant today) and the
    Python retry guidance.
 
@@ -307,15 +291,14 @@ is what this layer can express, and its calibration is the same kind of number
    crate and `API.md` §7's checklist; this record takes the cheaper route and
    names it so a reopening starts from the cost.
 
-   **Eleven shipped sites — and "counted rather than sampled" was wrong twice
-   before this number.** `FrameError::InternContended`'s
+   **Eleven shipped sites.** `FrameError::InternContended`'s
    variant doc and its `Display`; `LookupError::UnknownFrame`'s "transient";
    `find_core`'s `# Errors` and `ArenaView::find_frame`'s, both saying the
    claimant is *anonymous*; `Tree::lookup`'s `# Errors` ("— transient: retry"),
    which is the one a Rust caller actually reads; `intern_core`'s `# Errors`,
    which does not mention the variant at all; and **`tf_tree_py`'s
    `unresolvable_name` message**, which is the shipped Python text telling a
-   caller *"cannot identify … Retry"*. **Plus three found in round 4:**
+   caller *"cannot identify … Retry"*. **Plus three more:**
    `crates/tf_tree_c/include/tf_tree.h`'s `TFT_ERR_UNKNOWN_FRAME` — *"a name
    another participant is interning right now (transient — retry)"*, the shipped
    C ABI text, and the step's own first line already says "the C entry point";
@@ -434,30 +417,20 @@ each answer says where the evidence is.
      **Both constants shrink together or neither does**, and step 4 owes a
      control that fails when the abandon path is unreachable.
 
-   *An earlier version of this answer read "the smallest value whose product …
-   exceeds the measured intern by two orders of magnitude and stays under 10 ms".
-   That has a floor a single round already clears, so it yields **N = 1** — below
-   `READER_UNRECORDED_ROUNDS`, which is the one value that must not be chosen. It
-   stated the "N of about 8" conclusion beside a rule that contradicts it.*
-
    **Step 2 must still report the measured round cost**, on **both**
    architectures this project gates. `spin_loop()` is a `pause` of ~140 cycles on
    recent x86-64 and an `isb` of tens of cycles on aarch64, so the same iteration
    count is **several times shorter** there and the "~0.4 ms at 3 GHz" figure
    below is x86-specific.
 
-   **Which constraint that pressures is the opposite of what an earlier version
-   of this paragraph said.** A shorter round makes N × `INTERN_SPIN_LIMIT` a
+   **On aarch64 the health margin erodes; the ceiling does not.** A shorter round makes N × `INTERN_SPIN_LIMIT` a
    *smaller* duration, so the **ceiling gains** headroom on aarch64 — it is the
    **health margin** that erodes: "unreachable in health by orders of
    magnitude" goes from roughly three orders to two as a round falls from ~0.4 ms
    to ~0.05 ms. **The structural floor is untouched** — `READER_UNRECORDED_ROUNDS`
    and N both count *rounds*, not time, so no clock speed moves it, and calling
    the health margin "the floor's purpose" re-merged the two things this answer
-   separates. *The earlier text said the ceiling lost headroom on arm, which
-   would tell an implementer to lower N there — backwards for the constraint
-   actually under pressure, and toward the floor this same answer says must not
-   be crossed.*
+   separates.
 
    ~~What is the limit?~~ `INTERN_SPIN_LIMIT` is 10 000 pure-spin iterations
    between liveness checks (~0.4 ms at 3 GHz). A round bound of *N* liveness
@@ -483,19 +456,16 @@ each answer says where the evidence is.
    mutator's store will end. Yielding in any of them trades a sub-microsecond
    wait for a scheduler round trip, and `read_slot` is the hot read path.
 
-   *Two earlier spellings were wrong: "all four wait on a store" is false of A2,
-   which decides rather than waits; "all four are bounded" is false of
-   `plan.rs`'s `'walk: loop`, which carries no retry counter. What is true of all
+   What is true of all
    four, and is the reason, is that none of them waits on whether a peer is
-   **scheduled**.*
+   **scheduled**.
    `buffer::read_slot` is the hot read path, so that is not a theoretical cost.
    Exactly one waits on a peer whose scheduling is the thing in question.
 
    So `spin` stays pure for the four and a second function — calling the
    passthrough feature of *Decision* §1, pure-spinning with it
    off — is `wait_for_publish`'s alone, with each call site naming which it
-   wants. *This read "yielding under the std-backed arm", the mechanism §1 now
-   rejects; the mechanism is stated in three places and this was the third.* **The `loom` arm is unaffected**: it already yields for all
+   wants. **The `loom` arm is unaffected**: it already yields for all
    five, for interleaving rather than starvation, and that must stay true of both
    functions or the models stop scheduling the thread they wait on.
 

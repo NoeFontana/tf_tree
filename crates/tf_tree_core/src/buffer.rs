@@ -374,7 +374,7 @@ impl SampleRing<'_> {
         // a `lock`-prefixed instruction whose implicit full barrier drains the
         // store buffer right behind the eight relaxed payload stores above.
         // Measured on `push/single_writer`; the figure and the host are in
-        // `0014`, which this comment already cites twice. *No number is written
+        // `0014`. *No number is written
         // here: this line carried an earlier run's figure, contradicting the
         // record it names as authoritative. `docs/decisions/README.md`'s `0014`
         // row carries the erratum, and it is the only place the superseded pair

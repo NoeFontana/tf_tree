@@ -489,9 +489,8 @@ pub(crate) const MAX_TRACKED_PUBLISHERS: usize = 64;
 ///   manufacture a step out of nothing. Under a steady drift of `d` per sample
 ///   the steady-state lag of an `α = 1/8` EWMA is `(1-α)/α · d = 7d`. A stamp
 ///   stream advancing 1 ms per message against a frozen receipt clock — the
-///   pathological case, and what `tests/steady_state_alloc.rs` used to do
-///   accidentally — therefore sits 7 ms behind, an order of magnitude inside the
-///   threshold.
+///   pathological case — therefore sits 7 ms behind, an order of magnitude inside
+///   the threshold.
 /// - **Slow enough that a real step is not absorbed.** 1/8 moves the baseline by
 ///   12.5 % of the first sample of a step, so a 5 s rewind still leaves 4.4 s of
 ///   residual on the *next* sample. It is only ever asked to absorb the

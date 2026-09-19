@@ -90,9 +90,7 @@ nothing compiling it. So the honest choice is between *headers plus a gate* and
 cost is a check on every new source file, in perpetuity, plus a commit that
 touches every source file, and so every blame line, in the repository — the
 `git ls-files … | wc -l` line above prints how many, and this sentence
-deliberately does not. It said "289", which was exact on the day this record
-landed and had drifted by the next; the commit that reviewed this record had
-already deleted the same literal from the transcript block, and left it here.
+deliberately does not.
 The value is a file-level licence marker for a consumer who copies one file out of a dual-licensed
 project whose root, every crate directory, and every published artifact already
 carry both licence texts. Nobody has asked for it.

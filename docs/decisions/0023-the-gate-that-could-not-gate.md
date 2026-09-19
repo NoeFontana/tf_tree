@@ -106,9 +106,8 @@ validation, layout dispatch, the output slice, the `catch_unwind` landing pad.
 R3 is the C *signature*: `tft_plan_at` takes a plan and a stamp and has nowhere
 to keep a guard between calls, so it builds one every time. Both are real costs a
 C caller pays and both belong in §7 — but they have different owners (R1 is
-`tf_tree_c`'s, R3 is `0022`'s) and different futures — **as first written, that
-read "`0022` intends to *lower* R3 by giving the C tier a guard handle";
-`0022` has since gone `ready` declining the handle, so neither row is expected to
+`tf_tree_c`'s, R3 is `0022`'s) and different futures — **`0022` has since gone `ready`
+declining the guard handle, so neither row is expected to
 move and both are regression detectors.** Rolled into
 one number they move together and neither is diagnosable: a single ratio only
 says *something* changed. This is the same reasoning that made `abi_cost` a
@@ -134,7 +133,7 @@ decomposition.
 |---|---|---|---|
 | R1 | 1.025–1.038 | **1.10** | ~2.5× the largest measured excess over 1. Loose on purpose: a row that goes red for noise becomes a row people re-run until green. Still catches a doubling of any single check the boundary performs. **Provisional — the twelve runs were taken on a contended host; see open question 4** |
 | R2 | 0.999–1.006 | **1.05** | §3.4 predicts ~0 and that is what it measures. Fails if the landing pads stop being free on this target |
-| R3 | 1.059–1.075 | **1.25** | a *regression* detector, not a target: if `Guard` acquires new per-construction work this is the row that moves. **The clause that used to end this row — "`0022` aims to lower it, and lowering it is the win" — is now wrong**: `0022` is `ready` and declines the `tft_guard` handle, so R3 is a permanent regression detector rather than a number somebody intends to move. It is also measured on the wrong fixture; see open question 3 |
+| R3 | 1.059–1.075 | **1.25** | a *regression* detector, not a target: if `Guard` acquires new per-construction work this is the row that moves. `0022` is `ready` and declines the `tft_guard` handle, so R3 is a permanent regression detector rather than a number somebody intends to move. It is also measured on the wrong fixture; see open question 3 |
 | C | 0.992–1.002 | **±0.02** | more than twice the 0.8% widest excursion, and deliberately far tighter than the rungs it protects — the failure it hunts moved the comparand **43%** |
 
 All four are falsified in the useful direction by a *quiet* host: if the spread

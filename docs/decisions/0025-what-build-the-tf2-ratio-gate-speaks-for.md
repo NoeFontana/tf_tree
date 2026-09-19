@@ -146,7 +146,7 @@ sentence A adds is the sentence B would replace.
 ## Open questions
 
 1. ~~**Does `cargo install tf_tree_cli` get the workspace profile?**~~
-   **Answered: no, and the first draft of Option A asserted the opposite.**
+   **Answered: no.**
    `[profile.*]` is honoured only in a *workspace root* manifest, and
    `crates/tf_tree_cli/Cargo.toml` declares no profiles of its own — the
    workspace root does. A crate installed from the registry is unpacked as its
@@ -162,13 +162,7 @@ sentence A adds is the sentence B would replace.
    number, unresolvable as a verdict** — see *The three repeats*. Three runs put
    the consumer median in 2.047-2.088 (2% spread), so the figure repeats; but the
    *band* straddles 2.0 in two of the three, so the row cannot be gated here.
-   This is what decided against Option B, and it replaces the paragraph below,
-   which was written when the answer was unknown.
-
-   Superseded text: it comes from a single pair of
-   profile runs. The tf2-column control makes the *comparison* sound; it does not
-   make the value repeatable. Before B could set a floor from it, it needs the
-   same paired treatment the 2.49 got.
+   This is what decided against Option B.
 3. ~~**Does the embedder-build gap survive `codegen-units = 1`?**~~ **Moot, by
    question 1's answer.** The worry was that `[profile.embedder]` might be
    pessimistic relative to a consumer's real build, since `lto = false` is not

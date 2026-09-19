@@ -60,11 +60,8 @@
 //! # Nothing here is remembered from another run
 //!
 //! The disclosure under the table about the `.processes` arms' bimodal `svc`
-//! column is computed from the histograms of the run being reported. An earlier
-//! revision printed five literal microsecond values from one past run as
-//! "measured here" — on somebody else's host that is a false statement about
-//! their machine, printed above their own table, and it replaced a disclosure
-//! that had been permanently true. `docs/benchmarks/tf2.md` is where a worked
+//! column is computed from the histograms of the run being reported.
+//! `docs/benchmarks/tf2.md` is where a worked
 //! example with its control belongs; this tool states the shape of the run in
 //! front of it.
 // This binary's output IS its result.

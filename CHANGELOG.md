@@ -41,6 +41,25 @@ is a bug.
 
 ## [Unreleased]
 
+### Changed — a repo-wide deletion pass over narrative prose
+
+An eight-way sweep over the editable decision records, the phase specs, the
+cross-cutting docs and the doc comments of every crate but two, applying the
+rule above. Net −483 lines across 59 files, all of it narrative: what an earlier
+revision of a comment said, how many attempts a repair took, and claims restated
+two or three times in one document.
+
+Deletion only. No surviving contract sentence was reworded, because the previous
+entry's defects all came from compressing two scoped sentences into one general
+one rather than from removing anything. Nine dangling-antecedent regressions —
+a deleted sentence that a later pronoun still referred to — were caught and
+repaired before this landed.
+
+Out of scope and unchanged: the 28 `implemented` records, which are frozen;
+`CHANGELOG.md`'s released sections, which are a historical record;
+`crates/tf_tree/src/open.rs` and `tree.rs`, which many line citations point into.
+`docs/decisions/0020` shed one citation and its budget row falls to match.
+
 ### Changed — a doc comment states the contract, not its own history
 
 `CLAUDE.md` gains a rule: a comment states the decision and its load-bearing

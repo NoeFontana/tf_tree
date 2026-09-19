@@ -58,13 +58,6 @@ upload time** that no availability probe can see. The neighbour it collides with
 is **`tftree`**, which exists (HTTP 200): the check strips separators, so
 `tf_tree` → `tf-tree` → `tftree`.
 
-The general form is worth keeping, because it is the same shape as two other
-errors in this repository's history: **an absence measured at one layer was read
-as permission from another.** A 404 on the registry's read API is evidence about
-the index; admission is a property of the *upload* path, which nothing here
-exercised. The probe that would have answered the real question did not exist
-short of attempting an upload.
-
 Reproduce both halves:
 
 ```sh

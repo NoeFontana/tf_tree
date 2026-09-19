@@ -645,11 +645,7 @@ to `ready` when the five open questions below are answered — the first two by 
 decision, the third by where the gate-4 finding lands, the fourth by looking for a
 requester and not finding one, the fifth by one measurement.
 
-**Two process notes, because a draft that authorises four of its seven steps is
-worth a second look.** The README's own row for [`0013`](./0013-the-benchmark-gate-never-interpolated.md)
-flags implementing from a `draft` as a process irregularity; this record does it
-deliberately and says so, which is better than doing it quietly, but it is the same
-shape. And **step 5 should not be treated as unblocked**: its mitigation was wrong
+**Step 5 should not be treated as unblocked**: its mitigation was wrong
 in the first revision of this record (a shard is not a bound) and the corrected
 version rests on open question 2, which has not been measured. Steps 1, 6 and 7 are
 genuinely independent of the fork this record decides; step 5 is not.

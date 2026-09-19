@@ -383,8 +383,7 @@ The conclusion survives both, but it now rests on a run that interpolates.
    now, and it is worth 41 ns of the 99.5 at a batch of 256. Sort the stamps —
    the header says so, and the cursor is what the batch path is for.
 2. **Do not switch link mode expecting a win.** Static and shared measure within
-   0.4%, so LTO across the `.so` is not where this is recovered. That sentence
-   used to say the opposite here.
+   0.4%, so LTO across the `.so` is not where this is recovered.
 3. Note that a private (non-`shm`) arena does not pay anything like this. On
    `abi_cost.rs`'s three-edge heap tree at `[profile.embedder]`, `0023`'s pinned
    ladder prices the whole C ABI as **R1 = 1.025–1.038×**, which `docs/PHASE4.md`

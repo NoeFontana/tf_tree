@@ -22,8 +22,6 @@ already shipped.
 
 ### The budget has already been overtaken twice, without amendment
 
-This is the part worth pausing on, because it changes what the right fix is:
-
 | Crate | `unsafe` it carries | Phase | Amended? |
 |---|---|---|---|
 | `tf_tree_ipc::fork` | `pthread_atfork`, declared locally because libc omits it for `linux_like` (`fork.rs:71`, `:112`) | 2 | **No** |
@@ -61,9 +59,7 @@ changes.
    > one was an example of where a kind lived on the day this was written, and
    > every downstream reader — `CLAUDE.md`, `PROJECT.md` §6, `PHASE1.md` §0, and
    > two crates' own module headers — copied the crate name instead of the
-   > criterion. This record's *Rationale* had already named that failure one
-   > level up: *"a rule that states the criterion survives; a list does not."* It
-   > then wrote a list in brackets beside the criterion.
+   > criterion.
    >
    > `0048` makes the kinds **properties**, moves the crate names into a
    > non-normative index at `scripts/unsafe-budget.txt`, widens kind 3 from *"a
@@ -88,8 +84,7 @@ changes.
 
    > **Amended by [`0017`](./0017-owned-handles-and-the-lifetime-rule.md), which
    > moved `tf_tree` to `#![deny(unsafe_code)]` with exactly one `#[allow]`.**
-   > The clause above was written as a prediction and it was wrong about one
-   > case: `EdgeWriter<'a>` cannot be stored, three consumers needed to store it,
+   > `EdgeWriter<'a>` cannot be stored, three consumers needed to store it,
    > and two hand-rolled the lifetime extension in crates the Rust test suite,
    > Miri and TSan cannot instrument — one of them as a
    > `transmute::<EdgeWriter, Publisher>` that leaked a claim lease and bypassed

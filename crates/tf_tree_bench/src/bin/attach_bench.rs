@@ -40,9 +40,7 @@
 //! arm out of a different code path. The row stays owed; it is no longer owed
 //! *and* unmeasurable, because the cost it would be compared against is here.
 //!
-//! **An earlier revision listed a third route and said the "off" arm would
-//! arrive with `docs/decisions/0024`. It did not, and the prediction was
-//! wrong in a way worth keeping.** `0024` moved ring population from attach to
+//! `0024` moved ring population from attach to
 //! the moment an edge is taken up, which does give the attach path a policy —
 //! but it is not a *toggle*. There is still no `populate: false`, because there
 //! is still no case that wants one: population is now scoped to what the process

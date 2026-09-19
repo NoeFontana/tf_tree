@@ -26,8 +26,7 @@
 //!   writer that holds the edge (`work`'s `two_writers` arm). The other two
 //!   are not: slot leakage is checked once, at teardown (`check_recovery`),
 //!   and "the arena hash is stable across quiescent points" is not implemented
-//!   at all. **The reason is not the lint posture, and this header said it
-//!   was until 2026-09-05**: `#![forbid(unsafe_code)]` sits on
+//!   at all. `#![forbid(unsafe_code)]` sits on
 //!   `crates/tf_tree_bench/src/lib.rs`, and a bin is a **separate crate root**
 //!   that it does not govern — this file's only crate-level attribute is a
 //!   `clippy` allow, and sibling bins in this package carry `unsafe`
@@ -37,26 +36,6 @@
 //!   "quiescent point" is undefined for a harness that kills processes several
 //!   times a second. `docs/PHASE2.md` §0.0's §11.4 row says both where a reader
 //!   will meet them.
-//!
-//! **Three claims that stood in this header until 2026-09-04 were false, and
-//! are corrected rather than deleted**, because each one was a reason somebody
-//! could have given for not doing the work:
-//!
-//! 1. *"the killed processes are the joiners, never the rendezvous owner … §3.5's
-//!    takeover is not wired into `tf_tree::open` yet"*. §3.5's ownership
-//!    migration landed on **2026-08-28** (`Tree::owner_lost`,
-//!    `Tree::inherit_ownership`, `Session::take_over_ownership`), and this
-//!    harness now kills the owner on a schedule and requires a survivor to
-//!    inherit.
-//! 2. *"Crash points are §11.3's `crash-points` feature, which §0.0 records as
-//!    **not implemented** — there is no `TF_TREE_CRASH_AT` to arm"*. The feature
-//!    and the variable shipped on **2026-08-29**; `--crash-points` has armed
-//!    them since. What survives from that paragraph is the part that was never
-//!    about implementation status, and it is kept below.
-//! 3. *"the eleven named mid-protocol states §11.3 enumerates"*. §11.3's table
-//!    has fourteen rows, **thirteen** of which carry a site; the fourteenth
-//!    (`reclaim.probe_then_reoccupied`) names an interleaving between two live
-//!    processes and is deliberately not an abort site.
 //!
 //! **`SIGKILL` is still not §11.3 coverage**, and that distinction has nothing
 //! to do with what is implemented: a signal lands wherever the scheduler puts
@@ -1168,9 +1147,7 @@ mod imp {
     /// has, and it re-attaches *often*: 2 000 operations is the cap on one
     /// attachment, and a 2% detach-and-rejoin arm inside that loop is what
     /// usually ends it first, so the mean is tens of operations rather than
-    /// thousands. **This comment quoted the cap as the rate**, which is wrong by
-    /// the ratio between them and in the direction that makes the sampling
-    /// problem below look smaller than it is. Either way "spawned before the
+    /// thousands. Either way "spawned before the
     /// last migration" is not the same question and answers it far too widely —
     /// a child spawned at the start and re-attached a moment ago is on the
     /// current owner's socket like any other.
@@ -2663,17 +2640,6 @@ mod imp {
         // answers "who has held the rendezvous" completely; the creator is the
         // one member that ledger cannot contain, and the driver spawned it, so
         // it knows the pid exactly rather than reading it from anywhere.
-        //
-        // **This replaced a poll, and the poll was the defect.** The driver used
-        // to re-read the `owner.pid` marker each round and accumulate the pids it
-        // caught. `docs/decisions/0043` says an owner's own record is one no
-        // hangup callback collects, so that accumulated list is what
-        // [`check_recovery`] exempts from its strict path — and a role change the
-        // poll missed became a record judged strictly that nothing could have
-        // collected. The comment on the round-by-round read said exactly that
-        // consequence and treated it as a risk; it is not a risk, it is the
-        // common case, because the role turns over an order of magnitude faster
-        // than the driver's round.
         let creating_owner_pid = owner_kid.as_ref().map(|k| k.proc.id());
         let observer = attach_observer()?;
 
@@ -3182,10 +3148,7 @@ mod imp {
         // hangup CAS from `crates/tf_tree/src/open.rs` is the mutant that shows
         // the difference, and the honest statement of the result is a direction
         // rather than a tally: `--no-kill-owner` fails on every seed it has been
-        // run at. **A count was written here and it should not have been** —
-        // re-running the migrating arm at a fixed seed gave a different number of
-        // failures each time, so the figure recorded which afternoon it was taken
-        // on. **`--no-kill-owner` is where that collector is pinned** — the owner
+        // run at. **`--no-kill-owner` is where that collector is pinned** — the owner
         // is then the parked owner child, which runs no operations, sweeps
         // nothing and cannot detach — and `tests/torture.rs` runs that
         // configuration for exactly this reason.
@@ -3249,11 +3212,7 @@ mod imp {
         //
         // **On a run that migrated the heir is an ordinary worker, and the two
         // passes above hold it back by pid so the ordering holds there too.**
-        // Until 2026-09-04 it did not: the heir was signalled with the rest of
-        // the fleet, the records it was about to collect were left behind, and
-        // [`check_recovery`] absorbed them by sweeping the whole participant
-        // table on any run that migrated — which is a permissive check wearing a
-        // strict one's message, on the path every default run takes. The sweep
+        // The sweep
         // is now answerable for the records `docs/decisions/0043` names and for
         // nothing else; see `unreachable_by_hangup` above.
         //
@@ -3269,10 +3228,7 @@ mod imp {
         // leak — which never clears — costs the failing run the deadline and
         // nothing else.
         //
-        // **This is not fixing an observed failure, and an earlier draft of this
-        // comment claimed it was.** That claim came from a build which had lost
-        // the 200 ms sleep entirely; the flat sleep passed every strict-arm run
-        // it was measured over on a deliberately loaded host. What the poll
+        // What the poll
         // removes is the assumption, not a red run — and no pass tally is kept
         // here, because a scheduling count taken on one host on one day reads
         // as a property of the code.
@@ -5208,17 +5164,6 @@ mod imp {
         // prevents is silent by
         // construction: a wedged arena reads exactly like a healthy one. `arena_is_live` catches
         // the *consequence* a round at a time; this names the cause.
-        // **A fixed settle window, and it says so.** *This comment used to read
-        // "Polled, not sampled once, and the difference is a flaky gate", above
-        // a `for attempt in 0..9` loop whose early exit was structurally
-        // unreachable* — it broke when `dead_participant_slots(tree)` came back
-        // empty over the WHOLE table, before the `unreachable_by_hangup`
-        // partition on the next statement, and that partition is never empty by
-        // construction: it always contains the creating owner and the current
-        // owner, and `drive` kills the owner immediately before calling this. So
-        // the predicate could not clear, every run burned all nine attempts, and
-        // the code claimed a poll it did not perform.
-        //
         // It is written as the sleep it always was rather than given a reachable
         // exit, because a reachable one would be the weaker check: a record
         // whose kernel teardown has not finished reads as *alive*, is therefore
@@ -5236,8 +5181,7 @@ mod imp {
         // here does not mean "not scheduling". What it does cover is the window
         // between the last `wait()` and the kernel finishing the teardown, and
         // the `reap_participants` this function itself calls for the partitioned
-        // records. That is narrower than "does not depend on when a thread woke
-        // up", which is what this comment used to claim. The poll that *does*
+        // records. The poll that *does*
         // have a reachable exit, on the exempt-filtered predicate, is the
         // teardown one in `drive`, which is where an early exit belongs.
         // **After a migration, one of the two automatic collectors is not
@@ -5499,9 +5443,7 @@ mod imp {
         loop {
             // `Never`, in every child: the **owner child** creates and serves
             // the arena (see [`spawn_owner`]; the driver only *joins* it, via
-            // [`attach_observer`], and this comment said the driver did both
-            // until 2026-09-10 — it had been false since the owner became a
-            // child), so there is normally one to join, and a
+            // [`attach_observer`]), so there is normally one to join, and a
             // child that created a second one would silently split the run in
             // two — half the participants publishing where the observer cannot
             // see them, which is a *green* run that validates nothing. `Never`
@@ -5711,11 +5653,7 @@ mod imp {
             // loop", and every child runs it.
             //
             // **It does not follow that the property is independent of the
-            // population, and this comment said it did.** It read "so the
-            // property is never left to whether the surviving population
-            // happened to include a read-write participant" — the same sentence
-            // `docs/PHASE2.md` §0.0 carried, and both were false for the same
-            // reason: every child running this loop is worth nothing at an
+            // population.** Every child running this loop is worth nothing at an
             // instant when no child is *attached*. Only a joined participant can
             // inherit, and an ownerless arena admits no new one, so a vacancy
             // that finds the pool empty is absorbing. That is why
