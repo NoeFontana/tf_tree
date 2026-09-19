@@ -149,14 +149,19 @@ not the check that is wrong. What changed is everything the operator is told
 about it:
 
 - the finding's cause list named `Tree::attach_shared`, deleted by `0028` step
-  0b, and did not name the live-publisher case. It now names it and says
-  **check the pid is gone before you reap**;
+  0b, and did not name the live-publisher case. It names it now, and — **where
+  a process is named at all** — says *check the pid is gone before you reap*;
 - the evidence clause said *"/proc could not say what became of the process"*
-  where the lock file had named no process for `/proc` to be asked about. That
-  is a fourth rendering now, and it says which pid the finding is printing —
-  the arena record's — so the remedy has something to point at. It claims only
-  that *this run* got no identity record, because a failed read and an absent
-  one are folded together upstream;
+  where the lock file had named no process for `/proc` to be asked about. It
+  claims only that *this run* got no identity record, because a failed read and
+  an absent one are folded together upstream, and it says which pid the finding
+  is printing — the arena record's — so the remedy has something to point at;
+- **and where neither the lock file nor the arena record names a process**, the
+  finding prints no pid, no subject pid and no instruction to check one. A
+  `RESERVED` record whose registrant died inside `fill_slot` is that shape, and
+  a zero was reaching all three renderings — `slot_subject`'s own rustdoc had
+  described that defect since it was written, over a fallback arm that printed
+  the zero anyway. `named_pid` is the one predicate behind all of them;
 - `Tree.reap_dead()`'s Python docstring carried the pre-retraction framing while
   the runbook was warning operators about that exact call — **and so did
   `python/tf_tree/_core.pyi`**, which is the one a wheel user's editor shows.

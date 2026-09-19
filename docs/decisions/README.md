@@ -39,11 +39,13 @@ had de-numbered in this change while its twin in a `//!` block stayed. Those
 three are repaired; the Rust corpus as a whole is **not** measured and is not
 claimed to be.
 
-Every site that *may* be edited has been repaired instead: `0019` and `0057`
-(`ready`), `0027` and `0030` (`draft`), `docs/benchmarks/tf2.md`, and three in
-Rust doc comments — `crates/tf_tree_bench`'s `backing.rs` twice and
-`attach_bench.rs`. Each now names the symbol its own surrounding prose already
-named. **That list is stated once, here**, and no count of the attempts it took
+Every site that *may* be edited has been repaired instead: `docs/PHASE2.md`
+(two), `docs/PHASE3.md`, `docs/PHASE5.md`, `docs/benchmarks/tf2.md`, `0019` and
+`0057` (`ready`), `0027` and `0030` (`draft`), and three in Rust doc comments —
+`crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`. Each now
+names the symbol its own surrounding prose already named. *The four specs were
+repaired first and were missing from this list for three rounds, which is the
+list-stated-once rule failing at the place it was written.* **That list is stated once, here**, and no count of the attempts it took
 is given, because the count was itself restated wrongly a round after it was
 written.
 

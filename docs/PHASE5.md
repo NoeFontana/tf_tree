@@ -1853,10 +1853,21 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > field is still zero (`fill_slot` writes it after the `FREE -> RESERVED` CAS)
 > and on a read-only slot there is no record at all, so a subject built from it
 > read *"slot 8 pid 0 … /proc has no running process for it"*. Where both exist
-> and differ, both are named. The subject also carries which of the two shapes
-> it is — `byte free`, `byte still HELD`, or `byte not probed` for a source that
-> opened no lock file — because the responses are opposite and the difference
-> has to survive being read at 3am.
+> and differ, both are named.
+>
+> **Where neither exists, the finding names no process and asks for none.** The
+> subject is *"slot N, no pid recorded"*, the message omits the clause naming a
+> pid, and it omits the instruction to check that the pid is gone — there is
+> nothing to check. That case is a `RESERVED` record whose registrant died
+> inside `fill_slot`'s publication and whose lock byte the kernel has since
+> released. *Added 2026-09-19: the zero reached three renderings in `doctor` and
+> the first repair caught one of them, so this paragraph now states the
+> no-process case rather than leaving it to the two that name one.*
+>
+> The subject also carries which of the shapes it is — `byte free`,
+> `byte still HELD`, or `byte not probed` for a source that opened no lock
+> file — because the responses are opposite and the difference has to survive
+> being read at 3am.
 >
 > **The word-before-byte order is pinned by a signature, not by a comment.**
 > `0028` piece 2's third constraint requires the `state` word to be observed

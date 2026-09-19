@@ -2357,7 +2357,7 @@ fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
         (LockByte::Free, RecordedProcess::Gone) => {
             "the lock byte is free, and /proc has no running process for it"
         }
-        (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() && p.pid == 0 => {
+        (LockByte::Free, RecordedProcess::Unknown) if named_pid(p).is_none() => {
             "the lock byte is free, this run got no identity record out of the lock file for \
              this slot — none written, or none readable — and the arena record carries no pid \
              either, so there is no process here to ask /proc about and none to check"
@@ -2679,10 +2679,18 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
             SlotState::Live => "LIVE",
             SlotState::Free => "FREE (no arena record: a read-only participant, D18)",
         };
-        // The pid every sentence below is about: the lock file's, which is the
-        // one `/proc` was asked about, falling back to the arena record's on a
-        // source that read no lock file.
-        let pid = p.recorded_pid.unwrap_or(p.pid);
+        // **One pid answer for this whole function**, through `named_pid`, so a
+        // change to that predicate reaches every rendering. Only the fork arm
+        // still reads this binding, and it cannot be `None` there:
+        // `SlotLeak::ForkInheritor` needs `RecordedProcess::Gone`, which
+        // `slot_facts` produces only from an `Identity` it parsed — and
+        // `Identity::from_bytes` refuses pid 0. `unwrap_or(0)` is therefore
+        // unreachable rather than a fallback, and is spelled that way so a
+        // future producer of `Gone` without an identity cannot print a bare
+        // zero. *This read `p.recorded_pid.unwrap_or(p.pid)` under a comment
+        // about "every sentence below", which stopped being true when the
+        // abandoned arm moved to `named_pid`.*
+        let pid = named_pid(p).unwrap_or(0);
         match slot_leak(p) {
             None => {}
             Some(SlotLeak::Abandoned) => out.push(Finding::about(
@@ -2697,18 +2705,24 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
                     // the defect `slot_subject`'s doc is about.
                     let (left, check) = match named_pid(p) {
                         Some(n) => (
-                            format!("pid {n} left slot {} registered", p.slot),
+                            format!(
+                                "pid {n} left slot {} registered and no longer holds it",
+                                p.slot
+                            ),
                             " CHECK THE PID IS GONE before you reap: on that last one it \
                              is not.",
                         ),
                         None => (
-                            format!("slot {} was left registered", p.slot),
+                            format!(
+                                "slot {} was left registered by a process this run cannot name",
+                                p.slot
+                            ),
                             "",
                         ),
                     };
                     format!(
-                        "a record left behind — the record is {state}, {} — {left} \
-                         and no longer holds it, and the owner's \
+                        "a record left behind — the record is {state}, {} — {left}, \
+                         and the owner's \
                          socket-hangup reap did not clear it. That reap collects a rendezvous \
                          peer, so this is a slot it cannot reach: the owner's own, one its epoll \
                          never watched, a takeover heir's inherited peer, an owner that died \
