@@ -455,9 +455,10 @@ detection limits are written where it is implemented (`tft014`,
 hangup anybody sees.
 
 **And a record with no lock byte is worse than invisible — it is accused.**
-This paragraph used to say such a record "reaches the `unknown` byte row and is
-judged by `/proc` alone", which is what the run does when it read *no lock
-file*. A `doctor --attach` reached the arena through the rendezvous, so it has
+The paragraph above used to end by saying such a record "reaches the `unknown`
+byte row and is judged by `/proc` alone", which is what the run does when it
+read *no lock file*. A `doctor --attach` reached the arena through the
+rendezvous, so it has
 one and it probes: the byte-less record reads free, no lock-file identity names
 it, and `TFT014` reports **`a record left behind — … the lock byte is free`**
 about a process that is running and publishing. If you are looking at that
@@ -481,9 +482,14 @@ and take the claims of publishers that are running. No `tf_tree` subcommand
 sweeps — `doctor` reports and reclaims nothing — so the tool is safe to run
 either way.
 
-*This paragraph read "a participant that exited without releasing its slot,
-which `tf_tree participants` names" until 2026-09-05 — one command, no scope, and
-the wrong table for the byte-less class.*
+*Two errata on the paragraphs above, kept because each records a wrong answer an
+operator could have acted on. The **`tf_tree participants` / `doctor --attach`**
+paragraph read "a participant that exited without releasing its slot, which
+`tf_tree participants` names" until 2026-09-05 — one command, no scope, and the
+wrong table for the byte-less class. It then ended by sending the byte-less
+class to the `unknown` byte row, which is a fact about a run that read no lock
+file and not about the record; corrected 2026-09-19, and what it had been
+telling you to do was treat a live publisher's slot as abandoned.*
 
 Capacity is fixed at
 construction by design ([`PROJECT.md`](./PROJECT.md) §5 D4): the value comes from

@@ -2262,7 +2262,7 @@ pub enum SlotLeak {
 /// run reaches it too**, for any slot whose `F_OFD_GETLK` returns `Err`, which
 /// is why `slot_facts` is three-valued rather than folding a failed probe into
 /// `Free` — a failed probe is not an accusation. The cost is that
-/// [`abandoned_evidence`]'s message for this row says "no lock file was read on
+/// `abandoned_evidence`'s message for this row says "no lock file was read on
 /// this run", which on that path is false.
 ///
 /// **The one race left in it is the creator's, and it is µs-wide.** That path
@@ -2618,8 +2618,11 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
                      left slot {} registered and no longer holds it, and the owner's \
                      socket-hangup reap did not clear it. That reap collects a rendezvous \
                      peer, so this is a slot it cannot reach: the owner's own, one its epoll \
-                     never watched, an attach_shared participant, a takeover, or an owner \
-                     that died inside the callback (docs/decisions/0028). Nothing reclaims \
+                     never watched, a takeover heir's inherited peer, an owner that died \
+                     inside the callback (docs/decisions/0028) — or a live publisher that \
+                     never took a byte, which is a TreeBuilder::build_shared arena served \
+                     by hand and out of contract (docs/decisions/0031). CHECK THE PID IS \
+                     GONE before you reap: on that last one it is not. Nothing reclaims \
                      it — {leaked} of {slots} slots are spent for the life of the segment, \
                      and at {slots} every further attach fails NoParticipantSlots. Only \
                      stopping every participant, which frees the segment, frees a slot",
@@ -5400,9 +5403,13 @@ mod tests {
 
     /// **A message never claims a syscall the run did not make.**
     ///
-    /// Two sources reach clause (a) by different evidence: `--attach`, which
-    /// has a lock file and can say the byte is free, and the fixture or
-    /// `--from-bag`, which have none and are judged by `/proc` alone. The
+    /// Clause (a) is reached by two *evidence sets*, and mapping them onto two
+    /// **sources** is the shortcut this module keeps making: an `--attach` run
+    /// usually has a probed byte and a fixture or `--from-bag` never does, but
+    /// `slot_facts` (`crates/tf_tree_cli/src/lib.rs`) also answers
+    /// `LockByte::Unknown` when the probe itself errors, so an `--attach` run
+    /// reaches the second set too — see [`slot_leak`]'s note on that row. What
+    /// this test pins is the evidence, which is what the message is about. The
     /// wording that shipped before step 6 — *"the lock byte is free"* —
     /// predates `doctor` opening a lock file at all, so on the second source it
     /// asserted a probe nobody performed and sent an operator looking for a

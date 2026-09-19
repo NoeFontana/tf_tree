@@ -136,7 +136,9 @@ block: it **inverts the pairing** for the rest of the file, so prose is blanked
 and the code blocks are scanned in its place.
 
 `docs/PHASE5.md` therefore had no row in `scripts/line-citation-budget.txt` at
-all, and two citations in prose that nothing gated. The stripper is line-anchored
+all, and **three** citations in prose that nothing gated — the row reads 2,
+because this same commit converted one of the three to a symbol, so it records
+what the file carries now rather than what it always did. The stripper is line-anchored
 now — a fence is a fence only at the start of a line, blockquote markers
 stripped — and the file gets the row it always should have had. **That row is an
 addition to a file whose rule is that numbers only fall**, so the reason is

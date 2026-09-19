@@ -1401,13 +1401,28 @@ def check_line_citations() -> str:
     )
     gone = sorted(rel for rel, _, _ in dropped if rel not in files)
 
-    # An empty scan is not a pass: the pattern silently matching nothing would
-    # print the same "within budget" as a clean tree.
-    if total < 100:
+    # **An empty scan is not a pass**, and since 2026-09-19 the equality above
+    # is what says so: a pattern that stopped matching drops every row at once
+    # and fails loudly, naming each file. This used to be `if total < 100`,
+    # which was a floor on the corpus rather than on the pattern — and once a
+    # row became an equality that floor would have refused a commit which
+    # legitimately shed its way below 100 and lowered every row correctly, with
+    # a message blaming the regex.
+    #
+    # What is left to assert is the pattern's own shape, which no corpus size
+    # can show: that it still matches the form it is for, and still does not
+    # match the bare form, which is the documented scope limit rather than an
+    # accident.
+    if not pattern.search("see `crates/tf_tree/src/tree.rs:2182` for it"):
         fail(
-            f"the line-citation scan found only {total} citations where the "
-            f"budget records {sum(budget.values())}; the pattern has stopped "
-            f"matching and this gate is asserting nothing"
+            "the `path.rs:LINE` pattern no longer matches a full-path citation; "
+            "this gate is asserting nothing"
+        )
+    if pattern.search("see `tree.rs:2182` for it"):
+        fail(
+            "the `path.rs:LINE` pattern now matches the bare form; that is a "
+            "wider scope than every row in the budget was measured against, so "
+            "the rows must be re-derived in the same commit"
         )
 
     # **A drop is a failure, not a note, and that is what makes "a row may only

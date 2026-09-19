@@ -26,9 +26,10 @@ copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
 twenty-four lines.** Those in `0028`, `0034` and `0055` are not repaired,
 because those records are `implemented` and a line-number erratum per site would
 bury this file's real ones. **`0019` and `0057` were in that list for one round
-and should not have been** — both are `ready`, so both are editable, and every
-citation in them has been replaced by the symbol the surrounding prose already
-named. A status is what decides whether a record may be edited, and restating
+and should not have been** — both are `ready`, so both are editable, and their
+`tree.rs` citations have been replaced by the symbol the surrounding prose
+already named. Their other line-number citations are untouched and still
+budgeted; this erratum is about `tree.rs` only. A status is what decides whether a record may be edited, and restating
 one from memory is the mistake the paragraph below this is about.
 
 **"Moved by twenty-four" is not the same as "twenty-four lines early", and the

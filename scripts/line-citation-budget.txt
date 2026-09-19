@@ -29,13 +29,14 @@
 #
 # **One row was ADDED after the fact, on 2026-09-19, and that is not a licence
 # to add more.** `docs/PHASE5.md` had no row because the scanner reported zero
-# for it: the first fence-stripper was `re.sub(r"```.*?```", ...)`, which counts
-# a triple backtick written inside an inline code span, and an odd marker count
-# inverts the pairing for the rest of a file — prose blanked, code blocks
-# scanned. The two citations were always there and were never gated. The
-# stripper is line-anchored now (`strip_fenced_blocks`), so the row records what
-# the file has always carried. A row added for any other reason is a budget
-# being raised, which this file does not permit.
+# for it while the file carried three, one of which the same commit converted to
+# a symbol — so the row is 2, which is what the file carries *now* rather than
+# what it always did. Stating that plainly because a row added for any reason
+# other than "the scanner could not see these" is a budget being raised.
+# The cause: the first fence-stripper was `re.sub(r"```.*?```", ...)`, which
+# counted a triple backtick written inside an inline code span, and an odd
+# marker count inverts the pairing for the rest of a file — prose blanked, code
+# blocks scanned. The stripper is line-anchored now (`strip_fenced_blocks`).
 2	CHANGELOG.md
 17	docs/PHASE2.md
 3	docs/PHASE3.md
