@@ -146,9 +146,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: just
+          tool: just,mdbook
       - name: just doc
         run: just doc
+      - name: just book
+        run: just book
 
   # `just c-abi-check` (`docs/PHASE4.md` §6.1, §7 gate 4): Miri plus ASan.
   c-abi:

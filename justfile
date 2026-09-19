@@ -366,6 +366,10 @@ ingest-check:
 
 # **Rustdoc, with warnings denied — the docs.rs shop window.**
 # docs.rs's configuration: the five publishable crates set `all-features` and `--cfg docsrs`; `tf_tree_bench` names `shm,embed-probe`. Not gated: `tf2` (`just tf2-check`), `tf_tree_py` (`just py-lint`), `tf_tree_tf2_sys`.
+# **The prose book (`docs/SUMMARY.md`).** Fails on a listed file that does not exist.
+book:
+    mdbook build docs
+
 doc:
     RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo doc --no-deps --all-features \
         -p tf_tree -p tf_tree_core -p tf_tree_math -p tf_tree_arena \

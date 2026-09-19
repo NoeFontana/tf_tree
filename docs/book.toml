@@ -1,0 +1,7 @@
+[book]
+title = "tf_tree"
+src = "."
+
+[build]
+build-dir = "../target/book"
+create-missing = false
