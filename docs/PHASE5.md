@@ -1865,9 +1865,15 @@ Output modes: human (default, coloured, grouped by severity), `--json` (stable s
 > no-process case rather than leaving it to the two that name one.*
 >
 > The subject also carries which of the shapes it is — `byte free`,
-> `byte still HELD`, or `byte not probed` for a source that opened no lock
-> file — because the responses are opposite and the difference has to survive
-> being read at 3am.
+> `byte still HELD`, or `byte not probed` when the run has no kernel answer
+> about the byte — because the responses are opposite and the difference has to
+> survive being read at 3am. **`byte not probed` is about the run, not the
+> source**: usually it means no lock file was opened (`--from-bag`, the
+> fixture), and an `--attach` run reaches it too for any slot whose
+> `F_OFD_GETLK` returned an error, which is why `slot_facts` is three-valued
+> rather than folding a failed probe into `free`. *This read "for a source that
+> opened no lock file" until 2026-09-19, forty lines above a paragraph in this
+> same section saying the opposite.*
 >
 > **The word-before-byte order is pinned by a signature, not by a comment.**
 > `0028` piece 2's third constraint requires the `state` word to be observed

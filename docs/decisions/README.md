@@ -45,7 +45,9 @@ Every site that *may* be edited has been repaired instead: `docs/PHASE2.md`
 `crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`. Each now
 names the symbol its own surrounding prose already named. *The four specs were
 repaired first and were missing from this list for three rounds, which is the
-list-stated-once rule failing at the place it was written.* **That list is stated once, here**, and no count of the attempts it took
+list-stated-once rule failing at the place it was written.*
+
+**That list is stated once, here**, and no count of the attempts it took
 is given, because the count was itself restated wrongly a round after it was
 written.
 

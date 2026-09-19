@@ -1477,10 +1477,11 @@ def check_line_citations() -> str:
                 f"to be deleted rather than lowered"
             )
         fail(
-            f"{shed} `path.rs:LINE` citation(s) shed in {len(dropped)} file(s) "
-            f"whose budget still records the old count — {remedy}: {listed}. A "
-            f"row that sits above its file is headroom for a citation nobody "
-            f"had to justify."
+            f"{len(dropped)} budget row(s) sit above their file, by {shed} "
+            f"citation(s) in total — either the citations were removed and the "
+            f"rows were not, or a row was written too high; both read the same "
+            f"from here. {remedy}: {listed}. A row above its file is headroom "
+            f"for a citation nobody had to justify."
         )
     # **The uncounted half went into three documents and went stale in all of
     # them inside one branch**, so it is printed rather than written down — and

@@ -2365,15 +2365,16 @@ fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
         (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() => {
             "the lock byte is free, and this run got no identity record out of the lock file \
              for this slot — none written, or none readable — so /proc was asked about \
-             nobody and the pid below is the arena record's own"
+             nobody and the pid this finding names is the arena record's own"
         }
         (LockByte::Free, _) => {
             "the lock byte is free, and /proc could not say what became of the process — so \
              the kernel's answer is the whole of the evidence"
         }
         _ => {
-            "/proc says its process is gone, and no lock file was read on this run — so the \
-             kernel's own answer about the byte is not in this report"
+            "this run has no kernel answer about the byte — it read no lock file \
+             (`--from-bag`, the fixture), or the probe itself failed — so the verdict rests \
+             on the record being LIVE over a process this run could not confirm is running"
         }
     }
 }
@@ -2714,7 +2715,9 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
                         ),
                         None => (
                             format!(
-                                "slot {} was left registered by a process this run cannot name",
+                                "slot {} was left registered by a process this run cannot \
+                                 name — which rules out the last cause below, since a \
+                                 build_shared creator's record always carries its pid",
                                 p.slot
                             ),
                             "",
@@ -5364,10 +5367,13 @@ mod tests {
     /// evidence clause. A first draft of this note predicted the finding would
     /// vanish. So the two rows are not a fire-or-not difference: **both accuse
     /// a running process**, and what the retracted sentence got wrong is which
-    /// evidence an operator is sent after. Under it the message reads *"/proc
+    /// evidence an operator is sent after. Under it the message read *"/proc
     /// says its process is gone, and no lock file was read on this run"* —
     /// three claims about a live publisher, one of them about a syscall the run
-    /// did make.
+    /// did make. *That wording has since gone from the `(Unknown, _)` arm too,
+    /// for a third reason found in review: on an `--attach` run whose probe
+    /// errored, a lock file **was** read, and `alive` can come from the kernel
+    /// rather than from `/proc`, so both of its clauses could be false at once.*
     #[test]
     fn a_byteless_record_in_a_served_arena_is_accused_of_leaking() {
         let obs = Observations::new();
@@ -5403,7 +5409,8 @@ mod tests {
             "the clause must not settle which of the two it was — a failed read and an absent record fold together upstream: {m}"
         );
         assert!(
-            m.contains("the pid below is the arena record's own") && m.contains("pid 4712"),
+            m.contains("the pid this finding names is the arena record's own")
+                && m.contains("pid 4712"),
             "the finding prints a pid and its remedy says to check it, so the evidence must say where that number came from: {m}"
         );
         assert!(
@@ -5411,7 +5418,7 @@ mod tests {
             "/proc was never asked here — that clause is for a record that exists and a probe that would not answer: {m}"
         );
         assert!(
-            !m.contains("no lock file was read on this run"),
+            !m.contains("this run has no kernel answer about the byte"),
             "that clause belongs to the `LockByte::Unknown` row, which this shape does not take: reaching it would mean the retracted sentence was right: {m}"
         );
     }
@@ -5640,8 +5647,16 @@ mod tests {
         assert!(
             o.findings[1]
                 .message
-                .contains("no lock file was read on this run"),
-            "a run with no lock file must not claim the byte is free: {}",
+                .contains("this run has no kernel answer about the byte"),
+            "a run with no byte answer must not claim the byte is free: {}",
+            o.findings[1].message
+        );
+        assert!(
+            !o.findings[1]
+                .message
+                .contains("/proc says its process is gone"),
+            "this row's verdict does not rest on /proc either — `alive` can come \
+             from the kernel — so the clause must not say it did: {}",
             o.findings[1].message
         );
         assert!(

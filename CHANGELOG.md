@@ -156,6 +156,12 @@ about it:
   claims only that *this run* got no identity record, because a failed read and
   an absent one are folded together upstream, and it says which pid the finding
   is printing — the arena record's — so the remedy has something to point at;
+- the `byte not probed` rendering said it meant a run that opened **no lock
+  file**, in the check's rustdoc, in `PHASE5.md` §6 and in `docs/RUNBOOK.md`'s
+  `TFT014` table. An `--attach` run reaches it too, for any slot whose
+  `F_OFD_GETLK` returned an error — a failed probe is deliberately not reported
+  as *free*, because that would be an accusation. The runbook's remedy had been
+  telling such an operator to run the command they had just run;
 - **and where neither the lock file nor the arena record names a process**, the
   finding prints no pid, no subject pid and no instruction to check one. A
   `RESERVED` record whose registrant died inside `fill_slot` is that shape, and
