@@ -25,6 +25,10 @@
 # a failing run as well as a passing one — so neither is written down here to go
 # stale.
 #
+# **It scans tracked Markdown and nothing else.** The same citations are
+# written in Rust doc comments, where nothing gates them and several are
+# already stale. Covering those, and the bare spelling, is one follow-up.
+#
 # A row sitting above its file is headroom for a citation nobody had to
 # justify — and, until 2026-09-19, the way to raise a budget without anyone
 # noticing, because a drop was only a printed note.

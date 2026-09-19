@@ -33,15 +33,25 @@ ones. **`0028` alone holds most of them.**
 *"In tracked Markdown" is a scope this sentence needed and did not have for two
 rounds.* The same citations are written in Rust doc comments, which neither the
 gate nor the census that produced this list ever looked at —
-`crates/tf_tree_bench`'s `backing.rs` and `attach_bench.rs` carried three, one
-of them the *same* `tree.rs:1984` that `docs/benchmarks/tf2.md` had de-numbered
-in this change while its twin in a `//!` block stayed. All three are repaired.
+`crates/tf_tree_bench`'s `backing.rs` and `attach_bench.rs` carried three into
+`tree.rs`, one of them the *same* `tree.rs:1984` that `docs/benchmarks/tf2.md`
+had de-numbered in this change while its twin in a `//!` block stayed. Those
+three are repaired; the Rust corpus as a whole is **not** measured and is not
+claimed to be.
 
-Every site in a record that *may* be edited has been repaired instead, and the
-list of those took three attempts: `0019` and `0057` (`ready`), then `0027` and
-`0030` (`draft`), plus `docs/benchmarks/tf2.md`. Each now names the symbol its
-own surrounding prose already named. Only `tree.rs` citations are in scope here;
-those records' other line-number citations are untouched and still budgeted.
+Every site that *may* be edited has been repaired instead: `0019` and `0057`
+(`ready`), `0027` and `0030` (`draft`), `docs/benchmarks/tf2.md`, and three in
+Rust doc comments — `crates/tf_tree_bench`'s `backing.rs` twice and
+`attach_bench.rs`. Each now names the symbol its own surrounding prose already
+named. **That list is stated once, here**, and no count of the attempts it took
+is given, because the count was itself restated wrongly a round after it was
+written.
+
+Only `tree.rs` citations are in scope: those files' other line-number citations
+are untouched, and several of them are stale for reasons that predate this
+change — `backing.rs` alone still carries three into other files, two of them
+already pointing at the wrong item. Nothing gates a line citation in a Rust
+comment at all, which is the follow-up the budget's header names.
 
 A status is what decides whether a record may be edited, and restating one from
 memory is the mistake the paragraph below this is about — it is what made this

@@ -114,8 +114,10 @@ Every site that may be edited is repaired instead — `0019` and `0057`
 (`ready`), `0027` and `0030` (`draft`), `docs/benchmarks/tf2.md`, and three in
 Rust doc comments that the Markdown-only census had never looked at
 (`crates/tf_tree_bench`'s `backing.rs` twice and `attach_bench.rs`). That list
-took four passes to get right: assembled from memory twice, then measured over
-the wrong corpus.
+was assembled from memory twice and then measured over a corpus that stopped at
+tracked Markdown. It is stated once, in `decisions/README.md`, and no count of
+the attempts appears in either place — the count was itself restated wrongly a
+round after it was written.
 
 **Repairing `0019`'s is also what showed this paragraph was overstating**: its
 `tree.rs:1166-1181` was not displaced by twenty-four lines, it was *already*

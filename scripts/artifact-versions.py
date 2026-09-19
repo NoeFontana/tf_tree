@@ -1499,11 +1499,23 @@ def check_line_citations() -> str:
             "the wider census pattern no longer matches a bare citation; the "
             "figure it prints is asserting nothing"
         )
+    # A file whose fence never closed was read to the point of the fence and no
+    # further, so both totals are partial on that run. The shed report already
+    # excludes it; a census printed beside the failure has to say so too, or the
+    # number offered *because* a run failed is the number that run could not
+    # take.
+    partial = (
+        f" — PARTIAL: {len(unreadable)} file(s) were read only as far as an "
+        f"unclosed fence, so both totals are short"
+        if unreadable
+        else ""
+    )
     note(
         f"citation census: {total} `path.rs:LINE` in {len(found)} documents with "
         f"a directory prefix, {wider} with the prefix made optional — the gate "
         f"holds the first number, so its rows are a floor on the rot and not a "
-        f"census of it"
+        f"census of it{partial}. **Tracked Markdown only**: the same citations "
+        f"are written in Rust doc comments, which nothing here scans"
     )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
@@ -1645,12 +1657,14 @@ def main() -> int:
             lines.append(summary)
 
     if failures:
-        # **The summaries go out on a failing run too.** Every check that got
-        # far enough to produce one has something a reader wants precisely when
-        # something is wrong — the citation census most of all, since a person
-        # reading a ratchet failure is the person who needs both totals. They
-        # went to stdout only on success until 2026-09-19, and three documents
-        # had been changed to defer to output that a red run suppressed.
+        # **What goes out on a failing run is the measurements and the surviving
+        # verdicts.** A check that failed loses its summary in the loop above,
+        # because every summary asserts its own rule; `notes` carries the
+        # numbers that assert nothing and prints regardless, which is what a
+        # person reading a ratchet failure actually wants. Both halves of that
+        # arrangement were wrong in turn: summaries were suppressed entirely
+        # until 2026-09-19, then printed unconditionally on the same day, which
+        # put an all-clear above its own failure block.
         for line in [*lines, *notes]:
             print(f"artifact-versions: {line}")
         # stdout is block-buffered under a pipe — `just lint`, CI — so without

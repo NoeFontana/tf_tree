@@ -2334,14 +2334,24 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
 /// something to check. A reader told no process was named would otherwise read
 /// the pid beside it as contradicting that.
 ///
-/// **Usually, because a `RESERVED` record's pid is still zero.** `slot_leak`
-/// sends every non-`FREE` state through the byte table, and a registration
-/// caught in the creator's µs-wide window — byte taken, identity record not yet
-/// written — reaches this same row with `pid: 0`. Telling an operator the
-/// printed number is the record's own, and then to go and check it, would be
-/// `slot_subject`'s *"slot 8 pid 0 … /proc has no running process for it"*
-/// defect arriving by a new route. That shape gets its own clause, which says
-/// there is nothing to check.
+/// **Usually, because a `RESERVED` record's pid is still zero**, and `slot_leak`
+/// sends every non-`FREE` state through the byte table. The producer is
+/// `fill_slot` (`crates/tf_tree_core/src/participant.rs`): it CASes
+/// `FREE -> RESERVED`, writes the fields, then publishes `Release(LIVE)`, and a
+/// registrant killed inside that window leaves a `RESERVED` record whose `pid`
+/// field is still `0`. Once the kernel releases its lock byte, that record
+/// reaches this row. Telling an operator the printed number is the record's
+/// own, and then to go and check it, is `slot_subject`'s *"slot 8 pid 0 …
+/// /proc has no running process for it"* defect arriving by a new route, so
+/// that shape gets its own clause saying there is nothing to check.
+///
+/// *This named "the creator's µs-wide window — byte taken, identity record not
+/// yet written" for one round, and that window cannot reach here at all: with
+/// the byte taken `p.byte` is [`LockByte::Held`], which `slot_leak` routes to
+/// [`SlotLeak::ForkInheritor`] or to no finding. It is clause (b) on
+/// `slot_leak`, which is where that rustdoc already assigned it. The test had
+/// to set a free byte to reach this arm, contradicting its own prose — a
+/// rationale the fixture falsified, in the same commit.*
 fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
     match (p.byte, p.recorded) {
         (LockByte::Free, RecordedProcess::Gone) => {
@@ -2391,21 +2401,39 @@ fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
 /// slot to reap and a slot nothing may reap must not need a paragraph of prose
 /// to tell apart.
 fn slot_subject(p: &ParticipantInfo) -> String {
-    let evidence_pid = p.recorded_pid.unwrap_or(p.pid);
     let byte = match p.byte {
         LockByte::Held => "byte still HELD",
         LockByte::Free => "byte free",
         LockByte::Unknown => "byte not probed",
     };
-    match p.recorded_pid {
-        Some(rp) if rp != p.pid && p.pid != 0 => {
+    match (p.recorded_pid, named_pid(p)) {
+        (_, None) => format!("slot {}, no pid recorded, {byte}", p.slot),
+        (Some(rp), Some(_)) if rp != p.pid && p.pid != 0 => {
             format!(
                 "slot {} pid {rp} (arena record names pid {}), {byte}",
                 p.slot, p.pid
             )
         }
-        _ => format!("slot {} pid {evidence_pid}, {byte}", p.slot),
+        (_, Some(pid)) => format!("slot {} pid {pid}, {byte}", p.slot),
     }
+}
+
+/// The pid this finding is about, or `None` when nothing named one.
+///
+/// **The one predicate three renderings share**, because the zero used to reach
+/// them one at a time. `slot_subject`'s own doc has said since it was written
+/// that a record whose field is zero "names nothing and is left out rather than
+/// printed as a `0` somebody has to interpret" — and its fallback arm printed
+/// the zero anyway whenever the lock file named nobody either. [`tft014`]'s
+/// abandoned message printed it a second time, and told the operator to go and
+/// check it a third.
+///
+/// `recorded_pid` is the lock file's and leads, because the `/proc` sentence in
+/// every message is about that one; `ParticipantInfo::pid` is the arena
+/// record's, still zero on a `RESERVED` row and always zero on the `FREE` row a
+/// read-only participant leaves.
+fn named_pid(p: &ParticipantInfo) -> Option<u32> {
+    p.recorded_pid.or(Some(p.pid).filter(|&n| n != 0))
 }
 
 /// `TFT014` — a participant slot, or a claim, that outlived its owner.
@@ -2660,22 +2688,39 @@ fn tft014(inp: &Inputs<'_>) -> CheckOutcome {
             Some(SlotLeak::Abandoned) => out.push(Finding::about(
                 Tft::Tft014,
                 slot_subject(p),
-                format!(
-                    "a record left behind — the record is {state}, {} — pid {pid} \
-                     left slot {} registered and no longer holds it, and the owner's \
-                     socket-hangup reap did not clear it. That reap collects a rendezvous \
-                     peer, so this is a slot it cannot reach: the owner's own, one its epoll \
-                     never watched, a takeover heir's inherited peer, an owner that died \
-                     inside the callback (docs/decisions/0028) — or a live publisher that \
-                     never took a byte, which is a TreeBuilder::build_shared arena served \
-                     by hand and out of contract (docs/decisions/0031). CHECK THE PID IS \
-                     GONE before you reap: on that last one it is not. Nothing reclaims \
-                     it — {leaked} of {slots} slots are spent for the life of the segment, \
-                     and at {slots} every further attach fails NoParticipantSlots. Only \
-                     stopping every participant, which frees the segment, frees a slot",
-                    abandoned_evidence(p),
-                    p.slot
-                ),
+                {
+                    // **The pid appears three times in this finding and nothing
+                    // may print a zero.** `named_pid` is the one answer; where
+                    // it is `None` the clause naming a process goes, and so
+                    // does the instruction to check it, because there is
+                    // nothing to check and telling an operator otherwise is
+                    // the defect `slot_subject`'s doc is about.
+                    let (left, check) = match named_pid(p) {
+                        Some(n) => (
+                            format!("pid {n} left slot {} registered", p.slot),
+                            " CHECK THE PID IS GONE before you reap: on that last one it \
+                             is not.",
+                        ),
+                        None => (
+                            format!("slot {} was left registered", p.slot),
+                            "",
+                        ),
+                    };
+                    format!(
+                        "a record left behind — the record is {state}, {} — {left} \
+                         and no longer holds it, and the owner's \
+                         socket-hangup reap did not clear it. That reap collects a rendezvous \
+                         peer, so this is a slot it cannot reach: the owner's own, one its epoll \
+                         never watched, a takeover heir's inherited peer, an owner that died \
+                         inside the callback (docs/decisions/0028) — or a live publisher that \
+                         never took a byte, which is a TreeBuilder::build_shared arena served \
+                         by hand and out of contract (docs/decisions/0031).{check} Nothing reclaims \
+                         it — {leaked} of {slots} slots are spent for the life of the segment, \
+                         and at {slots} every further attach fails NoParticipantSlots. Only \
+                         stopping every participant, which frees the segment, frees a slot",
+                        abandoned_evidence(p),
+                    )
+                },
             )),
             Some(SlotLeak::ForkInheritor) => out.push(Finding::about(
                 Tft::Tft014,
@@ -5363,17 +5408,23 @@ mod tests {
     /// The sibling above added a clause saying the printed pid is the arena
     /// record's own, because `tft014`'s remedy is *check the pid is gone before
     /// you reap*. [`slot_leak`] routes every non-`FREE` state through the byte
-    /// table, so the creator's µs-wide window — byte taken, identity record not
-    /// yet written — reaches the same row with `pid: 0` and no `recorded_pid`.
-    /// Without its own clause the finding would read *"the pid below is the
-    /// arena record's own — pid 0 … CHECK THE PID IS GONE"*, which is
-    /// `slot_subject`'s documented *"slot 8 pid 0"* defect arriving by a new
-    /// route.
+    /// table, and `fill_slot`'s `FREE -> RESERVED -> fields -> Release(LIVE)`
+    /// publication leaves a `RESERVED` record with `pid: 0` if the registrant
+    /// dies inside it; once the kernel releases that process's lock byte the
+    /// record reaches this row with a free byte and no `recorded_pid`. Which is
+    /// what this fixture is, field for field.
     ///
-    /// **Mutant, run:** delete the `p.pid == 0` arm so this falls through to
-    /// the sibling's. Applied: the first assertion fails, printing *"the pid
-    /// below is the arena record's own — pid 0 left slot 1 registered"*. The
-    /// two clauses are therefore not interchangeable wording.
+    /// **The zero reached three renderings and the first fix caught one.** The
+    /// evidence clause stopped claiming a pid while the message still read
+    /// *"pid 0 left slot 1 registered … CHECK THE PID IS GONE"* and the subject
+    /// still rendered `slot 1 pid 0` — `slot_subject`'s documented defect,
+    /// verbatim, under a rustdoc saying it was being prevented. `named_pid` is
+    /// the one predicate now and the assertions below cover all three.
+    ///
+    /// **Mutant, run:** delete the `p.pid == 0` arm in `abandoned_evidence` so
+    /// this falls through to the sibling's. Applied: the first assertion fails,
+    /// printing *"the pid below is the arena record's own"*. The clauses are
+    /// not interchangeable wording.
     #[test]
     fn a_record_with_no_pid_at_all_is_not_something_to_go_and_check() {
         let obs = Observations::new();
@@ -5398,6 +5449,23 @@ mod tests {
         assert!(
             !m.contains("the pid below is the arena record's own"),
             "there is no pid below — that clause is the sibling's: {m}"
+        );
+        // **The other two places the zero used to reach.** Fixing the evidence
+        // clause alone left the message naming `pid 0` and shouting at the
+        // operator to check it, and the subject line rendering the `slot 8
+        // pid 0` shape verbatim.
+        assert!(
+            !m.contains("pid 0") && !m.contains("CHECK THE PID"),
+            "nothing may print a zero as a pid or send anybody to check one: {m}"
+        );
+        assert!(
+            m.contains("slot 1 was left registered"),
+            "the clause that named a process must still say which slot: {m}"
+        );
+        assert_eq!(
+            o.findings[0].subject, "slot 1, no pid recorded, byte free",
+            "the subject is the line `docs/RUNBOOK.md`'s rows key on, so it is \
+             the third place the zero must not appear"
         );
     }
 
