@@ -178,7 +178,8 @@ pub(crate) enum Reclamation {
 /// [`AttachMode::ReadWrite`] (`refuse_a_byteless_writer`), so the byte-less
 /// writer they used to produce has no producer left.
 ///
-/// **It does not buy *every participant*, and the difference is a live defect.**
+/// **It does not buy *every participant*, and the difference is a composition
+/// this project does not support.**
 /// `TreeBuilder::build_shared` called directly still registers without a byte.
 /// `0028` concluded that this was harmless because such a tree has "no lock file,
 /// therefore no probe, and never reaches here" — **and that is wrong, because the
@@ -189,11 +190,17 @@ pub(crate) enum Reclamation {
 /// every peer that joined normally, and [`Tree::reap_participants`] frees its
 /// record while it is publishing —
 /// `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
-/// (`crates/tf_tree/tests/rendezvous.rs`) pins it. The predicate is therefore
+/// (`crates/tf_tree/tests/rendezvous.rs`) characterises it. The predicate is therefore
 /// **total only over participants that joined through the rendezvous**, which is
 /// a property of the arena's population and not of this caller.
-/// `docs/decisions/0031-the-participant-record-with-no-byte.md` is where that is
-/// being decided; nothing here changes until it is.
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that on
+/// 2026-09-18, and **nothing here changes because of it**: a `build_shared`
+/// arena served through a hand-bound `OwnerServer` is *out of contract*, so the
+/// population this predicate is not total over is one the project does not
+/// support rather than one it owes a fix. The supported way to serve a created
+/// arena is `Open::open`'s `Created` arm, which is `build_shared` **plus** the
+/// rendezvous, the lock byte and the claim leases — and over that population the
+/// predicate is total.
 ///
 /// **Step 0c buys *the byte at index `slot` is the byte of the record at index
 /// `slot`***, and nothing else does. The two indices are chosen by code that

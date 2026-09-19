@@ -3473,8 +3473,13 @@ impl Tree {
         // No rendezvous, no lock file, no kernel fact to act on. This scopes the
         // *sweeper*, and only the sweeper: it says nothing about whether the
         // records it will judge have bytes of their own. A `build_shared`
-        // participant in this same arena has none, and is read dead — see
-        // `docs/decisions/0031-the-participant-record-with-no-byte.md`.
+        // participant in this same arena has none, and is read dead — but a
+        // sweeper can only *be* in such an arena if somebody served it through a
+        // hand-bound `tf_tree_ipc::OwnerServer`, which
+        // `docs/decisions/0031-the-participant-record-with-no-byte.md` answered
+        // **out of contract** on 2026-09-18. The supported create path takes the
+        // byte before it builds, so over the population it produces every record
+        // this sweep judges is byte-paired.
         let Some(probe) = self.ofd_probe.as_ref() else {
             return 0;
         };
@@ -3534,13 +3539,30 @@ impl Tree {
     /// smaller version of the same thing: every reclaimer keys on the byte
     /// (`docs/PHASE2.md` §5.1), so such a record reads *dead* to any peer
     /// carrying a probe, and `Tree::reap_participants` will free it while this
-    /// process is still publishing. See
-    /// `docs/decisions/0031-the-participant-record-with-no-byte.md`.
+    /// process is still publishing.
     ///
-    /// The three names above are deliberately **not** intra-doc links: this
-    /// method is compiled into the default tier and all three are `shm`-gated,
+    /// **A peer can only hold that opinion if the arena is served**, and
+    /// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
+    /// 2026-09-18 that serving a `build_shared` arena through a hand-bound
+    /// `tf_tree_ipc::OwnerServer` is **out of contract**. Unserved — the fd
+    /// passed to a child, which is what `TreeBuilder::build_shared` is for — no
+    /// observer carries a probe and the paragraph above describes nothing that
+    /// happens.
+    /// The supported way to serve a created arena is `tf_tree::Open`, which
+    /// takes the lock byte before it builds.
+    ///
+    /// `tf_tree::Open`, `Tree::reap_participants`, `TreeBuilder::build_shared`
+    /// and `tf_tree_ipc::OwnerServer` above are deliberately **not** intra-doc
+    /// links: this method is compiled into the default tier and all four are
+    /// `shm`-gated,
     /// so linking them breaks `just stable-tier-check`'s rustdoc pass — which is
-    /// the tier a published consumer reads.
+    /// the tier a published consumer reads. **[`Self::participant_alive`] is
+    /// linked above and must stay linked**: it carries no `cfg` and is in the
+    /// default tier, so it is the one name here that is safe.
+    ///
+    /// *This list named `Tree::participant_alive` and omitted
+    /// `TreeBuilder::build_shared` for one round — exactly inverted, in a
+    /// sentence whose only job is to say which names are unsafe to link.*
     #[must_use]
     pub fn participant_slot(&self) -> u32 {
         self.participant

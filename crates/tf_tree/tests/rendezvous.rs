@@ -3840,25 +3840,44 @@ fn a_read_only_tree_reaps_no_participant_records() {
 /// word over a permanently free byte: precisely the shape step 0b refused for
 /// `attach_shared(ReadWrite)`, reached by a call step 0b does not cover.
 ///
-/// **It pins the defect, not the fix.** When
-/// `docs/decisions/0031-the-participant-record-with-no-byte.md` is answered this
-/// test flips, and each `PIN:` message says which way. It is written as a pin
-/// rather than left for later because the claim it replaces sat in `PHASE2.md`
-/// §0.0 — the document that outranks every other in this project — for three
-/// days, and what let it survive is that nobody executed it.
+/// **It characterises an unsupported composition, and nothing here is owed a
+/// fix.** `docs/decisions/0031-the-participant-record-with-no-byte.md` was
+/// answered on 2026-09-18: serving a `build_shared` arena through a hand-bound
+/// `OwnerServer` is **out of contract**, so what this test executes is the
+/// boundary rather than a defect queued for repair. The assertions are
+/// unchanged, because the behaviour is unchanged — only the claim about it is.
+///
+/// *It was written as a pin on that decision, and each `PIN:` message said
+/// which way to flip it. That instruction is withdrawn: the answer changes no
+/// behaviour, so inverting an assertion here breaks a passing suite.* It stays
+/// executed because the claim it replaced sat in `PHASE2.md` §0.0 — the document
+/// that outranks every other in this project — for three days, and what let it
+/// survive is that nobody executed it. A boundary nobody runs rots the same way.
 ///
 /// Every call here is shipped public API: `TreeBuilder::build_shared`,
 /// `Tree::shared_fd`, `tf_tree_ipc::OwnerServer::bind_at`, `Tree::open`,
-/// `Tree::reap_participants`. **Nothing in this workspace composes them this
-/// way**, which is why running the suite never found it — the bench binaries
-/// that call `build_shared` pass the fd directly and stand up no rendezvous, so
-/// no probe-carrying observer exists in them to hold the wrong opinion.
+/// `Tree::reap_participants`. **No shipped path composes them this way** — the
+/// only `build_shared` calls in the workspace that stand a **rendezvous** up
+/// without a lock file are this test and the `byteless_served_arena()` helper
+/// the other two use, both on purpose. **Every other call site either stands up
+/// no rendezvous at all — sixteen of them, benches, examples and eight tests —
+/// or stands one up holding a lock file, which is `Open::open`'s `Created` arm,
+/// the supported path.** Neither shape gives a probe-carrying observer anything
+/// byte-less to judge, which is why the suite went on passing while `PHASE2.md`
+/// §0.0's claim was false.
+///
+/// *Three spellings of that sentence were wrong before this one: "Nothing in
+/// this workspace composes them this way", written inside one of the two call
+/// sites that do; then "the benches and examples", when eight of the sixteen are
+/// tests; then "everything else … stands up no rendezvous at all", which drops
+/// the `Created` arm — the nineteenth call site, and the one the whole record
+/// turns on.*
 ///
 /// **Mutant, run rather than asserted.** `Tree::reap_participants` counting the
 /// verdict without calling `ParticipantTable::reclaim`:
 ///
 /// ```text
-/// assertion `left == right` failed: PIN: the sweep currently FREEs the record
+/// assertion `left == right` failed: BOUNDARY: the sweep FREEs the record
 /// of a process that is running
 ///   left: 6
 ///  right: 0
@@ -3944,9 +3963,10 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 
     assert!(
         !rescuer.participant_alive(record),
-        "PIN: a joined peer currently reads the byte-less creator as DEAD. If \
-         this assertion fails, 0031 has been answered — invert the test, do not \
-         delete it"
+        "BOUNDARY: a joined peer reads the byte-less creator as DEAD. This is \
+         what serving a `build_shared` arena costs, and 0031 answered it out of \
+         contract — if this assertion fails, the behaviour changed, so find out \
+         why rather than inverting it"
     );
     assert_eq!(
         state_word(&creator, record),
@@ -3959,12 +3979,12 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 
     assert!(
         reaped >= 1,
-        "PIN: the sweep currently collects the live creator; it collected {reaped}"
+        "BOUNDARY: the sweep collects the live creator; it collected {reaped}"
     );
     assert_eq!(
         state_word(&creator, record),
         0x0,
-        "PIN: the sweep currently FREEs the record of a process that is running"
+        "BOUNDARY: the sweep FREEs the record of a process that is running"
     );
 
     publisher
@@ -3984,8 +4004,9 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 /// `docs/decisions/0031` open question 1, which asked whether the false-dead
 /// verdict leads on to a *claim*-level loss. Measured answer: **the claim goes,
 /// but D7 does not** — the eviction is an availability failure, not corruption,
-/// and that is what keeps `0031` a documented limitation rather than a
-/// fix-before-release.
+/// and that is what kept `0031` from being a fix-before-release. **It was
+/// answered on 2026-09-18: the composition is out of contract**, so this is the
+/// boundary's cost rather than a limitation awaiting repair.
 ///
 /// The mechanism is one line below the one the sibling test above pins.
 /// `take_claim_lease` opens `let Some(lock) = self.lock_file.as_ref() else {
@@ -3993,11 +4014,12 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 /// either**; `reap_inner` declines only on a byte it can see *held*, and an
 /// unheld byte is indistinguishable from a dead holder's.
 ///
-/// **What this asserts, and what it deliberately does not.** It pins that the
-/// live publisher is evicted (the defect) *and* that `push` refuses afterwards
-/// rather than interleaving (the property that bounds the severity). If `0031`
-/// is answered by giving the record a byte, the first assertion flips and the
-/// second must not.
+/// **What this asserts, and what it deliberately does not.** It asserts that
+/// the live publisher is evicted *and* that `push` refuses afterwards rather
+/// than interleaving — the property that bounds the severity, and the one that
+/// must hold whatever else changes. *This read "if `0031` is answered by giving
+/// the record a byte, the first assertion flips"; that answer was not taken, and
+/// the one that was changes no behaviour, so neither assertion flips.*
 ///
 /// Its control is `a_leased_publisher_keeps_its_edge_against_a_sweeper` below:
 /// same harness, publisher joined through the rendezvous, `reap_dead` takes
@@ -4005,12 +4027,14 @@ fn a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes() {
 /// reaps everything.
 ///
 /// **Mutant, run rather than asserted.** `reap_inner` made to decline every
-/// claim — roughly the shape of one answer to `0031` — fails this test and
-/// leaves the control passing, which is the right pair:
+/// claim — roughly the shape of the option `0031` did **not** take — fails this
+/// test and leaves the control passing, which is the right pair:
 ///
 /// ```text
-/// assertion `left == right` failed: PIN: an ordinary peer's sweep currently
-/// takes the claim of a publisher that is running.
+/// assertion `left == right` failed: BOUNDARY: an ordinary peer's sweep takes
+/// the claim of a publisher that is running. This is what serving a
+/// `build_shared` arena costs, and 0031 answered it out of contract — if this
+/// is now 0, the behaviour changed, so find out why rather than inverting it
 /// ```
 #[test]
 #[cfg(feature = "unstable")]
@@ -4040,8 +4064,10 @@ fn a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to() {
     assert_eq!(
         sweeper.reap_dead(),
         1,
-        "PIN: an ordinary peer's sweep currently takes the claim of a publisher \
-         that is running. If this is now 0, 0031 has been answered — invert it"
+        "BOUNDARY: an ordinary peer's sweep takes the claim of a publisher that \
+         is running. This is what serving a `build_shared` arena costs, and 0031 \
+         answered it out of contract — if this is now 0, the behaviour changed, \
+         so find out why rather than inverting it"
     );
 
     let thief = sweeper
@@ -4049,7 +4075,7 @@ fn a_byteless_publisher_is_evicted_from_the_edge_it_is_publishing_to() {
             sweeper.frame("base").unwrap(),
             sweeper.frame("map").unwrap(),
         )
-        .expect("PIN: and the edge is then claimable by somebody else");
+        .expect("BOUNDARY: and the edge is then claimable by somebody else");
 
     // The half that bounds the severity: the victim is refused, not interleaved.
     let revoked = victim.push(2_000, &tf_tree::exp_se3([0.0, 0.0, 0.0, 2.0, 0.0, 0.0]));

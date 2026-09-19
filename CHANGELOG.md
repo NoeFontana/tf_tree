@@ -41,6 +41,30 @@ is a bug.
 
 ## [Unreleased]
 
+### Documented — a served `build_shared` arena is out of contract (`0031`)
+
+`TreeBuilder::build_shared` registers a participant record and takes no lock
+byte, because such an arena has no lock file: the fd is the capability. Publish
+one through a hand-bound `tf_tree_ipc::OwnerServer` and every reclaimer reads
+that record as dead — measured, and it costs the creator the edge it is
+publishing to, repeatedly, with no data corrupted (`edge::reap` bumps the epoch
+first, so the victim's next `push` is refused rather than interleaved).
+
+**`0031` answers that this composition is not a shape the project supports.** The
+supported way to serve a created arena is `tf_tree::Open::open`'s `Created` arm,
+which is `build_shared` **plus** the rendezvous, the lock byte and the claim
+leases. **No shipped path composes the byte-less served shape** — the only
+`build_shared` call in shipped library code is that `Created` arm, and the two
+that compose it without a lock file are the tests staging the measurement — and
+neither the C nor the Python binding can reach it.
+
+Nothing changes in behaviour. `reclamation_verdict`'s rustdoc said the question
+was "being decided"; it now says what was decided and why nothing here changes
+because of it, and `Tree::participant_slot`'s says that the peer which could hold
+the wrong opinion only exists in the composition that is out of contract. The
+advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is **permanent, not lifted** —
+both said "until `0031` is answered", which after an answer reads as expired.
+
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
 `IpcError::HandshakeRejected` appended a per-status remedy to every rejection,
@@ -3542,10 +3566,19 @@ same shape one layer up. Each has a home; none is a surprise waiting to be found
   it joined and took a probe. An arena created through `tf_tree::Open` is
   unaffected (its creator holds byte 0), and so is the ordinary `build_shared`
   deployment that passes `Tree::shared_fd` to children and stands up no
-  rendezvous: no peer there carries a probe. Nothing in this workspace composes
-  it the affected way. **Until `docs/decisions/0031` is answered, do not call
-  `Tree::reap_participants` in a process tree where anything served a
-  `build_shared` arena by hand.**
+  rendezvous: no peer there carries a probe. *This said "Nothing in this
+  workspace composes it the affected way", and it was false when it shipped:
+  `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes`
+  composes it on purpose and is in the tree at this tag. (The other two tests
+  that compose it landed later the same day. *An earlier revision of this
+  erratum said "three tests … predate this tag", replacing one wrong count with
+  another — `git grep` at `v0.0.4` finds one.*) What is true is that **no
+  shipped path** composes it.* **Do not call `Tree::reap_participants` in a process
+  tree where anything served a `build_shared` arena by hand.** *This read "until
+  `docs/decisions/0031` is answered"; it was answered on 2026-09-18, and the
+  answer is that **serving a `build_shared` arena is out of contract** — so the
+  advisory is permanent rather than expired. Nothing was fixed, because the
+  composition it warns about is one this project does not support.*
 
 - **`Tree::reparent` decides topology-lock liveness from `/proc` even when the
   tree holds an OFD probe** (issue #213) — the same §5.1 shape this release fixed
