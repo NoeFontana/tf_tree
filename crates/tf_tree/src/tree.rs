@@ -3473,8 +3473,13 @@ impl Tree {
         // No rendezvous, no lock file, no kernel fact to act on. This scopes the
         // *sweeper*, and only the sweeper: it says nothing about whether the
         // records it will judge have bytes of their own. A `build_shared`
-        // participant in this same arena has none, and is read dead — see
-        // `docs/decisions/0031-the-participant-record-with-no-byte.md`.
+        // participant in this same arena has none, and is read dead — but a
+        // sweeper can only *be* in such an arena if somebody served it through a
+        // hand-bound `tf_tree_ipc::OwnerServer`, which
+        // `docs/decisions/0031-the-participant-record-with-no-byte.md` answered
+        // **out of contract** on 2026-09-18. The supported create path takes the
+        // byte before it builds, so over the population it produces every record
+        // this sweep judges is byte-paired.
         let Some(probe) = self.ofd_probe.as_ref() else {
             return 0;
         };

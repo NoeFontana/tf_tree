@@ -154,8 +154,10 @@ one stands up a rendezvous *with* a lock file (`Open::open`'s `Created` arm, the
 supported path); **two** stand one up *without* one —
 `a_byteless_creators_record_reads_dead_and_is_reaped_while_it_publishes` and the
 `byteless_served_arena()` helper, both in `crates/tf_tree/tests/rendezvous.rs`,
-feeding the three tests that stage this record's measurement on purpose; and the remaining **sixteen** pass the fd
-directly and stand up no rendezvous at all (`backing.rs`, `workload.rs`,
+feeding the three tests that stage this record's measurement on purpose; and the remaining **sixteen** stand up
+no rendezvous at all — most passing the fd to a child, and four
+(`control_loop`, `hugepage_grant`, `replay_bit_identity` ×2) never calling
+`shared_fd`, using the arena in one process (`backing.rs`, `workload.rs`,
 `cache.rs`, `tree.rs`, `mp_bench`, `attach_bench`, `shm_scaling`,
 `hugepage_grant`, `heap_vs_shared`, `control_loop`, `tests/population.rs` ×3,
 `tests/multiprocess.rs`, `replay_bit_identity.rs` ×2). **No shipped path composes
@@ -581,6 +583,26 @@ it.
   call. The composition the ruling rests on is unchanged; the sequence written
   down was not the sequence.
 
+- **This branch broke line citations *outside* the files it edited, and they are
+  not fixed here.** The two rustdoc corrections add 7 lines to
+  `crates/tf_tree/src/open.rs` and 17 to `tree.rs`, and `docs/` carries **36
+  unique `path.rs:N` citations into those two files** across 13 documents. Four
+  already pointed at a blank or bare-`///` line on `main`; the rest were
+  plausibly correct and are now off by the shift — verified on two,
+  [`0055`](./0055-the-recovery-capacity-a-fleet-cannot-add-later.md)'s
+  `open.rs:1183` (`.take_attached()`) and
+  [`0030`](./0030-the-atfork-handler-and-inherited-descriptors.md)'s `:1093`.
+
+  **Not swept, and the reason is structural rather than effort.** 23 of the 41
+  citation sites are in `implemented` records, which this project freezes:
+  corrections to them go in `decisions/README.md`'s errata, and twenty-three
+  line-number errata would bury that file's real ones. **This is a repository
+  problem that this branch exposed rather than created** — any edit to `open.rs`
+  breaks up to 22 citations, nothing gates it, and the convention that produced
+  them is still in force. The fix is a convention plus a gate: cite symbols, and
+  have `artifact-versions` refuse *new* `crates/**.rs:N` citations in `docs/`
+  while grandfathering the existing ones. **That is owed work and is recorded
+  here rather than done in a record-move PR.**
 - **A claim about the *world* went stale while the record sat in `draft`.**
   Question 1's severity argument said `reap_dead` has "no production caller — a
   bench and a test binary". `0044` gave the sweep to both bindings a month
