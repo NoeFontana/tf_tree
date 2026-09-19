@@ -144,6 +144,23 @@ is what this layer can express, and its calibration is the same kind of number
 
 ## Consequences
 
+- **`Tree::await_frames` is the one shipped caller the bound actively breaks, and
+  fixing it is what makes the bound coherent.** It maps *every* `find_frame`
+  error to `AwaitError::Frame(e)` and returns immediately — "Terminal, not
+  retried" — on the reasoning that such an error "will not change on its own".
+  That is exactly false for the new producer, which resumes on `SIGCONT`. A
+  consumer calling `await_frames(["odom"], 5s)` waits today and, after step 2,
+  would be refused at ~3 ms with its own five-second budget discarded: a
+  behaviour break on the stable tier of a published crate.
+
+  **The resolution is the separation the bound exists to create.**
+  `find_frame` stops waiting unboundedly and says *"someone holds this and I
+  cannot say when"*; the layer that **owns a deadline** decides how long to keep
+  asking. So `await_frames` retries `InternContended` within its own timeout and
+  returns it only when that timeout expires. The core answers, the caller with a
+  clock waits — which is the shape the record wanted and did not notice it was
+  breaking.
+
 - `Tree::lookup`, `tft_plan_create` and `tree.plan()` gain a failure mode they
   did not have. Their docs must say so — a call that could not fail and now can
   is a breaking change in behaviour even where the signature is unchanged.
@@ -175,9 +192,12 @@ is what this layer can express, and its calibration is the same kind of number
    store-waiters; a second function, used by `frame::wait_for_publish` alone,
    calls an installed yield hook after a pure-spin prefix and pure-spins when
    none is installed. **The prefix is per liveness round, not per wait** —
-   `wait_for_publish` resets its spin counter at every round, so a per-wait
-   reading would enter the scheduler `INTERN_SPIN_LIMIT` times less often and the
-   two differ by that factor. Consequences names the prefix as the knob to turn
+   `wait_for_publish` resets its spin counter at every round, so the per-round
+   reading re-spends the prefix at each boundary and enters the scheduler **less**
+   often, by up to `INTERN_SPIN_LIMIT`×, than a per-wait prefix spent once after
+   which every iteration yields. *An earlier version had that direction
+   backwards, which would send an implementer chasing a `bench-check` regression
+   toward up to 10 000× more scheduler entries on the name-resolution path.* Consequences names the prefix as the knob to turn
    on a `bench-check` regression, so which one it is has to be stated. `tf_tree` installs it. Both functions keep yielding under
    `cfg(loom)`, or the models stop scheduling the thread they wait on.
    - **Verified by** `just bench-check` against the committed baseline, reported
@@ -187,7 +207,7 @@ is what this layer can express, and its calibration is the same kind of number
      them.** *No hook installed* is a **runtime** state, and it is already
      exercised: every `tf_tree_core` unit test builds an `ArenaView` with no
      facade, and `just test` runs them. What has **no gate** is a `no_std`
-     compile of `tf_tree_core` — `stable-tier-check` compiles only `-p tf_tree`,
+     compile of `tf_tree_core` — `stable-tier-check` compiles `-p tf_tree` and runs `tf_tree_ingest` and `tf_tree_bridge`, none of them `tf_tree_core` `no_std`,
      the closest pass is
      `clippy -p tf_tree_core --no-default-features --features crash-points`
      which pulls `extern crate std` in through that feature, and there is no
@@ -236,8 +256,12 @@ is what this layer can express, and its calibration is the same kind of number
      test hand-publishes on the claimant's behalf and asserts
      `rx.recv().unwrap().unwrap_err() == FrameHashCollision`. Under the bound the
      spawned interner has already returned `InternContended` and exited, so
-     `recv_timeout` consumed the only message and `tx` is dropped: that `recv()`
-     **panics on a disconnected channel** rather than failing an assertion. The
+     `recv_timeout` consumed the only message and nothing sends again: that `recv()`
+     **blocks forever and the test hangs** until nextest's timeout kills it.
+     *An earlier version said it panics on a disconnected channel; `tx` is bound
+     in the enclosing function and the `s.spawn` closure is not `move`, so the
+     sender outlives the scope and the channel never disconnects. A hang is
+     harder to recognise than a panic, which makes the understatement worse.* The
      doc comment's claim that the unblocking "proves the waiter was still on the
      normal publish path" describes a property the bound makes unobservable.
      Fixing only the timeout leaves a panicking test.
@@ -260,11 +284,15 @@ is what this layer can express, and its calibration is the same kind of number
    documented as **transient**. For a `SIGSTOP`ped claimant all three are false —
    it is identified, it is alive, and nothing about it is transient.
 
-   **Worse, `tf_tree_py`'s error docs name this variant in the *retry loop***
-   alongside `SlotContended` and `LeaseContended`. A control loop following the
-   shipped guidance retries forever against a stopped claimant, which relocates
-   the unbounded wait into the caller rather than ending it — defeating the
-   purpose of step 2. So step 3 covers the variant doc, the `Display`,
+   **Worse, the shipped Python message tells the caller to retry.**
+   `unresolvable_name` renders *"is being interned right now by a participant
+   this arena cannot identify … Retry"*, so a control loop following it retries
+   forever against a stopped claimant — relocating the unbounded wait into the
+   caller rather than ending it, and defeating the purpose of step 2. *An earlier
+   version cited `detached_err`'s rustdoc naming the variant "in the retry loop"
+   alongside `SlotContended` and `LeaseContended`; that site is `pub(crate)` and
+   this step's own erratum says it reaches no wheel user, so the paragraph rested
+   on the source it withdraws.* So step 3 covers the variant doc, the `Display`,
    `intern_core`'s `# Errors` (which does not mention the variant today) and the
    Python retry guidance.
 
@@ -274,20 +302,39 @@ is what this layer can express, and its calibration is the same kind of number
    crate and `API.md` §7's checklist; this record takes the cheaper route and
    names it so a reopening starts from the cost.
 
-   **Eight shipped sites, counted rather than sampled.** `FrameError::InternContended`'s
+   **Eleven shipped sites — and "counted rather than sampled" was wrong twice
+   before this number.** `FrameError::InternContended`'s
    variant doc and its `Display`; `LookupError::UnknownFrame`'s "transient";
    `find_core`'s `# Errors` and `ArenaView::find_frame`'s, both saying the
    claimant is *anonymous*; `Tree::lookup`'s `# Errors` ("— transient: retry"),
    which is the one a Rust caller actually reads; `intern_core`'s `# Errors`,
    which does not mention the variant at all; and **`tf_tree_py`'s
    `unresolvable_name` message**, which is the shipped Python text telling a
-   caller *"cannot identify … Retry"*. *An earlier version of this step listed
+   caller *"cannot identify … Retry"*. **Plus three found in round 4:**
+   `crates/tf_tree_c/include/tf_tree.h`'s `TFT_ERR_UNKNOWN_FRAME` — *"a name
+   another participant is interning right now (transient — retry)"*, the shipped
+   C ABI text, and the step's own first line already says "the C entry point";
+   `AwaitError::Frame`'s doc, whose rationale is that such an error "will not
+   change on its own"; and `Tree::frame`'s `# Errors`. The header is generated,
+   so `cargo xtask headers` regenerates it and `just c-header-check` gates it.
+
+   *An earlier version of this step listed
    four and cited `detached_err`'s rustdoc for the Python site — that one is
    `pub(crate)` and reaches no wheel user, so the fix would have landed on the
    invisible copy while the message that actually sends a control loop into an
    unbounded retry stayed put.*
 4. A `loom` model reaches the bound, with a control that fails when the bound is
-   unreachable.
+   unreachable — and, per question 2, a second control that fails when the
+   reader's `CLAIM_UNRECORDED` abandon path is unreachable, which is what a
+   shrunk N below `READER_UNRECORDED_ROUNDS` would cause.
+
+5. **`Tree::await_frames` retries `InternContended` within its own timeout**
+   rather than returning it terminally, and `AwaitError::Frame`'s doc stops
+   saying the error "will not change on its own". Without this the bound turns a
+   five-second await into a three-millisecond refusal.
+   - **Verified by** a test that stages a contended name and asserts
+     `await_frames` keeps waiting to *its* deadline, and by the existing await
+     tests passing unchanged.
 
 ## Open questions
 
@@ -403,9 +450,12 @@ each answer says where the evidence is.
    **Which constraint that pressures is the opposite of what an earlier version
    of this paragraph said.** A shorter round makes N × `INTERN_SPIN_LIMIT` a
    *smaller* duration, so the **ceiling gains** headroom on aarch64 — it is the
-   **floor's purpose** that erodes: "unreachable in health by orders of
+   **health margin** that erodes: "unreachable in health by orders of
    magnitude" goes from roughly three orders to two as a round falls from ~0.4 ms
-   to ~0.05 ms. *The earlier text said the ceiling lost headroom on arm, which
+   to ~0.05 ms. **The structural floor is untouched** — `READER_UNRECORDED_ROUNDS`
+   and N both count *rounds*, not time, so no clock speed moves it, and calling
+   the health margin "the floor's purpose" re-merged the two things this answer
+   separates. *The earlier text said the ceiling lost headroom on arm, which
    would tell an implementer to lower N there — backwards for the constraint
    actually under pressure, and toward the floor this same answer says must not
    be crossed.*
@@ -427,8 +477,13 @@ each answer says where the evidence is.
    | `topology.rs`'s A2 acquire | the lock word, bounded |
    | **`frame::wait_for_publish`** | **a peer that may not be running at all** |
 
-   Four of the five wait on a store a *running* peer is about to make, and
-   yielding in those trades a sub-microsecond wait for a scheduler round trip.
+   Four of the five are **bounded and return rather than waiting on a peer's
+   scheduling** — three wait on a store a running peer is about to make, and
+   A2's acquire spins `TOPO_LOCK_SPIN_LIMIT` and then decides, as the Context
+   above is at pains to say. Yielding in any of them trades a sub-microsecond
+   wait for a scheduler round trip. *An earlier version said all four wait on a
+   store a running peer is about to make, which is the claim the Context
+   paragraph exists to refute about A2.*
    `buffer::read_slot` is the hot read path, so that is not a theoretical cost.
    Exactly one waits on a peer whose scheduling is the thing in question.
 
