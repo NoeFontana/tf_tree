@@ -106,6 +106,23 @@ assert!((pose.t.x - 0.5).abs() < 1e-12);
 **Stamps are integer nanoseconds**, and **nothing returns a view
 into shared memory** (`Plan.at_into` supplies the destination).
 
+## Measured against `tf2`
+
+In-process, single thread, same `LerpSlerp` policy, ROS 2 Lyrical container on a
+4-core AMD EPYC-Milan (not core-pinned hardware); tf2 called natively in C++.
+Both engines agree to 6.7e-15 on 50,000 recorded-stream queries.
+
+| Workload | `tf_tree` | `tf2` | Ratio |
+|---|---|---|---|
+| Lookup, recorded stream, depth 3 | 94 ns | 253 ns | **2.7×** |
+| Lookup, 375 frames, depth 15 | 1193 ns | 7337 ns | **6.2×** |
+| Publish | 9.4 ns | 114 ns | **12.1×** |
+
+The headline drops to **1.8×** for a consumer build without LTO, and to 1.5× when
+called through the C ABI. Publish and plan reuse do not allocate. Method, biases
+and the re-run commands: [`docs/benchmarks/tf2.md`](./docs/benchmarks/tf2.md);
+every number's artifact: [`EVIDENCE.md`](./docs/benchmarks/EVIDENCE.md).
+
 ## When to use it, and when not
 
 Use it for lookups in a deadline loop, many readers on one host, dataloader
