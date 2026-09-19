@@ -14,13 +14,16 @@
 //! ```
 //! use tf_tree::{TreeBuilder, InterpPolicy, Stamp, Iso3};
 //!
-//! // `build()` sizes the arena from exactly these edges.
+//! // Topology is declared on the builder; `build()` sizes the arena from exactly
+//! // these edges (static edges reserve no ring slots).
 //! let tree = TreeBuilder::new()
 //!     .static_edge("map", "odom", &Iso3::IDENTITY)
 //!     .build()
 //!     .expect("layout");
 //!
-//! // The typed binding pins the default `SystemDomain`.
+//! // map -> odom is a static identity, so the lookup is identity at any time.
+//! // A typed binding pins the default `SystemDomain` (method-call inference does
+//! // not apply a type parameter's default, so annotate the stamp once).
 //! let now: Stamp = Stamp::from_nanos(0);
 //! let t = tree.lookup("map", "odom", now).unwrap();
 //! assert_eq!(t, Iso3::IDENTITY);

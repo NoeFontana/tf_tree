@@ -123,12 +123,16 @@ impl<D: Domain> Stamp<D> {
     /// let t = Stamp::<SystemDomain>::from_parts(1, 500_000_000).unwrap();
     /// assert_eq!(t.nanos(), 1_500_000_000);
     ///
-    /// // Pre-epoch: negative seconds, positive nanosecond remainder.
+    /// // Pre-epoch stamps are exact too — the seconds go negative, the
+    /// // nanoseconds stay a positive remainder, exactly as `timespec` says.
     /// let before = Stamp::<SystemDomain>::from_parts(-1, 250_000_000).unwrap();
     /// assert_eq!(before.nanos(), -750_000_000);
     ///
-    /// // A nanosecond field past a second is refused, as is `i64` overflow.
+    /// // A nanosecond field that is not a sub-second remainder is refused
+    /// // rather than carried into the seconds.
     /// assert!(Stamp::<SystemDomain>::from_parts(1, 1_000_000_000).is_none());
+    ///
+    /// // ... and so is anything `i64` nanoseconds cannot hold.
     /// assert!(Stamp::<SystemDomain>::from_parts(i64::MAX, 0).is_none());
     /// ```
     #[inline]
@@ -154,6 +158,7 @@ impl<D: Domain> Stamp<D> {
     /// ```
     /// use tf_tree_core::{SensorDomain, Stamp};
     ///
+    /// // `clock_gettime(CLOCK_REALTIME, &ts)` gives exactly this pair.
     /// let t = Stamp::<SensorDomain>::from_timespec(1_700_000_000, 123_456_789).unwrap();
     /// assert_eq!(t.nanos(), 1_700_000_000_123_456_789);
     ///

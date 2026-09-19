@@ -60,7 +60,7 @@ impl EdgeId {
 /// }
 ///
 /// let e = newest_pose(true).unwrap_err();
-/// // Identifiers, not names.
+/// // Identifiers, not names: this type has no arena to resolve against.
 /// assert!(e.to_string().contains('3'));
 /// ```
 ///

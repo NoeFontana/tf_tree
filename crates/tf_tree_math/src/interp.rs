@@ -151,7 +151,8 @@ impl Iso3 {
 /// let qb = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_2));
 /// let mid = slerp(qa, qb, 0.5);
 ///
-/// // Half of a 90° yaw is a 45° yaw.
+/// // Half of a 90° yaw is a 45° yaw, and the result is unit without a
+/// // normalization step.
 /// let quarter = exp_so3(Vec3::new(0.0, 0.0, core::f64::consts::FRAC_PI_4));
 /// assert!(mid.sub(quarter).norm() < 1e-15);
 /// assert!((mid.norm() - 1.0).abs() < 1e-15);
