@@ -1266,6 +1266,94 @@ RELEASE_VISIBLE = (
 NO_CHANGELOG = "[no changelog]"
 
 
+def check_line_citations() -> str:
+    """`path.rs:LINE` citations in Markdown may not increase, per file.
+
+    **A line number into a churning file is a citation the next edit to that
+    file silently breaks**, and nothing noticed until it was measured
+    (2026-09-19): four citations into `crates/tf_tree/src/{open,tree}.rs`
+    already pointed at a blank or bare-`///` line on `main`, and a seven-line
+    rustdoc edit in a single PR moved twenty-two more. Twenty-three of the sites
+    are in `implemented` records, which this project freezes — their corrections
+    belong in `decisions/README.md`'s errata, and twenty-three line-number
+    errata would bury that file's real ones.
+
+    So this is a **ratchet, not a ban**: the 157 that exist are grandfathered per
+    file in `scripts/line-citation-budget.txt` and the count may only fall. Cite
+    a symbol instead; a symbol survives every edit that does not rename it.
+
+    **Per file rather than in total**, because a total is not a ratchet: one
+    document could shed five citations while another gained five and the sum
+    would not move. That is the same defect `0055` step 6 found in a
+    max-over-a-set bound.
+
+    **Fenced blocks are excluded and code spans are not.** A `path:line` inside
+    a ``` fence is compiler output or a shell transcript; the citations this
+    gate is about are written inside single-backtick spans, and blanking those
+    took the scan from 157 hits to 0 — which is how the first version of this
+    check would have passed vacuously.
+    """
+    budget_path = "scripts/line-citation-budget.txt"
+    budget: dict[str, int] = {}
+    for raw in Path(budget_path).read_text().splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        count, name = raw.split("\t", 1)
+        budget[name] = int(count)
+
+    pattern = re.compile(
+        r"\b(?:crates|xtask|scripts|ros)/[A-Za-z0-9_./-]+\.(?:rs|py):\d+"
+    )
+    files = tracked("*.md")
+    found: dict[str, int] = {}
+    total = 0
+    for rel in files:
+        text = Path(rel).read_text(errors="replace")
+        prose = re.sub(r"```.*?```", "", text, flags=re.S)
+        hits = len(pattern.findall(prose))
+        if hits:
+            found[rel] = hits
+            total += hits
+
+    for rel, hits in sorted(found.items()):
+        allowed = budget.get(rel, 0)
+        if hits > allowed:
+            fail(
+                f"{rel} carries {hits} `path.rs:LINE` citation(s), over its "
+                f"budget of {allowed} in {budget_path}. A line number breaks on "
+                f"the next edit to the file it names — cite a symbol instead. "
+                f"The budget may only fall; raising it needs a reason this "
+                f"message cannot give you."
+            )
+
+    dropped = sorted(
+        (rel, budget[rel], found.get(rel, 0))
+        for rel in budget
+        if found.get(rel, 0) < budget[rel]
+    )
+
+    # An empty scan is not a pass: the pattern silently matching nothing would
+    # print the same "within budget" as a clean tree.
+    if total < 100:
+        fail(
+            f"the line-citation scan found only {total} citations where the "
+            f"budget records {sum(budget.values())}; the pattern has stopped "
+            f"matching and this gate is asserting nothing"
+        )
+
+    note = ""
+    if dropped:
+        shed = sum(was - now for _, was, now in dropped)
+        note = (
+            f"; {shed} shed in {len(dropped)} file(s) — lower them in "
+            f"{budget_path} in the same commit"
+        )
+    return (
+        f"{total} `path.rs:LINE` citations in {len(found)} documents, "
+        f"all within their per-file budget{note}"
+    )
+
+
 def check_changelog_freshness() -> str:
     """`CHANGELOG.md` must not sit behind a release-visible commit.
 
@@ -1382,6 +1470,7 @@ def main() -> int:
         check_distribution_name(),
         check_decision_status_citations(),
         check_changelog_freshness(),
+        check_line_citations(),
     ]
 
     if failures:

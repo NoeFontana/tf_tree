@@ -1,0 +1,45 @@
+# Per-file budget for `path.rs:LINE` citations in tracked Markdown.
+#
+# A line number into a churning file is a citation the next edit to that file
+# silently breaks. Measured 2026-09-19: four citations into
+# `crates/tf_tree/src/{open,tree}.rs` already pointed at a blank or bare-`///`
+# line on `main`, and a seven-line rustdoc edit in one PR moved twenty-two more.
+# Twenty-three of those sites sit in `implemented` records, which this project
+# freezes, so they cannot be repaired in place.
+#
+# The existing ones are grandfathered and the count may only fall. Cite a
+# **symbol** instead — `reclamation_verdict` in `crates/tf_tree/src/open.rs` —
+# which survives every edit that does not rename it.
+#
+# Fenced blocks are excluded (a `path:line` there is compiler output); code
+# spans are not, because that is where these citations are written.
+#
+# `just lint` refuses any increase. A decrease is reported; lower the number
+# here in the same commit.
+2	CHANGELOG.md
+19	docs/PHASE2.md
+4	docs/PHASE3.md
+5	docs/PHASE4.md
+2	docs/PROJECT.md
+1	docs/RUNBOOK.md
+2	docs/benchmarks/tf2.md
+1	docs/decisions/0005-the-shared-memory-seam.md
+4	docs/decisions/0013-the-benchmark-gate-never-interpolated.md
+3	docs/decisions/0015-the-bridge-fills-a-shared-arena.md
+5	docs/decisions/0016-portable-simd-and-the-dependency-budget.md
+7	docs/decisions/0019-one-binary-and-topology-you-can-wait-for.md
+4	docs/decisions/0020-the-consumer-side-of-the-arena-refusal.md
+1	docs/decisions/0022-the-per-call-guard-and-the-unwatched-gate.md
+1	docs/decisions/0026-the-corpus-shape-of-a-frozen-index.md
+2	docs/decisions/0027-the-48-byte-frame-name-store.md
+27	docs/decisions/0028-the-slot-a-killed-participant-keeps.md
+1	docs/decisions/0030-the-atfork-handler-and-inherited-descriptors.md
+1	docs/decisions/0031-the-participant-record-with-no-byte.md
+14	docs/decisions/0033-the-identity-record-cannot-name-a-namespace.md
+24	docs/decisions/0034-the-depth-bound-priced-two-slots-the-same.md
+1	docs/decisions/0039-extrapolation-you-cannot-fail-to-notice.md
+12	docs/decisions/0055-the-recovery-capacity-a-fleet-cannot-add-later.md
+7	docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md
+5	docs/decisions/0059-the-arena-errors-that-cannot-describe-themselves.md
+1	docs/decisions/README.md
+1	testdata/frozen/README.md

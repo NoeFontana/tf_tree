@@ -211,6 +211,11 @@ cannot see it — **`just ros-build` and `just ros-test` are its entire gate**;
   timeout (D17). Every mutation protocol walks the crash matrix (D15).
 - Do not add a **second spelling** of an existing path (a `coverage` beside
   `span`, a `resample` beside `at(arange(...))`). Document the one that exists.
+- **Cite a symbol, never a line number.** `path.rs:123` in a Markdown file
+  breaks on the next edit to that file — measured: four such citations were
+  already stale on `main`, and one seven-line rustdoc edit moved twenty-two
+  more. `just lint` ratchets the 157 that exist down per file
+  (`scripts/line-citation-budget.txt`); a new one fails.
 - No blocking wait, futex, or notification primitive **in the arena**
   ([`0018`](./docs/decisions/0018-blocking-waits-belong-in-the-shim.md)).
 - **Cut, not deferred** ([`0009`](./docs/decisions/0009-descoping-phase-6.md)):
