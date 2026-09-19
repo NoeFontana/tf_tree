@@ -2328,15 +2328,29 @@ pub fn slot_leak(p: &ParticipantInfo) -> Option<SlotLeak> {
 /// same defect one level down: an absence asserted from a question that may not
 /// have been answered.
 ///
-/// **And the pid in the finding is still real.** It is the arena record's,
-/// which `tft014` falls back to, so the remedy this check prints — *check the
-/// pid is gone before you reap* — has something to check. The clause says where
-/// that number comes from, because a reader who has just been told no process
-/// was named would otherwise read the pid beside it as contradicting it.
+/// **And the pid in the finding is usually real**, so the clause says where it
+/// comes from: it is the arena record's, which `tft014` falls back to, and the
+/// remedy this check prints — *check the pid is gone before you reap* — needs
+/// something to check. A reader told no process was named would otherwise read
+/// the pid beside it as contradicting that.
+///
+/// **Usually, because a `RESERVED` record's pid is still zero.** `slot_leak`
+/// sends every non-`FREE` state through the byte table, and a registration
+/// caught in the creator's µs-wide window — byte taken, identity record not yet
+/// written — reaches this same row with `pid: 0`. Telling an operator the
+/// printed number is the record's own, and then to go and check it, would be
+/// `slot_subject`'s *"slot 8 pid 0 … /proc has no running process for it"*
+/// defect arriving by a new route. That shape gets its own clause, which says
+/// there is nothing to check.
 fn abandoned_evidence(p: &ParticipantInfo) -> &'static str {
     match (p.byte, p.recorded) {
         (LockByte::Free, RecordedProcess::Gone) => {
             "the lock byte is free, and /proc has no running process for it"
+        }
+        (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() && p.pid == 0 => {
+            "the lock byte is free, this run got no identity record out of the lock file for \
+             this slot — none written, or none readable — and the arena record carries no pid \
+             either, so there is no process here to ask /proc about and none to check"
         }
         (LockByte::Free, RecordedProcess::Unknown) if p.recorded_pid.is_none() => {
             "the lock byte is free, and this run got no identity record out of the lock file \
@@ -5340,6 +5354,50 @@ mod tests {
         assert!(
             !m.contains("no lock file was read on this run"),
             "that clause belongs to the `LockByte::Unknown` row, which this shape does not take: reaching it would mean the retracted sentence was right: {m}"
+        );
+    }
+
+    /// **A record caught mid-registration names no pid, and the finding must
+    /// not send an operator to check one.**
+    ///
+    /// The sibling above added a clause saying the printed pid is the arena
+    /// record's own, because `tft014`'s remedy is *check the pid is gone before
+    /// you reap*. [`slot_leak`] routes every non-`FREE` state through the byte
+    /// table, so the creator's µs-wide window — byte taken, identity record not
+    /// yet written — reaches the same row with `pid: 0` and no `recorded_pid`.
+    /// Without its own clause the finding would read *"the pid below is the
+    /// arena record's own — pid 0 … CHECK THE PID IS GONE"*, which is
+    /// `slot_subject`'s documented *"slot 8 pid 0"* defect arriving by a new
+    /// route.
+    ///
+    /// **Mutant, run:** delete the `p.pid == 0` arm so this falls through to
+    /// the sibling's. Applied: the first assertion fails, printing *"the pid
+    /// below is the arena record's own — pid 0 left slot 1 registered"*. The
+    /// two clauses are therefore not interchangeable wording.
+    #[test]
+    fn a_record_with_no_pid_at_all_is_not_something_to_go_and_check() {
+        let obs = Observations::new();
+        let mut snap = two_frame_snapshot(edge(1, 1, 2, 100));
+        snap.participants.push(ParticipantInfo {
+            slot: 1,
+            state: SlotState::Reserved,
+            pid: 0,
+            alive: false,
+            byte: LockByte::Free,
+            recorded: RecordedProcess::Unknown,
+            recorded_pid: None,
+        });
+
+        let o = tft014(&inputs(&snap, &obs, &[], Clock::Wall(0)));
+        assert_eq!(o.status, Status::Fired, "{o:?}");
+        let m = &o.findings[0].message;
+        assert!(
+            m.contains("no process here to ask /proc about and none to check"),
+            "a record with no pid must say so, not point at the zero it printed: {m}"
+        );
+        assert!(
+            !m.contains("the pid below is the arena record's own"),
+            "there is no pid below — that clause is the sibling's: {m}"
         );
     }
 

@@ -118,9 +118,20 @@ PROJECT_VERSION_RE = re.compile(
 
 failures: list[str] = []
 
+# **Measurements, as opposed to verdicts.** A `check_*` returns a sentence that
+# *asserts* its rule, so that sentence must be withheld when the check failed —
+# otherwise the tool prints an all-clear above its own failure block. A number
+# that asserts nothing has the opposite need: the citation census is wanted most
+# by whoever is reading a ratchet failure. These print on every run.
+notes: list[str] = []
+
 
 def fail(message: str) -> None:
     failures.append(message)
+
+
+def note(message: str) -> None:
+    notes.append(message)
 
 
 # One spelling of the `subprocess.run` boilerplate that was written out five
@@ -1295,17 +1306,29 @@ def strip_fenced_blocks(text: str) -> tuple[str, bool]:
     citations, which it has not: they are merely unreadable.
     """
     out: list[str] = []
-    fenced = False
+    opened = 0
     for line in text.split("\n"):
-        bare = line.lstrip()
-        while bare.startswith(">"):
-            bare = bare[1:].lstrip()
-        if bare.startswith("```"):
-            fenced = not fenced
-            out.append("")
-            continue
-        out.append("" if fenced else line)
-    return "\n".join(out), fenced
+        stripped = line.lstrip()
+        while stripped.startswith(">"):
+            stripped = stripped[1:].lstrip()
+        run = len(stripped) - len(stripped.lstrip("`"))
+        if run >= 3:
+            # CommonMark: a fence closes only on a run at least as long as the
+            # one that opened it, so a ``` line *inside* a ```` block is
+            # content. Toggling on any run of three inverts the pairing there,
+            # with the marker count still even — the same silent false pass as
+            # the regex, one nesting level down. Latent today; no tracked file
+            # opens a four-backtick fence.
+            if opened == 0:
+                opened = run
+                out.append("")
+                continue
+            if run >= opened:
+                opened = 0
+                out.append("")
+                continue
+        out.append("" if opened else line)
+    return "\n".join(out), opened != 0
 
 
 def check_line_citations() -> str:
@@ -1476,11 +1499,15 @@ def check_line_citations() -> str:
             "the wider census pattern no longer matches a bare citation; the "
             "figure it prints is asserting nothing"
         )
+    note(
+        f"citation census: {total} `path.rs:LINE` in {len(found)} documents with "
+        f"a directory prefix, {wider} with the prefix made optional — the gate "
+        f"holds the first number, so its rows are a floor on the rot and not a "
+        f"census of it"
+    )
     return (
         f"{total} `path.rs:LINE` citations in {len(found)} documents, "
-        f"each matching its row in {budget_path} "
-        f"({wider} with the directory prefix made optional — the gate's rows "
-        f"are a floor on the rot, not a census)"
+        f"each matching its row in {budget_path}"
     )
 
 
@@ -1589,19 +1616,33 @@ def check_changelog_freshness() -> str:
 
 def main() -> int:
     authority = load_toml("Cargo.toml")["workspace"]["package"]["version"]
-    lines = [
-        check_versions(),
-        check_publishable(authority),
-        check_changelog(authority),
-        check_recipe_references(),
-        check_markdown_tables(),
-        check_relative_links(),
-        check_front_page_versions(),
-        check_distribution_name(),
-        check_decision_status_citations(),
-        check_changelog_freshness(),
-        check_line_citations(),
-    ]
+
+    # **A check's summary sentence is unconditional, so it must not be printed
+    # for a check that failed.** Every `check_*` ends by *asserting* its rule —
+    # "all read 0.0.5", "each matching its row" — and `fail()` only appends
+    # elsewhere, so printing the summaries on a failing run (added 2026-09-19 so
+    # a ratchet failure would still carry the census) made the tool emit an
+    # all-clear about the very rule in the failure block beneath it. The
+    # snapshot of `failures` around each call is what tells them apart, and it
+    # is the whole mechanism: a check that added a message loses its sentence.
+    lines: list[str] = []
+    for call in (
+        check_versions,
+        lambda: check_publishable(authority),
+        lambda: check_changelog(authority),
+        check_recipe_references,
+        check_markdown_tables,
+        check_relative_links,
+        check_front_page_versions,
+        check_distribution_name,
+        check_decision_status_citations,
+        check_changelog_freshness,
+        check_line_citations,
+    ):
+        before = len(failures)
+        summary = call()
+        if len(failures) == before:
+            lines.append(summary)
 
     if failures:
         # **The summaries go out on a failing run too.** Every check that got
@@ -1610,8 +1651,13 @@ def main() -> int:
         # reading a ratchet failure is the person who needs both totals. They
         # went to stdout only on success until 2026-09-19, and three documents
         # had been changed to defer to output that a red run suppressed.
-        for line in lines:
+        for line in [*lines, *notes]:
             print(f"artifact-versions: {line}")
+        # stdout is block-buffered under a pipe — `just lint`, CI — so without
+        # this the failure block on stderr arrives first and the summaries land
+        # after it. The claim "printed before the failure block" held on a tty
+        # and nowhere else.
+        sys.stdout.flush()
         print(
             "artifact-versions: the repository disagrees with itself.\n",
             file=sys.stderr,
@@ -1626,7 +1672,7 @@ def main() -> int:
         )
         return 1
 
-    for line in lines:
+    for line in [*lines, *notes]:
         print(f"artifact-versions: {line}")
     return 0
 

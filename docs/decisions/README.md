@@ -25,10 +25,17 @@ copied into each.** On 2026-09-19 a twenty-four-line rustdoc was added to
 `crates/tf_tree/src/tree.rs:NNN` citation with `NNN` past that point moved by
 twenty-four lines**, in both spellings — the bare `tree.rs:NNN` too, which the
 `scripts/line-citation-budget.txt` gate does not see at all. Measured rather
-than listed from memory: the displaced sites are in `0005`, `0028`, `0034`,
-`0055` and `0059`, all `implemented` and therefore not repaired, because a
-line-number erratum per site would bury this file's real ones. **`0028` alone
-holds most of them.**
+than listed from memory: **in tracked Markdown**, the displaced sites are in
+`0005`, `0028`, `0034`, `0055` and `0059`, all `implemented` and therefore not
+repaired, because a line-number erratum per site would bury this file's real
+ones. **`0028` alone holds most of them.**
+
+*"In tracked Markdown" is a scope this sentence needed and did not have for two
+rounds.* The same citations are written in Rust doc comments, which neither the
+gate nor the census that produced this list ever looked at —
+`crates/tf_tree_bench`'s `backing.rs` and `attach_bench.rs` carried three, one
+of them the *same* `tree.rs:1984` that `docs/benchmarks/tf2.md` had de-numbered
+in this change while its twin in a `//!` block stayed. All three are repaired.
 
 Every site in a record that *may* be edited has been repaired instead, and the
 list of those took three attempts: `0019` and `0057` (`ready`), then `0027` and
