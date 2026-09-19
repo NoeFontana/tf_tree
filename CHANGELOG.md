@@ -57,6 +57,7 @@ defined by the status tables in `docs/`; they win over this file.
 
 ### Added
 
+- **README gains a "Measured against `tf2`" table**, every figure from `docs/benchmarks/tf2.md`.
 - **`just book`** builds the docs as an mdBook (`docs/SUMMARY.md`), sorted into start/operating/reference/explanation/decisions; no file moved.
 - **`StaticStore::conflicts_by_edge()`**; loom model `head_publishes_every_stamp_below_it`.
 - **Gates:** `just gate2`, `gate5`, `gate4` exit non-zero on FAIL (`scripts/gate-run.sh`:

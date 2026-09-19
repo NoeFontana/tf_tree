@@ -6,78 +6,41 @@
 [![CI](https://github.com/NoeFontana/tf_tree/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NoeFontana/tf_tree/actions/workflows/ci.yml)
 [![Licence](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue.svg)](#licence)
 
-A transform tree engine. It stores time-stamped rigid-body transforms between
-named coordinate frames and answers *"where was frame A relative to frame B at
-time t?"* — from a control loop, from many processes at once, or from a
-dataloader with no robot attached.
+A transform tree: it stores time-stamped poses between named frames and answers
+"where was frame A relative to frame B at time t?". Use it in a control loop,
+across processes on one host, or in a dataloader with no robot attached.
 
-**It is not `tf2`, not a fork of it, and not affiliated with ROS**
-([`0008`](./docs/decisions/0008-the-name-tf-tree.md)); no drop-in
-`tf2_ros::Buffer` shim exists, only a one-way `/tf` ingest bridge
-(`docs/PHASE4.md` §5).
+It is faster than ROS `tf2` (below) but is not `tf2`: no ROS dependency and no
+drop-in `tf2_ros::Buffer`, only a one-way `/tf` ingest bridge
+([`0008`](./docs/decisions/0008-the-name-tf-tree.md)). Linux first: shared memory
+and frozen `.tft` files are Linux-only (`shm` feature); the in-process engine is
+portable.
 
-**Linux-first.** The single-process engine is portable Rust; attaching to a live
-arena, the frozen `.tft` backend and `tf_tree freeze` are Linux-only, behind the
-default-off `shm` feature.
+**`0.0.x` promises nothing between releases.** Pin exactly ([`CHANGELOG.md`](./CHANGELOG.md)).
 
 ## Install
 
-| What | How | From |
-|---|---|---|
-| Rust engine | `cargo add tf_tree` | crates.io |
-| Python bindings | `pip install transform_tree`, then `import tf_tree` (PyPI refused `tf_tree`; [`0008`](./docs/decisions/0008-the-name-tf-tree.md)) | PyPI |
-| `tf_tree` CLI | a prebuilt Linux binary from [the latest release](https://github.com/NoeFontana/tf_tree/releases/latest) (`{x86_64, aarch64}` × `{gnu, musl}`, glibc 2.34+ for gnu, all with `--features shm`) | GitHub Releases |
-| CLI from source | `cargo install --path crates/tf_tree_cli --features shm` (the CLI is `publish = false`) | a clone |
-| C ABI, C++ header, ROS 2 bridge | `just c-abi-check`, `just cpp-check`, `just ros-build` | a clone |
+- Rust: `cargo add tf_tree`
+- Python: `pip install transform_tree`, then `import tf_tree`
+- CLI (`tf_tree`, alias `tft`): a binary from the [latest release](https://github.com/NoeFontana/tf_tree/releases/latest), or `cargo install --path crates/tf_tree_cli --features shm`
+- C ABI, C++ header, ROS 2 bridge: `just c-abi-check`, `just cpp-check`, `just ros-build`
 
-**`0.0.x` promises nothing between releases**: pin exactly, crate and wheel
-([`CHANGELOG.md`](./CHANGELOG.md)).
+## Quickstart
 
-## Start from a recording you already have
-
-```sh
-# unpack tf_tree-<tag>-x86_64-unknown-linux-musl.tar.gz from the latest release
-tft=./tf_tree-<tag>-x86_64-unknown-linux-musl/tf_tree
-$tft doctor --from-bag drive.mcap                # what is wrong with this /tf traffic
-$tft freeze --from-bag drive.mcap -o drive.tft   # keep the answer
-```
-
-From Python: `tf_tree.ingest_bag("drive.mcap").freeze("drive.tft")`. A `.tft` is a
-**frozen transform index**: opening one is an `mmap`, shared by dataloader workers:
-
-```python
-import numpy as np, tf_tree
-
-# Open per worker, after the fork/spawn — docs/PHASE5.md §4.3 says why.
-tree   = tf_tree.open_file("drive.tft")
-plan   = tree.plan("base_link", "lidar_top")           # compile the route once
-stamps = np.asarray(batch_stamps_ns, dtype=np.int64)   # integer nanoseconds
-poses  = plan.at(stamps, layout="quat_twist")          # (N, 13) float64
-```
-
-Ingestion is **MCAP only**; convert a `.db3` bag with `ros2 bag convert`.
-
-## Start with no data at all
-
-```sh
-just quickstart        # uv-managed interpreter + venv, extension installed
-.venv/bin/python
-```
+Python, from scratch (`just quickstart` runs this). Stamps are integer nanoseconds; a pose is `[qw, qx, qy, qz, x, y, z]`.
 
 ```python
 import tf_tree
 
 tree = tf_tree.build([("map", "base"), ("base", "cam")])
-# stamp in integer nanoseconds; pose is [qw, qx, qy, qz, x, y, z]
-tf_tree.push(tree, "base", "map", 1_000, [1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0])
-tf_tree.push(tree, "base", "map", 2_000, [1.0, 0.0, 0.0, 0.0, 3.0, 4.0, 5.0])
+tf_tree.push(tree, "base", "map", 1_000, [1, 0, 0, 0, 1.0, 2.0, 3.0])
+tf_tree.push(tree, "base", "map", 2_000, [1, 0, 0, 0, 3.0, 4.0, 5.0])
 
-print(tree.plan("map", "base").at(1_500)[:3, 3])   # -> [2. 3. 4.]
+plan = tree.plan("map", "base")   # compile the route once, reuse it
+print(plan.at(1_500)[:3, 3])      # -> [2. 3. 4.]
 ```
 
-The query lands halfway between two samples. Keep the `plan()` and evaluate it
-many times. The same shape in Rust
-([`crates/tf_tree/README.md`](./crates/tf_tree/README.md) has the annotated version):
+Rust:
 
 ```rust
 use tf_tree::{Capacity, EdgeCfg, Iso3, Quat, Stamp, TreeBuilder, Vec3};
@@ -103,68 +66,81 @@ let pose = plan.at(&g, t).expect("in range");
 assert!((pose.t.x - 0.5).abs() < 1e-12);
 ```
 
-**Stamps are integer nanoseconds**, and **nothing returns a view
-into shared memory** (`Plan.at_into` supplies the destination).
+## From a recorded bag
 
-## When to use it, and when not
+MCAP only (for `.db3`, run `ros2 bag convert` first):
 
-Use it for lookups in a deadline loop, many readers on one host, dataloader
-transforms without a ROS node, kilohertz-class edges, or debugging a tree
-(`tf_tree doctor`, `tf_tree top`, `TFT001`–`TFT019`). **Look elsewhere when:**
+```sh
+tft doctor --from-bag drive.mcap                 # what is wrong with this /tf traffic
+tft freeze --from-bag drive.mcap -o drive.tft    # index it
+```
+```python
+tree = tf_tree.open_file("drive.tft")   # an mmap; open per worker, after fork/spawn
+poses = tree.plan("base_link", "lidar_top").at(stamps_ns, layout="quat_twist")  # (N, 13)
+```
 
-| You need | Why not this | Written down |
+## Against `tf2`
+
+In-process, one thread, same interpolation, `tf2` called natively; 4-core EPYC-Milan,
+not core-pinned. Both agree to 7e-15 on 50,000 recorded queries.
+
+| | `tf_tree` | `tf2` | |
+|---|---|---|---|
+| Lookup, depth 3 | 94 ns | 253 ns | 2.7× |
+| Lookup, depth 15 | 1193 ns | 7337 ns | 6.2× |
+| Publish | 9.4 ns | 114 ns | 12.1× |
+
+Without LTO the lookup gap is 1.8×; through the C ABI, 1.5×. Method:
+[`tf2.md`](./docs/benchmarks/tf2.md); sources: [`EVIDENCE.md`](./docs/benchmarks/EVIDENCE.md).
+
+## Not for
+
+| Need | Why | See |
 |---|---|---|
-| A drop-in `tf2_ros::Buffer` | Phase 7, gated, not scheduled; only a one-way ingest bridge exists | [`PHASE7.md`](./docs/PHASE7.md) §0.0 |
-| Covariance; multi-parent frames, loop closure, copy-on-write branches | Cut | [`0009`](./docs/decisions/0009-descoping-phase-6.md), [`PROJECT.md`](./docs/PROJECT.md) §5 D2 |
-| Transforms across hosts | Phase 8. Not started | [`PROJECT.md`](./docs/PROJECT.md) §4 |
-| Shared memory or `.tft` off Linux | The mapping code does not exist elsewhere | [`SUPPORT.md`](./SUPPORT.md) |
-| A viewer, or point-cloud deskewing | Deliberately absent | [`PHASE5.md`](./docs/PHASE5.md) §8, [`PROJECT.md`](./docs/PROJECT.md) §5 D8 |
+| Drop-in `tf2_ros::Buffer` | gated, not scheduled | [`PHASE7.md`](./docs/PHASE7.md) |
+| Covariance, multi-parent frames, loop closure | cut | [`0009`](./docs/decisions/0009-descoping-phase-6.md) |
+| Transforms across hosts | not started | [`PROJECT.md`](./docs/PROJECT.md) §4 |
+| Shared memory or `.tft` off Linux | not implemented | [`SUPPORT.md`](./SUPPORT.md) |
+| A viewer, point-cloud deskewing | deliberately absent | [`PHASE5.md`](./docs/PHASE5.md) §8 |
 
 ## Status
 
-| Phase | What it is | Status |
+| Phase | | Status |
 |---|---|---|
-| 1 | Single-process engine: arena, seqlock buffers, plans, SE(3) math | **Implemented** |
-| 2 | Shared memory: rendezvous, fd passing, claims as leases, reaping | **Implemented**, with gaps |
-| 3 | Python bindings (PyO3, zero intermediate allocation) | **Implemented** |
-| 4 | C ABI, C++ wrapper, ROS 2 ingest bridge, derivatives | **Implemented**, with gaps |
-| 5 | Frozen `.tft` arena, bag ingestion, diagnostics, `tf_tree top` | **Mostly implemented** |
-| 6–8 | Continuous-time interpolation, `tf2` shim, multi-host replication | Not started |
+| 1 | Engine: arena, seqlock buffers, plans, SE(3) math | Implemented |
+| 2 | Shared memory across processes | Implemented, with gaps |
+| 3 | Python bindings | Implemented |
+| 4 | C ABI, C++ wrapper, ROS 2 ingest, derivatives | Implemented, with gaps |
+| 5 | Frozen `.tft`, bag ingestion, diagnostics, `tf_tree top` | Mostly implemented |
+| 6–8 | Continuous time, `tf2` shim, multi-host | Not started |
 
-**The per-phase `§0.0` tables are the source of truth**, not this one —
-[`PHASE2`](./docs/PHASE2.md#00-implementation-status),
-[`PHASE4`](./docs/PHASE4.md#00-implementation-status),
-[`PHASE5`](./docs/PHASE5.md#00-implementation-status).
+The `§0.0` tables in [`PHASE2`](./docs/PHASE2.md#00-implementation-status),
+[`PHASE4`](./docs/PHASE4.md#00-implementation-status) and
+[`PHASE5`](./docs/PHASE5.md#00-implementation-status) win over this one.
 
 ## Shared memory is not a sandbox
 
-Processes sharing an arena are **mutually trusting, same-user, cooperating
-processes**: a read-write participant can corrupt any part of the arena
-([`PHASE2.md`](./docs/PHASE2.md) §3.10); [`SECURITY.md`](./SECURITY.md) draws the
-line against a vulnerability. A **read-only participant cannot corrupt anything**
-(the consumer default, D18), and a crashed or hung participant cannot corrupt the
-arena or wedge anyone else.
+Processes sharing an arena trust each other: a read-write participant can corrupt
+it ([`PHASE2.md`](./docs/PHASE2.md) §3.10; [`SECURITY.md`](./SECURITY.md)). A
+read-only participant (the default for readers) cannot, and a crashed or hung one
+cannot wedge the others.
 
-**`fork()` is the sharp edge.** The arena is mapped `MADV_DONTFORK`, so a child's
-inherited handles report `ChildDetached`. Python's `multiprocessing` defaults to
-`fork` on Linux — open inside the worker, or use `spawn`. A frozen `.tft` is the
-exception: a child inherits it intact.
+`fork()` is the sharp edge: a child's inherited handles report `ChildDetached`.
+Python's `multiprocessing` forks by default on Linux, so open the arena inside the
+worker or use `spawn`. A frozen `.tft` survives a fork.
 
-## Workspace
+## Layout
 
-`crates/` holds `tf_tree_math`, `tf_tree_arena`, `tf_tree_core`, `tf_tree` (std
-facade), `tf_tree_ipc`, `tf_tree_c` (C ABI + C++ wrapper), `tf_tree_bridge`,
-`tf_tree_ingest`, `tf_tree_py`, `tf_tree_bench`, `tf_tree_tf2_sys` and
-`tf_tree_cli` (binary `tf_tree`, alias `tft`); `ros/` the ament_cmake packages.
-`tf_tree_py`, `tf_tree_tf2_sys` and `ros/` are outside the cargo workspace (own
-recipes: `just py-*`, `just tf2-check`, `just ros-build`). Five crates publish:
-`tf_tree`, `tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`.
+`crates/`: `tf_tree_math`, `tf_tree_arena`, `tf_tree_core`, `tf_tree` (facade),
+`tf_tree_ipc`, `tf_tree_c`, `tf_tree_bridge`, `tf_tree_ingest`, `tf_tree_py`,
+`tf_tree_bench`, `tf_tree_tf2_sys`, `tf_tree_cli`. `ros/` holds the ROS 2
+packages. `tf_tree_py`, `tf_tree_tf2_sys` and `ros/` sit outside the cargo
+workspace and have their own `just` recipes. Five crates publish: `tf_tree`,
+`tf_tree_core`, `tf_tree_math`, `tf_tree_arena`, `tf_tree_ipc`. MSRV **1.87**.
 
-## Contributing and support
-
+Docs: [`docs/README.md`](./docs/README.md) ·
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) · [`SUPPORT.md`](./SUPPORT.md) ·
-[`SECURITY.md`](./SECURITY.md) · [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) ·
-docs map: [`docs/README.md`](./docs/README.md). MSRV is **1.87**.
+[`SECURITY.md`](./SECURITY.md) · [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
 
 ## Licence
 
