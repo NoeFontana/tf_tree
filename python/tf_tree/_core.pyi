@@ -119,8 +119,9 @@ class EdgeAlreadyClaimedError(TfTreeError):
     edge, or be reaped, first. The attributes exist only on instances the
     library raises (see `docs/PHASE3.md` §4.4): `owner_slot` is the holder's
     participant **slot**, not a pid — `tf_tree participants` lists the held
-    slots and `tf_tree doctor` names the process behind one. `owner_slot` is `None` while the holder's claim is still being
-    taken, or was abandoned mid-claim, which records no slot yet.
+    slots and `tf_tree doctor` names the process behind one. `owner_slot` is
+    `None` while the holder's claim is still being taken, or was abandoned
+    mid-claim, which records no slot yet.
     """
 
     edge: tuple[str, str] | None

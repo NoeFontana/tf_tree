@@ -58,6 +58,22 @@ repaired before this landed.
 Out of scope and unchanged: the 28 `implemented` records, which are frozen;
 `CHANGELOG.md`'s released sections, which are a historical record;
 `crates/tf_tree/src/open.rs` and `tree.rs`, which many line citations point into.
+
+### Changed — one home per claim
+
+A claim stated in several places now has one authoritative statement and a
+citation from the rest. Seven finders swept the whole corpus by *claim*, not by
+file; 87 candidate clusters merged into 23, and 275 copies were replaced with a
+one-line citation to a symbol or section. 88 copies were kept on purpose: a
+copy carrying a qualifier or number its authority lacks, a copy a wheel or C
+user reads with no way to follow a citation, and anything in a frozen record.
+Authority text is untouched; nothing surviving was reworded.
+
+Not collapsed, because the copies disagree and a citation would pick a side:
+`abi_cost`'s R3 threshold (`PHASE4.md` §7 says reported, `0023` and `EVIDENCE.md`
+say gated), slerp's instruction counts (`API.md` §2.7 quotes them, row 16 says
+none is portable), and the push-sampler figures. Those need a decision.
+`tf_tree_unstable.h` was regenerated from the edited comments.
 `docs/decisions/0020` shed one citation and its budget row falls to match.
 
 ### Changed — a doc comment states the contract, not its own history
