@@ -455,6 +455,23 @@ detection limits are written where it is implemented (`tft014`,
 owner or by a `build_shared` participant is invisible to it, because neither has
 a socket hangup anybody sees.
 
+**Those two blind spots are not the same kind of thing, and what you do about
+them differs.** A dead **owner** is in contract: it happens to every fleet, and
+`tf_tree doctor` simply cannot see what it left — a surviving read-write peer's
+sweep is the collector. A byte-less `build_shared` participant only becomes
+*anybody else's* problem if the arena it created was published into a rendezvous
+by hand, and
+[`0031`](./decisions/0031-the-participant-record-with-no-byte.md) decided that
+composition **out of contract** on 2026-09-18. So a byte-less record in a served
+arena is a report about the *application*, not about this tool: something called
+`TreeBuilder::build_shared` and then bound an `OwnerServer` over the fd, where
+`tf_tree::Open` is the supported way to create and serve. Until that is fixed,
+**do not sweep**: `Tree::reap_dead` / `Tree::reap_participants` in Rust,
+`tft_tree_reap_dead` in C and `Tree.reap_dead()` in Python will free the records
+and take the claims of publishers that are running. No `tf_tree` subcommand
+sweeps — `doctor` reports and reclaims nothing — so the tool is safe to run
+either way.
+
 *This paragraph read "a participant that exited without releasing its slot,
 which `tf_tree participants` names" until 2026-09-05 — one command, no scope, and
 the wrong table for the byte-less class.*

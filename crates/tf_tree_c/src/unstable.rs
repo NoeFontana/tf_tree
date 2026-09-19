@@ -623,6 +623,19 @@ pub unsafe extern "C" fn tft_tree_inherit_ownership(
 /// and a `TreeBuilder::build_shared` participant with no socket — and this is
 /// their only collector.
 ///
+/// **Only one of that pair is in contract, and this call is written for that
+/// one.** A dead owner is an ordinary, supported outcome: nothing sees its
+/// hangup, so its claims outlive it and something has to sweep them. The
+/// `build_shared` participant is different — its claim can go stale *to another
+/// process* only if that process holds the arena read-write, which means the
+/// rendezvous (`tf_tree::Open`) or the `ReadWrite` fd-attach that `0028` step 0b
+/// refuses. Reaching it therefore takes a `build_shared` arena served through a
+/// hand-bound `OwnerServer`, and
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided that
+/// composition **out of contract** on 2026-09-18. Sweeping in a process tree
+/// that contains one frees the records and claims of *live* publishers; against
+/// the supported population this call has nothing to do but the owner's leavings.
+///
 /// Returns `0` written to `out` for a read-only tree, a heap tree, or a tree
 /// with no rendezvous: none of them can prove a holder is gone, and none of them
 /// may write the arena.

@@ -65,6 +65,30 @@ the wrong opinion only exists in the composition that is out of contract. The
 advisory in 0.0.4's entry and in `PHASE2.md` §0.0 is **permanent, not lifted** —
 both said "until `0031` is answered", which after an answer reads as expired.
 
+**Where the boundary is written** (step 1). `TreeBuilder::build_shared`'s own
+rustdoc says it, because that is where the call is, and `PHASE2.md` §3.1 — *The
+sharing boundary is the runtime directory*, NORMATIVE — says it from the spec
+side: an arena no runtime directory names sits outside that boundary, and
+serving it is reaching back across. Three shipped sites described the shape and
+are reconciled rather than rewritten. `tf_tree doctor`'s `TFT014` said
+`build_shared` is "still supported" — true of the **call**, and not of serving
+its result, which is the only way anything ever asks that check about a
+byte-less record. `tft_tree_reap_dead`'s doc and `docs/RUNBOOK.md` each named
+two producers of a stale claim that no hangup collects, a dead **owner** and a
+byte-less `build_shared` participant, and now say which is which: the owner is
+in contract and is what the sweep is for; the other is reachable only in the
+composition this record refuses. The runbook adds what an operator does about
+it — **do not sweep**, because `Tree::reap_dead`, `tft_tree_reap_dead` and
+`Tree.reap_dead()` will take the claims of publishers that are running, while no
+`tf_tree` subcommand sweeps at all, so `doctor` is safe either way.
+
+That rustdoc moved every line-number citation into `tree.rs` that pointed past
+it. The ones in `PHASE2.md`, `PHASE3.md` and `PHASE5.md` are symbol citations
+now and `scripts/line-citation-budget.txt` falls accordingly — one of them had
+been stale on `main` since long before this change, pointing at a benchmark note
+some two thousand lines from the `impl Drop for Tree` it claimed. The rest sit
+in frozen `implemented` records, where that budget's own note says they stay.
+
 ### Fixed — attach refusals did not fit the C ABI's message buffer (`0055` step 7)
 
 `IpcError::HandshakeRejected` appended a per-status remedy to every rejection,

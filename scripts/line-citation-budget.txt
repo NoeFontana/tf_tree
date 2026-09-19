@@ -17,8 +17,8 @@
 # `just lint` refuses any increase. A decrease is reported; lower the number
 # here in the same commit.
 2	CHANGELOG.md
-19	docs/PHASE2.md
-4	docs/PHASE3.md
+17	docs/PHASE2.md
+3	docs/PHASE3.md
 5	docs/PHASE4.md
 2	docs/PROJECT.md
 1	docs/RUNBOOK.md

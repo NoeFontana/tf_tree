@@ -2628,8 +2628,8 @@ Phase 5 is where the repository becomes publishable, so this is a deliverable, n
    mapping. No offline variant of the lookup, no separate index." That is what
    the code does: `Tree::open_frozen` maps the file and hands a `FrozenArena` to
    the same `&dyn Arena` the heap and `memfd` backings go through
-   (`crates/tf_tree/src/frozen.rs:119`, `ArenaBacking` at
-   `crates/tf_tree/src/tree.rs:697`), so the three backings are, in §2.1's
+   (`crates/tf_tree/src/frozen.rs:119`, `ArenaBacking` in
+   `crates/tf_tree/src/tree.rs`), so the three backings are, in §2.1's
    words, three ways of holding the same bytes — which is what
    `a_frozen_lookup_is_bit_identical_to_the_live_one`
    (`crates/tf_tree/tests/frozen.rs:181`) asserts, gate 1's three-way

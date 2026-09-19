@@ -2478,9 +2478,13 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 ///   writer's slot but not its claims — nothing calls `Tree::reap_participant`
 ///   on hangup", and the owner's callback now revokes that slot's claims before
 ///   it frees the record, so the ordinary #184 flow no longer leaves one. Two
-///   producers remain and this check is still blind to both: a **dead owner**,
-///   whose own hangup nobody sees, and a `TreeBuilder::build_shared`
-///   participant, which has no socket to hang up. Not a regression: the
+///   producers remain and this check is still blind to both, and they are not
+///   equally in scope: a **dead owner**, whose own hangup nobody sees, is in
+///   contract and unchanged; a `TreeBuilder::build_shared` participant has no
+///   socket to hang up, and its claim can go stale *to another process* only in
+///   the served composition
+///   `docs/decisions/0031-the-participant-record-with-no-byte.md` put out of
+///   contract on 2026-09-18. Not a regression: the
 ///   `owner_pid == 0` predicate was silent here too, for the same reason.
 ///   Closing the *detection* still needs the incarnation *inside* the claim
 ///   word, which is an arena format change and not one `0028` proposes.
@@ -2499,6 +2503,15 @@ fn slot_subject(p: &ParticipantInfo) -> String {
 /// registers without a byte and is still supported — but such a tree has no
 /// lock file, so it reaches [`slot_leak`]'s `unknown` byte row and is judged by
 /// `/proc` alone, exactly as it was before.
+///
+/// **"Still supported" is about the call, not about serving its result.**
+/// `docs/decisions/0031-the-participant-record-with-no-byte.md` decided on
+/// 2026-09-18 that binding a rendezvous over a `build_shared` arena is *out of
+/// contract*, and that is the only composition in which anything ever asks this
+/// check about a byte-less record: unserved, the fd goes to a child and no peer
+/// holds a probe. So the `unknown` row is what a supported byte-less
+/// participant gets, and the population it is *wrong* about is one the project
+/// does not support.
 ///
 /// **The claim half rests on the owner word being decoded correctly.** It is
 /// `(epoch << 16) | (slot + 1)`, so a hand-rolled `word - 1` resolves every
