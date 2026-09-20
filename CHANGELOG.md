@@ -53,7 +53,6 @@ defined by the status tables in `docs/`; they win over this file.
   dies mid-handshake is retried ([`0057`](docs/decisions/0057-an-owner-is-not-dead-until-its-files-close.md)).
 - **`build_shared` without a lock byte is out of contract**; use `Open::open`
   ([`0031`](docs/decisions/0031-the-participant-record-with-no-byte.md)).
-- **Documentation cut by roughly two thirds**; `0002`/`0003` are deleted.
 
 ### Added
 
