@@ -71,6 +71,7 @@ grep -m1 -H '^\*\*Status:' docs/decisions/0*.md
 | [`0059`](./0059-the-arena-errors-that-cannot-describe-themselves.md) | `Display` and `core::error::Error` for `ShmError`, `FrozenError`, `LayoutError` and `ParticipantError`. |
 | [`0060`](./0060-the-batch-fold-that-reads-before-it-interpolates.md) | a two-phase chunked `fold_batch` (read every bracket, then interpolate) as the SoA batch lever `0016` called unreachable. |
 | [`0061`](./0061-a-freeze-protects-the-argument-not-the-pointers.md) | a freeze protects the argument, not `path.rs:NNN` pointers. |
+| [`0062`](./0062-the-host-checks-doctor-does-not-make.md) | why `doctor` gains no `/dev/shm`, AVX2 or `--clean-stale` check. |
 
 ## Lifecycle
 

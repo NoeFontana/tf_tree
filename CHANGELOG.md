@@ -57,6 +57,7 @@ defined by the status tables in `docs/`; they win over this file.
 
 ### Added
 
+- **`just top-cpu`** asserts `tf_tree top` at 10 Hz uses under 0.5% of a core (0.30% measured).
 - **README gains a "Measured against `tf2`" table**, every figure from `docs/benchmarks/tf2.md`.
 - **`just book`** builds the docs as an mdBook (`docs/SUMMARY.md`), sorted into start/operating/reference/explanation/decisions; no file moved.
 - **`StaticStore::conflicts_by_edge()`**; loom model `head_publishes_every_stamp_below_it`.
