@@ -94,3 +94,43 @@ fn an_unmatched_edge_needle_is_reported() {
     assert!(ok, "top failed:\n{err}");
     assert!(out.contains("no edge matches"), "{out}");
 }
+
+/// CPU time the process has used so far, from `/proc/<pid>/schedstat` (ns
+/// resolution; `/proc/<pid>/stat` ticks at 10 ms, too coarse for 0.5%).
+fn cpu_ns(pid: u32) -> Option<u64> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/schedstat")).ok()?;
+    s.split_whitespace().next()?.parse().ok()
+}
+
+/// `top` at 10 Hz costs under 0.5% of a core once running (`--interval 100`).
+/// Startup is excluded: the window opens after the first frames. Measured 0.30%
+/// at `--release`; a debug build reads ~0.8%, so it runs under `just top-cpu`.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "debug build; `just top-cpu`")]
+fn ten_hertz_costs_under_half_a_percent_of_a_core() {
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tf_tree"))
+        .args(["top", "--iterations", "60", "--interval", "100"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn tf_tree top");
+    let pid = child.id();
+    std::thread::sleep(Duration::from_millis(1000));
+    let c0 = cpu_ns(pid);
+    let t0 = Instant::now();
+    std::thread::sleep(Duration::from_millis(4000));
+    let c1 = cpu_ns(pid);
+    let t1 = Instant::now();
+    child.kill().ok();
+    child.wait().ok();
+    // No schedstat on this host: nothing to measure.
+    let (Some(c0), Some(c1)) = (c0, c1) else {
+        return;
+    };
+    let frac = (c1 - c0) as f64 / t1.duration_since(t0).as_nanos() as f64;
+    assert!(
+        frac < 0.005,
+        "top at 10 Hz used {:.2}% of a core",
+        frac * 100.0
+    );
+}

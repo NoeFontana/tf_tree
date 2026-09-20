@@ -366,6 +366,10 @@ ingest-check:
 
 # **Rustdoc, with warnings denied — the docs.rs shop window.**
 # docs.rs's configuration: the five publishable crates set `all-features` and `--cfg docsrs`; `tf_tree_bench` names `shm,embed-probe`. Not gated: `tf2` (`just tf2-check`), `tf_tree_py` (`just py-lint`), `tf_tree_tf2_sys`.
+# `tf_tree top` at 10 Hz uses < 0.5% of a core (`--release`; the debug build is ignored in `just test`).
+top-cpu:
+    cargo nextest run --release -p tf_tree_cli --test top ten_hertz
+
 # **The prose book (`docs/SUMMARY.md`).** Fails on a listed file that does not exist.
 book:
     mdbook build docs
