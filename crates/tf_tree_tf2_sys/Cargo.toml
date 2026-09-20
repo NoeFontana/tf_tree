@@ -7,7 +7,7 @@
 name = "tf_tree_tf2_sys"
 description = "FFI bridge to ROS 2 tf2::BufferCore, for the tf_tree differential and benchmark harnesses."
 # Hand-kept copy of `[workspace.package] version`; a stale number fails to resolve `tf_tree_math`.
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 # Hand-kept copy of the workspace floor; CI's `msrv` job compares it.
 rust-version = "1.87"
@@ -40,7 +40,7 @@ unsafe_code = "allow"
 unsafe_op_in_unsafe_fn = "deny"
 
 [dependencies]
-tf_tree_math = { path = "../tf_tree_math", version = "0.0.5" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.0.6" }
 
 [build-dependencies]
 cc = "1"

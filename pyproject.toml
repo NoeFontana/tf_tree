@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "transform_tree"
 # Hand-kept copy of `[workspace.package] version` in the root `Cargo.toml`;
 # maturin reads it from here, and the two must agree.
-version = "0.0.5"
+version = "0.0.6"
 description = "A transform tree engine — faster and more scalable than ROS tf2"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

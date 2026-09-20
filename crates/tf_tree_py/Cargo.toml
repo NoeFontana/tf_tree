@@ -9,7 +9,7 @@ description = "PyO3 bindings for tf_tree (docs/PHASE3.md)"
 # Hand-kept copy of `[workspace.package] version`. `tf_tree.__version__` reads
 # this field, pip reads `pyproject.toml`'s; bump both together
 # (`tests/python/test_version.py`, which runs under `just py-test`).
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 # Workspace floor, by hand (see the root `Cargo.toml`).
 rust-version = "1.87"
@@ -47,9 +47,9 @@ pure-hash = ["tf_tree/pure-hash"]
 
 [dependencies]
 # `unstable`: `offline.rs` walks a frozen `.tft` through `Tree::arena_view` (`docs/API.md` §2.6).
-tf_tree = { path = "../tf_tree", version = "0.0.5", features = ["shm", "unstable"] }
-tf_tree_core = { path = "../tf_tree_core", version = "0.0.5" }
-tf_tree_math = { path = "../tf_tree_math", version = "0.0.5" }
+tf_tree = { path = "../tf_tree", version = "0.0.6", features = ["shm", "unstable"] }
+tf_tree_core = { path = "../tf_tree_core", version = "0.0.6" }
+tf_tree_math = { path = "../tf_tree_math", version = "0.0.6" }
 # Topology config shared with `ros/tf_tree_ros` (`docs/decisions/0041`); nothing Linux-only.
 tf_tree_bridge = { path = "../tf_tree_bridge" }
 # Unconditional and without `shm`: the binding uses only `run` and `digest_file`

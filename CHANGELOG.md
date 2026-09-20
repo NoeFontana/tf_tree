@@ -10,7 +10,7 @@ defined by the status tables in `docs/`; they win over this file.
 
 ---
 
-## [Unreleased]
+## [0.0.6] — 2026-09-20 (the prose cut)
 
 ### Breaking
 
@@ -88,3 +88,4 @@ out of searches and sweeps.
 [0.0.3]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.3
 [0.0.4]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.4
 [0.0.5]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.5
+[0.0.6]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.6
