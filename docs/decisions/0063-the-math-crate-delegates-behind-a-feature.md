@@ -22,10 +22,18 @@ too, as `CLAUDE.md` requires.
 2. With the feature on, a function listed below calls `helicoid` through a private
    module; with it off, the body that exists today runs. The public signatures,
    `Quat`/`Iso3` layouts (`Pod`) and facade re-exports do not change.
-3. **Wave 1 — SO(3):** `exp_so3`, `log_so3`, `quat_from_rot3`, `slerp`, `Quat::rotate`.
+3. **Wave 1 — SO(3):** `exp_so3`, `log_so3`, `quat_from_rot3`, `slerp`. **`Quat::rotate` takes
+   decision 5's fallback**: `Iso3` composition feeds it quaternions drifted past `helicoid`'s
+   `2^-40` debug domain by design (a 50k-compose test reaches norm error `1e-9`), and the formula
+   is `SO3::act`'s, so delegating buys no accuracy.
    `quat_from_rot3` is a **recorded behaviour change** under the feature: it returns the
    normalized quaternion `SO3::from_matrix` returns, where today's body returns an
-   un-normalized one (`helicoid` `0049` decision 4). `Quat::{dot, norm, norm_squared,
+   un-normalized one (`helicoid` `0049` decision 4). Three more differences are accepted and
+   pinned: `slerp` extrapolates off `[0, 1]` (the native series collapses there); `slerp` of
+   identical inputs returns `qa` to a few ulp, where native returns the bit; and `log_so3`/`slerp`
+   take `helicoid`'s unit domain as a `debug_assert!`, so a NaN or an off-unit input panics a
+   *debug* build and is garbage-in-garbage-out in release. The native-contract tests are
+   `cfg(not(feature = "helicoid"))`; the feature arm has its own. `Quat::{dot, norm, norm_squared,
    normalize}` and `Iso3::normalized` stay this crate's permanently (`0049`).
 4. **Waves 2 and 3** (SE(3); the screw path) are separate PRs under the same feature, each
    gated as `helicoid` `0041` decision 4 says. Nothing here decides them.
