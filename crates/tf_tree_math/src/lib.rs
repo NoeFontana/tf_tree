@@ -33,6 +33,8 @@
 mod readme {}
 
 pub mod dualquat;
+#[cfg(feature = "helicoid")]
+mod helicoid_backend;
 pub mod interp;
 pub mod iso3;
 pub mod quat;
