@@ -376,18 +376,14 @@ fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
     );
 }
 
-/// `NaN` propagates through every branch except the early return that answers
-/// before `s` is read: `slerp(qa, qa, NaN)` returns `qa`.
+/// `NaN` propagates through every branch, on both arms.
 ///
 /// Do not "harden" the closed form. A `NaN` component reaches the closed form,
 /// where `acos(NaN.min(1.0)) = 0` makes `sin_angle` zero and the output `NaN` only
 /// via `0.0/0.0`; a `sin_angle == 0.0` guard would turn a `NaN` input into a
 /// plausible pose. `dot.clamp(-1.0, 1.0)` would be safe; see `slerp`'s docs.
-///
-/// Native arm only: `helicoid` asserts its unit domain in debug builds, and a NaN is outside it (`docs/decisions/0063`).
 #[test]
-#[cfg(not(feature = "helicoid"))]
-fn nan_propagates_except_through_the_identical_input_return() {
+fn nan_propagates_through_every_branch() {
     let all_nan = |q: Quat| q.w.is_nan() && q.x.is_nan() && q.y.is_nan() && q.z.is_nan();
     for k in 0..16 {
         let qa = sample_rotation(k);
@@ -412,15 +408,26 @@ fn nan_propagates_except_through_the_identical_input_return() {
                  before relaxing this."
             );
         }
-        // `h` is `0`, so nothing downstream reads `s`.
-        assert_eq!(bits(slerp(qa, qa, f64::NAN)), bits(qa), "k={k}");
-        assert_eq!(bits(slerp(qa, qa, f64::INFINITY)), bits(qa), "k={k}");
-        // A NaN component cannot reach it: `h` is NaN, not `<= 0.0`.
         let qnan = Quat::new(f64::NAN, qa.x, qa.y, qa.z);
         assert!(
             all_nan(slerp(qnan, qnan, 0.5)),
-            "the early return ate a NaN component: k={k}"
+            "a NaN component was eaten: k={k}"
         );
+    }
+}
+
+/// The native early return answers before `s` is read: `slerp(qa, qa, NaN)` returns `qa`. A NaN
+/// component cannot reach it, which `nan_propagates_through_every_branch` checks: `h` is NaN, not
+/// `<= 0.0`.
+///
+/// Native arm only: `helicoid`'s geodesic has no early return, so a NaN `s` gives NaN there.
+#[test]
+#[cfg(not(feature = "helicoid"))]
+fn the_identical_input_return_answers_before_s_is_read() {
+    for k in 0..16 {
+        let qa = sample_rotation(k);
+        assert_eq!(bits(slerp(qa, qa, f64::NAN)), bits(qa), "k={k}");
+        assert_eq!(bits(slerp(qa, qa, f64::INFINITY)), bits(qa), "k={k}");
     }
 }
 

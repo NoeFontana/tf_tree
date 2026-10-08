@@ -2,6 +2,12 @@
 //!
 //! Each function converts at the boundary and calls one `helicoid` routine; the arithmetic is
 //! `helicoid`'s. `Quat` and `Vec3` keep their layouts, so nothing here crosses a storage contract.
+//!
+//! A quaternion enters on `helicoid`'s *carried* path, a struct literal moved into
+//! `SO3::from_quat_unchecked`, never through the vouching `Quat::from_wxyz_unchecked`. `Iso3`
+//! composition never normalizes, so this crate's quaternions drift by design. The carried path
+//! asserts nothing, propagates NaN, and states each operation's error up to
+//! `|‖q‖² − 1| ≤ 2^-26.29` (`helicoid`'s `NUMERICS.md` §12).
 
 use crate::iso3::Vec3;
 use crate::quat::Quat;
@@ -10,7 +16,12 @@ use helicoid_linalg::{Matrix, Vector};
 
 #[inline]
 fn so3(q: Quat) -> SO3<f64> {
-    SO3::from_quat_unchecked(HQuat::from_wxyz_unchecked(q.w, q.x, q.y, q.z))
+    SO3::from_quat_unchecked(HQuat {
+        w: q.w,
+        x: q.x,
+        y: q.y,
+        z: q.z,
+    })
 }
 
 #[inline]
@@ -47,6 +58,13 @@ pub(crate) fn quat_from_rot3(r: &[f64; 9]) -> Quat {
 #[inline]
 pub(crate) fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
     quat(SO3::geodesic(&so3(qa), &so3(qb), s))
+}
+
+/// Bit-identical to the native sandwich, drifted or not: the same products, in the same order.
+#[inline]
+pub(crate) fn rotate(q: Quat, v: Vec3) -> Vec3 {
+    let [x, y, z] = so3(q).act(Vector([v.x, v.y, v.z])).0;
+    Vec3::new(x, y, z)
 }
 
 /// The adapter twins (`docs/decisions/0063` decision 5): each delegated function against the body
@@ -204,5 +222,63 @@ mod twin_tests {
             }
         }
         assert!(worst < 1e-13, "extrapolation differs by {worst:e}");
+    }
+
+    /// `q` scaled so that `‖q‖² − 1 = eta`: the drift `Iso3` composition carries.
+    fn drifted(q: Quat, eta: f64) -> Quat {
+        q.scale((1.0 + eta).sqrt())
+    }
+
+    /// Unit, at `helicoid`'s vouched bound `2^-40`, and out to the edge of its drift band.
+    const DRIFTS: [f64; 5] = [0.0, 9.1e-13, -9.1e-13, 1.2e-8, -1.2e-8];
+
+    #[test]
+    fn rotate_is_the_native_twin_to_the_bit_drifted_or_not() {
+        let v = [
+            Vec3::new(1.0, -2.0, 0.5),
+            Vec3::new(-3e-9, 7.0, 1e6),
+            Vec3::new(0.0, 0.0, 1.0),
+        ];
+        let bits = |a: Vec3| [a.x, a.y, a.z].map(f64::to_bits);
+        for w in rotation_vectors() {
+            for eta in DRIFTS {
+                let q = drifted(exp_so3_native(w), eta);
+                for &v in &v {
+                    assert_eq!(
+                        bits(rotate(q, v)),
+                        bits(q.rotate_native(v)),
+                        "{w:?} {eta:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A drifted quaternion reaches every delegated function without a debug panic, and `log_so3`
+    /// stays the native twin's: both are scale-invariant.
+    #[test]
+    fn a_drifted_quaternion_is_carried_through_every_delegated_function() {
+        let mut worst = 0.0f64;
+        for w in rotation_vectors() {
+            for eta in DRIFTS {
+                let q = drifted(exp_so3_native(w), eta);
+                worst = worst.max(log_so3(q).sub(log_so3_native(q)).norm());
+                let other = drifted(exp_so3_native(w.scale(0.5)), -eta);
+                let _ = slerp(q, other, 0.3);
+            }
+        }
+        assert!(worst < 1e-14, "log_so3 of a drifted q differs by {worst:e}");
+    }
+
+    #[test]
+    fn nan_propagates_through_every_delegated_function() {
+        let q = Quat::new(f64::NAN, 0.1, 0.2, 0.3);
+        let one = exp_so3_native(Vec3::new(0.3, -0.2, 0.1));
+        let log = log_so3(q);
+        assert!(log.x.is_nan() && log.y.is_nan() && log.z.is_nan());
+        assert!(rotate(q, Vec3::new(1.0, 2.0, 3.0)).x.is_nan());
+        assert!(slerp(q, one, 0.5).w.is_nan());
+        assert!(slerp(one, q, 0.5).w.is_nan());
+        assert!(slerp(one, one, f64::NAN).w.is_nan());
     }
 }

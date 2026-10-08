@@ -174,6 +174,22 @@ impl Quat {
     #[inline]
     #[must_use]
     pub fn rotate(self, v: Vec3) -> Vec3 {
+        #[cfg(feature = "helicoid")]
+        {
+            crate::helicoid_backend::rotate(self, v)
+        }
+        #[cfg(not(feature = "helicoid"))]
+        {
+            self.rotate_native(v)
+        }
+    }
+
+    /// The body that ran before delegation, kept as [`Quat::rotate`]'s adapter twin
+    /// (`docs/decisions/0063`).
+    #[inline]
+    #[must_use]
+    #[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+    pub(crate) fn rotate_native(self, v: Vec3) -> Vec3 {
         let u = self.vector();
         let t = u.cross(v).scale(2.0);
         v.add(t.scale(self.w)).add(u.cross(t))
