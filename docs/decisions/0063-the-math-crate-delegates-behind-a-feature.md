@@ -22,19 +22,28 @@ too, as `CLAUDE.md` requires.
 2. With the feature on, a function listed below calls `helicoid` through a private
    module; with it off, the body that exists today runs. The public signatures,
    `Quat`/`Iso3` layouts (`Pod`) and facade re-exports do not change.
-3. **Wave 1 — SO(3):** `exp_so3`, `log_so3`, `quat_from_rot3`, `slerp`. **`Quat::rotate` takes
-   decision 5's fallback**: `Iso3` composition feeds it quaternions drifted past `helicoid`'s
-   `2^-40` debug domain by design (a 50k-compose test reaches norm error `1e-9`), and the formula
-   is `SO3::act`'s, so delegating buys no accuracy.
-   `quat_from_rot3` is a **recorded behaviour change** under the feature: it returns the
-   normalized quaternion `SO3::from_matrix` returns, where today's body returns an
-   un-normalized one (`helicoid` `0049` decision 4). Three more differences are accepted and
-   pinned: `slerp` extrapolates off `[0, 1]` (the native series collapses there); `slerp` of
-   identical inputs returns `qa` to a few ulp, where native returns the bit; and `log_so3`/`slerp`
-   take `helicoid`'s unit domain as a `debug_assert!`, so a NaN or an off-unit input panics a
-   *debug* build and is garbage-in-garbage-out in release. The native-contract tests are
-   `cfg(not(feature = "helicoid"))`; the feature arm has its own. `Quat::{dot, norm, norm_squared,
-   normalize}` and `Iso3::normalized` stay this crate's permanently (`0049`).
+3. **Wave 1 — SO(3):** `exp_so3`, `log_so3`, `quat_from_rot3`, `slerp`, `Quat::rotate`.
+   **Every quaternion enters `helicoid` on its *carried* path** (`helicoid` `0058`): a struct
+   literal moved into `SO3::from_quat_unchecked`, never the vouching `Quat::from_wxyz_unchecked`.
+   `Iso3` composition never normalizes, so this crate's quaternions drift by design. A 50k-compose
+   test reaches `‖q‖² − 1 ≈ 1e-9`, past the vouching assert's `2^-40` and inside the carried
+   path's `2^-26.29` band, where `helicoid` states each operation's error. The carried path asserts
+   nothing and propagates NaN, as this crate's functions do.
+   - `Quat::rotate` is **bit-identical** to its native twin, drifted or not: `SO3::act` is the
+     same sandwich in the same order (`rotate_is_the_native_twin_to_the_bit_drifted_or_not`).
+   - `quat_from_rot3` is a **recorded behaviour change** under the feature. It returns the
+     normalized quaternion `SO3::from_matrix` returns, where today's body returns an
+     un-normalized one (`helicoid` `0049` decision 4).
+   - Two `slerp` differences are accepted and pinned. It extrapolates off `[0, 1]`, where the
+     native series collapses. Identical inputs return `qa` to a few ulp, where native returns the
+     bit, and a NaN `s` returns NaN, because there is no early return.
+   - One drift difference is a gain. On near pairs, `slerp`'s chord-based angle reads the norm
+     difference as rotation and loses up to `~4 000 u` at `2^-26.29`, while `helicoid`'s provided
+     body is scale-invariant and stays at `6.5 u` (`helicoid` `0058`, Measured).
+   - The native-contract tests that pin these differences are `cfg(not(feature = "helicoid"))`,
+     and the feature arm has its own.
+   - `Quat::{dot, norm, norm_squared, normalize}` and `Iso3::normalized` stay this crate's
+     permanently (`0049`).
 4. **Waves 2 and 3** (SE(3); the screw path) are separate PRs under the same feature, each
    gated as `helicoid` `0041` decision 4 says. Nothing here decides them.
 5. A function that regresses on accuracy or latency stays on its old body; the feature is
