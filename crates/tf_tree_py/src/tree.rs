@@ -1608,9 +1608,9 @@ pub fn open_arena(
         (_, e) => open_err(py, created, capacity, e),
     };
     if let Some(n) = name {
-        o = o.name(n).map_err(&map_err)?;
+        o = o.name(n).map_err(map_err)?;
     }
-    let inner = o.open().map_err(&map_err)?;
+    let inner = o.open().map_err(map_err)?;
     Ok(PyTree::wrap(Arc::new(inner)))
 }
 
