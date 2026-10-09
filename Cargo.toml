@@ -76,6 +76,9 @@ tf_tree_ingest = { path = "crates/tf_tree_ingest", default-features = false }
 libm = "0.2"
 bytemuck = { version = "1", features = ["derive"] }
 blake3 = { version = "1", default-features = false }
+# `tf_tree_math`'s optional `helicoid` feature (`docs/decisions/0063`): off by default, so D14's budget holds for everyone who does not opt in.
+helicoid = "=0.0.1"
+helicoid-linalg = "=0.0.1"
 # std-side facade / tooling only.
 thiserror = "2"
 anyhow = "1"

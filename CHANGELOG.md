@@ -10,6 +10,24 @@ defined by the status tables in `docs/`; they win over this file.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`tf_tree_math` feature `helicoid` (off by default)**: `exp_so3`, `log_so3`,
+  `quat_from_rot3`, `slerp` and `Quat::rotate` call
+  [`helicoid`](https://crates.io/crates/helicoid) 0.0.1
+  ([`0063`](docs/decisions/0063-the-math-crate-delegates-behind-a-feature.md)), on its
+  assertion-free carried path, so drifted quaternions and NaN behave as they do natively.
+  Under the feature:
+  - `Quat::rotate` is bit-identical to the native body.
+  - `quat_from_rot3` returns a normalized quaternion.
+  - `slerp` extrapolates off `[0, 1]`. For identical inputs it returns `qa` to a few ulp,
+    not the bit, and a NaN `s` gives NaN.
+  - On near pairs of drifted quaternions, `slerp` stays at rounding level.
+
+---
+
 ## [0.0.6] — 2026-09-20 (the prose cut)
 
 ### Breaking

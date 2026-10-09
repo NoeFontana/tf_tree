@@ -159,6 +159,21 @@ impl Iso3 {
 #[inline]
 #[must_use]
 pub fn slerp(qa: Quat, qb: Quat, s: f64) -> Quat {
+    #[cfg(feature = "helicoid")]
+    {
+        crate::helicoid_backend::slerp(qa, qb, s)
+    }
+    #[cfg(not(feature = "helicoid"))]
+    {
+        slerp_native(qa, qb, s)
+    }
+}
+
+/// The body that ran before delegation, kept as [`slerp`]'s adapter twin (`docs/decisions/0063`).
+#[inline]
+#[must_use]
+#[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+pub(crate) fn slerp_native(qa: Quat, qb: Quat, s: f64) -> Quat {
     let dot = qa.dot(qb);
     let qb = if dot < 0.0 { qb.neg() } else { qb };
 

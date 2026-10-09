@@ -174,6 +174,22 @@ impl Quat {
     #[inline]
     #[must_use]
     pub fn rotate(self, v: Vec3) -> Vec3 {
+        #[cfg(feature = "helicoid")]
+        {
+            crate::helicoid_backend::rotate(self, v)
+        }
+        #[cfg(not(feature = "helicoid"))]
+        {
+            self.rotate_native(v)
+        }
+    }
+
+    /// The body that ran before delegation, kept as [`Quat::rotate`]'s adapter twin
+    /// (`docs/decisions/0063`).
+    #[inline]
+    #[must_use]
+    #[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+    pub(crate) fn rotate_native(self, v: Vec3) -> Vec3 {
         let u = self.vector();
         let t = u.cross(v).scale(2.0);
         v.add(t.scale(self.w)).add(u.cross(t))
@@ -205,6 +221,21 @@ impl Mul for Quat {
 #[inline]
 #[must_use]
 pub fn exp_so3(w: Vec3) -> Quat {
+    #[cfg(feature = "helicoid")]
+    {
+        crate::helicoid_backend::exp_so3(w)
+    }
+    #[cfg(not(feature = "helicoid"))]
+    {
+        exp_so3_native(w)
+    }
+}
+
+/// The body that ran before delegation, kept as [`exp_so3`]'s adapter twin (`docs/decisions/0063`).
+#[inline]
+#[must_use]
+#[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+pub(crate) fn exp_so3_native(w: Vec3) -> Quat {
     exp_so3_theta(w, w.norm())
 }
 
@@ -238,6 +269,21 @@ pub(crate) fn exp_so3_theta(w: Vec3, theta: f64) -> Quat {
 #[inline]
 #[must_use]
 pub fn log_so3(q: Quat) -> Vec3 {
+    #[cfg(feature = "helicoid")]
+    {
+        crate::helicoid_backend::log_so3(q)
+    }
+    #[cfg(not(feature = "helicoid"))]
+    {
+        log_so3_native(q)
+    }
+}
+
+/// The body that ran before delegation, kept as [`log_so3`]'s adapter twin (`docs/decisions/0063`).
+#[inline]
+#[must_use]
+#[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+pub(crate) fn log_so3_native(q: Quat) -> Vec3 {
     // w ≥ 0 puts the result in the principal branch.
     let (w, x, y, z) = if q.w < 0.0 {
         (-q.w, -q.x, -q.y, -q.z)
@@ -269,6 +315,21 @@ pub fn log_so3(q: Quat) -> Vec3 {
 #[inline]
 #[must_use]
 pub fn quat_from_rot3(r: &[f64; 9]) -> Quat {
+    #[cfg(feature = "helicoid")]
+    {
+        crate::helicoid_backend::quat_from_rot3(r)
+    }
+    #[cfg(not(feature = "helicoid"))]
+    {
+        quat_from_rot3_native(r)
+    }
+}
+
+/// The body that ran before delegation, kept as [`quat_from_rot3`]'s adapter twin (`docs/decisions/0063`).
+#[inline]
+#[must_use]
+#[cfg_attr(all(feature = "helicoid", not(test)), allow(dead_code))]
+pub(crate) fn quat_from_rot3_native(r: &[f64; 9]) -> Quat {
     let (r00, r11, r22) = (r[0], r[4], r[8]);
     let trace = r00 + r11 + r22;
     if trace > 0.0 {

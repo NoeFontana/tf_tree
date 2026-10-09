@@ -111,7 +111,11 @@ fn endpoints_are_bit_exact_above_the_lerp_fallback() {
 /// `s = 0` differs from `qa` by a couple of ulp unless `qa` is already unit to
 /// the bit. That ulp is the observable: it appears below the threshold and
 /// disappears above it with the same `qa`.
+///
+/// Native arm only: `helicoid`'s geodesic has no LERP fallback to pin, and its endpoints are
+/// held by `helicoid_backend`'s `slerp_endpoints_agree_with_the_native_twin`.
 #[test]
+#[cfg(not(feature = "helicoid"))]
 fn endpoints_lose_bit_exactness_only_in_the_lerp_fallback() {
     let mut discriminating = 0usize;
     let mut worst = 0.0f64;
@@ -262,7 +266,10 @@ fn the_arc_is_the_short_one_and_the_sign_of_qb_is_irrelevant() {
 }
 
 /// Identical inputs short-circuit, and `s` cannot perturb the answer.
+///
+/// Native arm only: `helicoid`'s geodesic returns `qa` to a few ulp, not the bit; `slerp_of_identical_inputs_is_qa_to_a_few_ulp` pins that arm.
 #[test]
+#[cfg(not(feature = "helicoid"))]
 fn numerically_identical_inputs_return_qa_at_every_s() {
     for k in 0..16 {
         let qa = sample_rotation(k);
@@ -274,11 +281,13 @@ fn numerically_identical_inputs_return_qa_at_every_s() {
 }
 
 /// The exact great-circle point at parameter `s`, valid off the segment too.
+#[cfg(not(feature = "helicoid"))]
 fn geodesic(qa: Quat, theta: f64, s: f64) -> Quat {
     step(qa, s * theta)
 }
 
 /// The double cover: the distance that counts is the smaller of the two.
+#[cfg(not(feature = "helicoid"))]
 fn rot_dist(a: Quat, b: Quat) -> f64 {
     a.sub(b).norm().min(a.add(b).norm())
 }
@@ -287,7 +296,10 @@ fn rot_dist(a: Quat, b: Quat) -> f64 {
 /// branches degrade differently (closed form holds, series collapses, the
 /// fallback's chord is fine until the arc grows), so the bands are wide and pin
 /// the shape, not a libm revision.
+///
+/// Native arm only: `helicoid` does not collapse out of range; `slerp_extrapolates_off_the_segment` pins that arm.
 #[test]
+#[cfg(not(feature = "helicoid"))]
 fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
     // Closed form: as true off the segment as on it.
     let mut worst_closed = 0.0f64;
@@ -364,15 +376,14 @@ fn out_of_range_s_extrapolates_and_only_the_closed_form_holds() {
     );
 }
 
-/// `NaN` propagates through every branch except the early return that answers
-/// before `s` is read: `slerp(qa, qa, NaN)` returns `qa`.
+/// `NaN` propagates through every branch, on both arms.
 ///
 /// Do not "harden" the closed form. A `NaN` component reaches the closed form,
 /// where `acos(NaN.min(1.0)) = 0` makes `sin_angle` zero and the output `NaN` only
 /// via `0.0/0.0`; a `sin_angle == 0.0` guard would turn a `NaN` input into a
 /// plausible pose. `dot.clamp(-1.0, 1.0)` would be safe; see `slerp`'s docs.
 #[test]
-fn nan_propagates_except_through_the_identical_input_return() {
+fn nan_propagates_through_every_branch() {
     let all_nan = |q: Quat| q.w.is_nan() && q.x.is_nan() && q.y.is_nan() && q.z.is_nan();
     for k in 0..16 {
         let qa = sample_rotation(k);
@@ -397,15 +408,26 @@ fn nan_propagates_except_through_the_identical_input_return() {
                  before relaxing this."
             );
         }
-        // `h` is `0`, so nothing downstream reads `s`.
-        assert_eq!(bits(slerp(qa, qa, f64::NAN)), bits(qa), "k={k}");
-        assert_eq!(bits(slerp(qa, qa, f64::INFINITY)), bits(qa), "k={k}");
-        // A NaN component cannot reach it: `h` is NaN, not `<= 0.0`.
         let qnan = Quat::new(f64::NAN, qa.x, qa.y, qa.z);
         assert!(
             all_nan(slerp(qnan, qnan, 0.5)),
-            "the early return ate a NaN component: k={k}"
+            "a NaN component was eaten: k={k}"
         );
+    }
+}
+
+/// The native early return answers before `s` is read: `slerp(qa, qa, NaN)` returns `qa`. A NaN
+/// component cannot reach it, which `nan_propagates_through_every_branch` checks: `h` is NaN, not
+/// `<= 0.0`.
+///
+/// Native arm only: `helicoid`'s geodesic has no early return, so a NaN `s` gives NaN there.
+#[test]
+#[cfg(not(feature = "helicoid"))]
+fn the_identical_input_return_answers_before_s_is_read() {
+    for k in 0..16 {
+        let qa = sample_rotation(k);
+        assert_eq!(bits(slerp(qa, qa, f64::NAN)), bits(qa), "k={k}");
+        assert_eq!(bits(slerp(qa, qa, f64::INFINITY)), bits(qa), "k={k}");
     }
 }
 

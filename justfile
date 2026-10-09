@@ -15,6 +15,8 @@ test-rust:
     # `bridge` is default-off, so `--workspace` compiles none of `tf_tree_c/src/bridge.rs`; this line is its gate.
     cargo nextest run -p tf_tree_c --features bridge
     cargo nextest run -p tf_tree_core --features crash-points
+    # The `helicoid` arm of `tf_tree_math` (`docs/decisions/0063`): off by default, so `--workspace` never builds it.
+    cargo nextest run -p tf_tree_math --features helicoid
 
 test-doc:
     cargo test --doc --workspace
@@ -393,6 +395,7 @@ lint: no-build-output no-conflict-markers py-compile evidence-audit artifact-ver
     cargo clippy -p tf_tree_ingest --features fixture --all-targets -- -D warnings
     cargo clippy -p tf_tree_ingest --no-default-features --all-targets -- -D warnings
     cargo clippy -p tf_tree_cli --no-default-features --all-targets -- -D warnings
+    cargo clippy -p tf_tree_math --features helicoid --all-targets -- -D warnings
     cargo clippy -p tf_tree_core --features pure-hash --all-targets -- -D warnings
     cargo clippy -p tf_tree --features pure-hash --all-targets -- -D warnings
     cargo clippy -p tf_tree_core --features crash-points --all-targets -- -D warnings
