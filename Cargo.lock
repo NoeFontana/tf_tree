@@ -550,9 +550,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "helicoid"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "801d338995d1f774baa96f3e63c341abf7d3607bbbc12b2729723bd274f0f385"
+checksum = "192333bfa349f6e1636bf0f88cce1226e7449657197c74ca62013768b6128ec3"
 dependencies = [
  "helicoid-linalg",
  "libm",
@@ -560,9 +560,9 @@ dependencies = [
 
 [[package]]
 name = "helicoid-linalg"
-version = "0.0.1"
+version = "0.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15e4d0c47d4e35fcad9a4425240201c57bf26e89f5cea45e11aa4d8d3eed93b1"
+checksum = "e013a494a17d6cfe99ff603ccc4df07af4f4f6d0812d37699d8384392b2a7d34"
 dependencies = [
  "libm",
 ]

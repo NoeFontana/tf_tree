@@ -6,7 +6,7 @@
 
 ## Context
 
-`helicoid` 0.0.1 and `helicoid-linalg` 0.0.1 are on crates.io. `helicoid`'s records
+`helicoid` 0.0.2 and `helicoid-linalg` 0.0.2 are on crates.io. `helicoid`'s records
 `0041` and `0049` (both `ready`) decide that it replaces `tf_tree_math`'s Lie-group
 bodies through an adapter at this crate, not by substituting types, and that the
 `tf_tree` side is a feature. That decision names a dependency this workspace's
@@ -16,9 +16,10 @@ too, as `CLAUDE.md` requires.
 ## Decision
 
 1. `tf_tree_math` gains an **optional** dependency on `helicoid` and `helicoid-linalg`
-   (`=0.0.1` while the line is `0.0.x`) and a feature `helicoid = ["dep:helicoid",
-   "dep:helicoid-linalg"]`. **Off by default.** Both are `no_std`, no `alloc`, no
-   `unsafe`, and add only `libm` (already a dependency) to the closure.
+   (`=0.0.2`, pinned exactly while the line is `0.0.x`) and a feature
+   `helicoid = ["dep:helicoid", "dep:helicoid-linalg"]`. **Off by default.** Both are
+   `no_std`, no `alloc`, no `unsafe`, and add only `libm` (already a dependency) to the
+   closure.
 2. With the feature on, a function listed below calls `helicoid` through a private
    module; with it off, the body that exists today runs. The public signatures,
    `Quat`/`Iso3` layouts (`Pod`) and facade re-exports do not change.
@@ -40,6 +41,9 @@ too, as `CLAUDE.md` requires.
    - One drift difference is a gain. On near pairs, `slerp`'s chord-based angle reads the norm
      difference as rotation and loses up to `~4 000 u` at `2^-26.29`, while `helicoid`'s provided
      body is scale-invariant and stays at `6.5 u` (`helicoid` `0058`, Measured).
+   - `slerp`'s latency is at parity from `helicoid` 0.0.2 (`helicoid` `0059`):
+     `lookup/depth3/lerpslerp` reads 211.7 ns against 209.3 ns native, where 0.0.1 read
+     239.1 ns. So decision 5 keeps it delegated.
    - The native-contract tests that pin these differences are `cfg(not(feature = "helicoid"))`,
      and the feature arm has its own.
    - `Quat::{dot, norm, norm_squared, normalize}` and `Iso3::normalized` stay this crate's
