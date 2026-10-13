@@ -1,8 +1,8 @@
 # 0063: `tf_tree_math` delegates SO(3) and SE(3) to `helicoid` behind an off-by-default feature
 
-**Status:** draft
+**Status:** ready — Wave 1 (SO(3)) on `helicoid` 0.0.3; Waves 2 and 3 owed
 **Owner:** @NoeFontana
-**Implementation:** none
+**Implementation:** #374 (this record), #375 (Wave 1), #377 (`helicoid` 0.0.3)
 
 ## Context
 
