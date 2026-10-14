@@ -43,8 +43,8 @@ pub(crate) fn log_so3(q: Quat) -> Vec3 {
     Vec3::new(x, y, z)
 }
 
-/// Returns the **normalized** quaternion `SO3::from_matrix` does; the native body does not
-/// normalize (`docs/decisions/0063` decision 3).
+/// Shepperd's quotients in the native body's arithmetic on a rotation, normalized off the sphere,
+/// as `SO3::from_matrix` returns them (`docs/decisions/0063` decision 3).
 #[inline]
 pub(crate) fn quat_from_rot3(r: &[f64; 9]) -> Quat {
     let row = |i: usize| Vector([r[3 * i], r[3 * i + 1], r[3 * i + 2]]);
