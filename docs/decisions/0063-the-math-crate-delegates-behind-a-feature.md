@@ -64,7 +64,7 @@ too, as `CLAUDE.md` requires.
 5. A function that regresses on accuracy or latency stays on its old body; the feature is
    not all-or-nothing. The old bodies stay as the *adapter twins* (`helicoid` `0049`
    Consequences): they answer "did delegation change the answer".
-6. Making the feature default is a separate, later decision.
+6. Making the feature default is a separate, later decision: [`0064`](./0064-the-math-crate-uses-helicoid-by-default.md) makes it.
 
 ## Rationale
 

@@ -39,6 +39,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "helicoid"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d8d5abfd68550c667ec6721da48a1d1fb852b435db673a8fda7093195411a7d"
+dependencies = [
+ "helicoid-linalg",
+ "libm",
+]
+
+[[package]]
+name = "helicoid-linalg"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "994bdd3e24ef9a226b96904499395071be521cf75a4a4234198bc71a627794d2"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -84,6 +103,8 @@ name = "tf_tree_math"
 version = "0.0.6"
 dependencies = [
  "bytemuck",
+ "helicoid",
+ "helicoid-linalg",
  "libm",
 ]
 

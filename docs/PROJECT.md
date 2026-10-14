@@ -73,7 +73,7 @@ Above the query layer sit the bindings: Rust, PyO3, a C ABI with a C++ RAII head
 - **D11 — Every error names the offending edge.** Errors are `Copy`, allocation-free and carry IDs; a `Display` wrapper resolves names against the arena.
 - **D12 — Numerics are measured, not assumed.** `log_SO3` must go through the quaternion `atan2` form, and the small-angle series threshold is θ < 0.1 with four terms (`PHASE1.md` §3.3). *Do not* adjust either without re-running the verification.
 - **D13 — Reference implementation plus fast implementation, forever.** Every non-obvious numeric routine keeps an obvious slow version in the tree and a fast version tested against it by proptest.
-- **D14 — `no_std` + `alloc` core, minimal dependencies.** `tf_tree_core` depends on `libm`, `bytemuck` and `blake3`, and nothing else. *Do not* add `serde`, `tokio`, `nalgebra`, or a logging framework to the core.
+- **D14 — `no_std` + `alloc` core, minimal dependencies.** `tf_tree_core` depends on `libm`, `bytemuck` and `blake3`, and nothing else, except `helicoid` and `helicoid-linalg` through `tf_tree_math` ([`0064`](./decisions/0064-the-math-crate-uses-helicoid-by-default.md)): `no_std`, no `alloc` or `unsafe`, `libm` alone beneath them. *Do not* add `serde`, `tokio`, `nalgebra`, or a logging framework to the core.
 
 > `blake3` is deliberate: `PHASE1.md` §5.1 mandates it for frame-name hashing, because two **processes** intern into one arena.
 
