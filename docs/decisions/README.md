@@ -73,6 +73,7 @@ grep -m1 -H '^\*\*Status:' docs/decisions/0*.md
 | [`0061`](./0061-a-freeze-protects-the-argument-not-the-pointers.md) | a freeze protects the argument, not `path.rs:NNN` pointers. |
 | [`0062`](./0062-the-host-checks-doctor-does-not-make.md) | why `doctor` gains no `/dev/shm`, AVX2 or `--clean-stale` check. |
 | [`0063`](./0063-the-math-crate-delegates-behind-a-feature.md) | `tf_tree_math` delegates SO(3)/SE(3) to `helicoid` behind an off-by-default feature; Wave 1 is SO(3). |
+| [`0064`](./0064-the-math-crate-uses-helicoid-by-default.md) | The `helicoid` feature is on by default; D14 names `helicoid` and `helicoid-linalg`. |
 
 ## Lifecycle
 
