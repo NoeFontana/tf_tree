@@ -1,12 +1,12 @@
 # 0063: `tf_tree_math` delegates SO(3) and SE(3) to `helicoid` behind an off-by-default feature
 
-**Status:** draft
+**Status:** ready — Wave 1 (SO(3)) on `helicoid` 0.0.4; Waves 2 and 3 owed
 **Owner:** @NoeFontana
-**Implementation:** none
+**Implementation:** #374 (this record), #375 (Wave 1), #377 (`helicoid` 0.0.4)
 
 ## Context
 
-`helicoid` 0.0.1 and `helicoid-linalg` 0.0.1 are on crates.io. `helicoid`'s records
+`helicoid` 0.0.4 and `helicoid-linalg` 0.0.4 are on crates.io. `helicoid`'s records
 `0041` and `0049` (both `ready`) decide that it replaces `tf_tree_math`'s Lie-group
 bodies through an adapter at this crate, not by substituting types, and that the
 `tf_tree` side is a feature. That decision names a dependency this workspace's
@@ -16,9 +16,10 @@ too, as `CLAUDE.md` requires.
 ## Decision
 
 1. `tf_tree_math` gains an **optional** dependency on `helicoid` and `helicoid-linalg`
-   (`=0.0.1` while the line is `0.0.x`) and a feature `helicoid = ["dep:helicoid",
-   "dep:helicoid-linalg"]`. **Off by default.** Both are `no_std`, no `alloc`, no
-   `unsafe`, and add only `libm` (already a dependency) to the closure.
+   (`=0.0.4`, pinned exactly while the line is `0.0.x`) and a feature
+   `helicoid = ["dep:helicoid", "dep:helicoid-linalg"]`. **Off by default.** Both are
+   `no_std`, no `alloc`, no `unsafe`, and add only `libm` (already a dependency) to the
+   closure.
 2. With the feature on, a function listed below calls `helicoid` through a private
    module; with it off, the body that exists today runs. The public signatures,
    `Quat`/`Iso3` layouts (`Pod`) and facade re-exports do not change.
@@ -31,15 +32,29 @@ too, as `CLAUDE.md` requires.
    nothing and propagates NaN, as this crate's functions do.
    - `Quat::rotate` is **bit-identical** to its native twin, drifted or not: `SO3::act` is the
      same sandwich in the same order (`rotate_is_the_native_twin_to_the_bit_drifted_or_not`).
-   - `quat_from_rot3` is a **recorded behaviour change** under the feature. It returns the
-     normalized quaternion `SO3::from_matrix` returns, where today's body returns an
-     un-normalized one (`helicoid` `0049` decision 4).
+   - `quat_from_rot3` is a **recorded behaviour change** under the feature, and from
+     `helicoid` 0.0.4 a small one. `SO3::from_matrix` returns Shepperd's quotients in this
+     crate's arithmetic whenever they are within `16u` of the unit sphere, as every rotation
+     rounded to binary64 is (`helicoid` `0086`), and normalizes one column of `K + I` otherwise
+     (`0079`). Over 1.2 M rotations (uniform, near `π`, and below `10^-2`), 97.0 % of outputs are
+     the native body's bits. The other 3.0 % are where the two pick different pivots: the native
+     body takes the trace pivot whenever `tr R > 0`, and `helicoid` the largest candidate. Those
+     are within `9.5e-16` of the normalized native quaternion. Off the sphere, for a scaled or
+     non-orthogonal matrix, the result is normalized where the native one is not, and an entry
+     past about `2^511` gives NaN. `tf_tree_c::layout::read`'s determinant check admits such a
+     matrix (`diag(a, 1/a, 1)`), which is not a rotation.
    - Two `slerp` differences are accepted and pinned. It extrapolates off `[0, 1]`, where the
      native series collapses. Identical inputs return `qa` to a few ulp, where native returns the
      bit, and a NaN `s` returns NaN, because there is no early return.
    - One drift difference is a gain. On near pairs, `slerp`'s chord-based angle reads the norm
      difference as rotation and loses up to `~4 000 u` at `2^-26.29`, while `helicoid`'s provided
      body is scale-invariant and stays at `6.5 u` (`helicoid` `0058`, Measured).
+   - `slerp`'s latency is at parity from `helicoid` 0.0.2 (`helicoid` `0059`):
+     `lookup/depth3/lerpslerp` reads 211.7 ns against 209.3 ns native, where 0.0.1 read
+     239.1 ns. So decision 5 keeps it delegated. On 0.0.3 it reads 211.7 ns against 209.5 ns
+     native and 211.5 ns on 0.0.2, where an identical copy of the native binary reads 206.7 ns
+     (five interleaved rounds, one pinned core). 0.0.4 moves only `from_matrix`'s bits
+     (`helicoid`'s `just determinism`), so `slerp` is unchanged.
    - The native-contract tests that pin these differences are `cfg(not(feature = "helicoid"))`,
      and the feature arm has its own.
    - `Quat::{dot, norm, norm_squared, normalize}` and `Iso3::normalized` stay this crate's
