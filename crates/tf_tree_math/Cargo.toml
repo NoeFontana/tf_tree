@@ -42,9 +42,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 # `sqrt`/`sin`/`cos` on the hot path — with soft floats.
 miri-soft-float = ["libm/force-soft-floats"]
 
+# Delegate the SO(3) bodies to `helicoid` (`docs/decisions/0063`). Off by default; the old bodies stay
+# compiled either way, as the adapter twins.
+helicoid = ["dep:helicoid", "dep:helicoid-linalg"]
+
 [dependencies]
 libm.workspace = true
 bytemuck.workspace = true
+helicoid = { workspace = true, optional = true }
+helicoid-linalg = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
