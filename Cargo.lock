@@ -549,6 +549,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "helicoid"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d8d5abfd68550c667ec6721da48a1d1fb852b435db673a8fda7093195411a7d"
+dependencies = [
+ "helicoid-linalg",
+ "libm",
+]
+
+[[package]]
+name = "helicoid-linalg"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "994bdd3e24ef9a226b96904499395071be521cf75a4a4234198bc71a627794d2"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -964,9 +983,9 @@ dependencies = [
 
 [[package]]
 name = "ruzstd"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
 
 [[package]]
 name = "same-file"
@@ -1212,6 +1231,8 @@ name = "tf_tree_math"
 version = "0.0.6"
 dependencies = [
  "bytemuck",
+ "helicoid",
+ "helicoid-linalg",
  "libm",
  "proptest",
 ]
