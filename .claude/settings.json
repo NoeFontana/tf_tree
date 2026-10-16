@@ -35,9 +35,7 @@
       "Read(./target/**)",
       "Read(./crates/*/target/**)",
       "Read(./**/.venv/**)",
-      "Read(./docs/changelog/**)",
-      "Read(./Cargo.lock)",
-      "Read(./crates/*/Cargo.lock)"
+      "Read(./docs/changelog/**)"
     ]
   },
   "hooks": {

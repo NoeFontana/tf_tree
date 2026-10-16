@@ -82,7 +82,6 @@ Everything goes through `just`; CI invokes the recipes 1:1. Run them before push
 ## Gate gaps (CI runs what local passes miss)
 
 - Run the whole recipe, not the line you changed; a CI job may call several recipes.
-- `just lint` skips `scripts/*.py` (`just py-lint`), rustdoc (`just doc`) and `shm`-gated targets (`just shm-check`).
 - CI follows `channel = "stable"`; the dev host lags, so local clippy/fmt green is not CI green. `--target aarch64-unknown-linux-gnu` reproduces the arm `c_char` clippy failures.
 - Never pipe a gate into `tail`/`grep -c` inside an `&&` chain; it reports the last command's exit code. Run each recipe and print its own `exit=$?`.
 - Gates read the working tree, not the commit: stash WIP before regenerating headers or running `c-header-check`.
@@ -90,7 +89,7 @@ Everything goes through `just`; CI invokes the recipes 1:1. Run them before push
 
 ## Never read or commit
 
-`target/`, `crates/*/target/`, `.venv`, bag files and `testdata/` blobs, `.tft` arenas. Agents measuring things write probes to the scratchpad, never into `crates/*/examples` or `tests/` (cargo compiles them in every gate). Subagents share the working tree: use `isolation: "worktree"` and re-check `git branch --show-current` afterwards. Never `git add -A`; add paths.
+`target/`, `crates/*/target/`, `.venv`, ad-hoc bag files and `.tft` arenas (the tracked fixtures under `testdata/` are read only when the task concerns them). Agents measuring things write probes to the scratchpad, never into `crates/*/examples` or `tests/` (cargo compiles them in every gate). Subagents share the working tree: use `isolation: "worktree"` and re-check `git branch --show-current` afterwards. Never `git add -A`; add paths.
 
 ## Decision workflow
 
