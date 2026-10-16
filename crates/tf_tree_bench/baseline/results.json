@@ -1,11 +1,11 @@
 {
   "schema": "tf_tree.bench-report/2",
   "provenance": {
-    "generated_utc": "2026-09-10T22:38:17Z",
+    "generated_utc": "2026-10-16T03:46:54Z",
     "schema": "tf_tree.bench-report/2",
-    "git_commit": "0cabaec3ae2458c54bf0c371d546eebded0fdf10",
+    "git_commit": "de1d296b1da51ca4615e3675fb85684675b52b88",
     "git_dirty": "true",
-    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
     "build_profile": "release",
     "build_lto": "\"thin\"",
     "target": "x86_64",
@@ -19,11 +19,11 @@
     "physical_cores": "4",
     "logical_cpus": "8",
     "cpu_governor": "unknown",
-    "kernel": "6.8.0-138-generic",
+    "kernel": "6.8.0-139-generic",
     "transparent_hugepage": "always [madvise] never",
     "transparent_hugepage_shmem": "always within_size advise [never] deny force",
     "perf_event_paranoid": "4",
-    "load_average": "2.56 1.23 1.01 2/337 3739872",
+    "load_average": "4.30 6.64 5.29 2/354 2223305",
     "container": "no",
     "ros_distro": "none (no ROS 2 in this run)",
     "tf2_version": "none — the tf2 columns are UNAVAILABLE, not zero",
@@ -39,11 +39,11 @@
     "core_reason": "4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler",
     "forced": false,
     "consumers": 16,
-    "busy_fraction": 0.15000000000000002,
+    "busy_fraction": 0.14225941422594146,
     "physical_cores": 4,
     "logical_cpus": 8,
     "warmup_discarded_s": 2,
-    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out", "machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock"]
+    "reasons": ["SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing", "CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out", "machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock"]
   },
   "rows": [
     {
@@ -53,7 +53,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "just mp-bench (tf_tree) / just mp-bench-tf2 (both, in the ROS container)",
       "tf_tree": {},
       "tf2": {}
@@ -77,7 +77,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
+      "reason": "this row is single-threaded and in-process, so the only thing between it and a number is the host, and the host failed the fitness probe: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "cargo bench -p tf_tree_bench --bench lookup (or this tool on a quiet, non-SMT, performance-governor host)",
       "tf_tree": {},
       "tf2": {}
@@ -89,7 +89,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. There is a further gap, and it is not the one this reason used to name: nothing in this repository times publish-to-visible end to end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its number answers a different question. A cross-process publish additionally goes through the shared-memory backend, and this binary was compiled without `--features shm`",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. There is a further gap, and it is not the one this reason used to name: nothing in this repository times publish-to-visible end to end. `just dds-bench` is a real DDS round trip — one publisher, N tf2_ros listeners, §5.2's QoS — but `dds_report` reports `svc`, the engine call itself, so its number answers a different question. A cross-process publish additionally goes through the shared-memory backend, and this binary was compiled without `--features shm`",
       "reproduce": "just mp-bench (tf_tree, service latency) / just mp-bench-tf2",
       "tf_tree": {},
       "tf2": {}
@@ -101,7 +101,7 @@
       "timing_sensitive": true,
       "needs_n_cores": true,
       "status": "unavailable",
-      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
+      "reason": "this tool is a single process: it stands up none of the 16 consumers this row compares, so the row is not measured here on any host — the command below is what measures it; this build links no second engine: there is no ROS 2 in this build or environment, so the tf2 column cannot be measured at all; the host also has 4 physical cores for 16 consumers plus a publisher (17 needed); above the core count the rows measure the scheduler; SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock. That a short host produces a bent curve rather than a slow one is not a guess: `docs/PHASE1.md` §11.3's read-scaling gate (>= 6x from 1 to 8 threads) is recorded in `docs/PHASE5.md` §0.0 as FAILING at 5.35-5.62x on the 4-physical-core development host, which is what an oversubscribed 8-thread row looks like",
       "reproduce": "just tf2-scaling / just shm-scaling, on >= 16 physical cores",
       "tf_tree": {},
       "tf2": {}
@@ -149,7 +149,7 @@
       "timing_sensitive": true,
       "needs_n_cores": false,
       "status": "unavailable",
-      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 15% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
+      "reason": "the pair was measured, but the host failed the fitness probe, so neither half of the ratio is a claim: SMT is on (8 logical CPUs over 4 physical cores); sibling threads share execution resources, so a per-thread number depends on what the sibling is doing; CPU frequency governor is unreadable (no cpufreq sysfs), so frequency scaling cannot be ruled out; machine is 14% busy before the run starts (threshold 10%); a cross-engine ratio does not divide this out, because only one of the two arms takes a lock",
       "reproduce": "just embed-cost",
       "tf_tree": {},
       "tf2": {}
