@@ -30,6 +30,25 @@
       "Bash(just versions)",
       "Bash(just --list)",
       "Bash(lscpu*)"
+    ],
+    "deny": [
+      "Read(./target/**)",
+      "Read(./crates/*/target/**)",
+      "Read(./**/.venv/**)",
+      "Read(./docs/changelog/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r .tool_input.file_path); case \"$f\" in *.rs) rustfmt --edition 2021 \"$f\" 2>&1 | head -5;; esac; exit 0"
+          }
+        ]
+      }
     ]
   }
 }

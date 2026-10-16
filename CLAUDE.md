@@ -79,6 +79,18 @@ Everything goes through `just`; CI invokes the recipes 1:1. Run them before push
 | `just gate2` / `gate4` / `gate5` | PHASE5 §12 gates; figures in `docs/benchmarks/EVIDENCE.md` |
 | `just ros-build` / `ros-test` | container-only |
 
+## Gate gaps (CI runs what local passes miss)
+
+- Run the whole recipe, not the line you changed; a CI job may call several recipes.
+- CI follows `channel = "stable"`; the dev host lags, so local clippy/fmt green is not CI green. `--target aarch64-unknown-linux-gnu` reproduces the arm `c_char` clippy failures.
+- Never pipe a gate into `tail`/`grep -c` inside an `&&` chain; it reports the last command's exit code. Run each recipe and print its own `exit=$?`.
+- Gates read the working tree, not the commit: stash WIP before regenerating headers or running `c-header-check`.
+- After reverting a source mutation, `touch` the file (a restored mtime makes cargo reuse the mutant build). Never restore a `cp` backup over later edits.
+
+## Never read or commit
+
+`target/`, `crates/*/target/`, `.venv`, ad-hoc bag files and `.tft` arenas (the tracked fixtures under `testdata/` are read only when the task concerns them). Agents measuring things write probes to the scratchpad, never into `crates/*/examples` or `tests/` (cargo compiles them in every gate). Subagents share the working tree: use `isolation: "worktree"` and re-check `git branch --show-current` afterwards. Never `git add -A`; add paths.
+
 ## Decision workflow
 
 A change the specs do not cover — new public API, new crate boundary, a different
