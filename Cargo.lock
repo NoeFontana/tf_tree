@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "proptest",
  "tf_tree_arena",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_arena"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytemuck",
  "proptest",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_bench"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "criterion",
@@ -1160,14 +1160,14 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_bridge"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "tf_tree",
 ]
 
 [[package]]
 name = "tf_tree_c"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "tf_tree",
  "tf_tree_bridge",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_cli"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "clap",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_core"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "blake3",
  "bytemuck",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_ingest"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_ipc"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "libc",
  "rustix",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_math"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "bytemuck",
  "helicoid",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_tf2_sys"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "cc",
  "tf_tree_math",
@@ -1487,7 +1487,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
 ]
