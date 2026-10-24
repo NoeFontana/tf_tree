@@ -12,6 +12,13 @@ defined by the status tables in `docs/`; they win over this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`tf_tree_math` uses `helicoid` 0.0.8** (was 0.0.5). It brings helicoid's portable
+  `atan2` kernel and compensated single-rounded `SO3::log` exact arm (maximum error
+  falls from 2.317 to 1.405 `u`), with no API break. Lockfiles across the workspace and
+  excluded crates follow. Bench baseline re-cut / verified.
+
 ---
 
 ## [0.0.8] — 2026-10-16 (helicoid 0.0.5)

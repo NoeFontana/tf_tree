@@ -47,11 +47,10 @@ pub(crate) fn log_so3(q: Quat) -> Vec3 {
 /// as `SO3::from_matrix` returns them (`docs/decisions/0063` decision 3).
 #[inline]
 pub(crate) fn quat_from_rot3(r: &[f64; 9]) -> Quat {
-    let row = |i: usize| Vector([r[3 * i], r[3 * i + 1], r[3 * i + 2]]);
-    quat(SO3::from_matrix(&Matrix::from_rows([
-        row(0),
-        row(1),
-        row(2),
+    quat(SO3::from_matrix(&Matrix::from_cols([
+        Vector([r[0], r[3], r[6]]),
+        Vector([r[1], r[4], r[7]]),
+        Vector([r[2], r[5], r[8]]),
     ])))
 }
 
