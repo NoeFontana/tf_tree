@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_math"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "bytemuck",
  "helicoid",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "tf_tree_tf2_sys"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cc",
  "tf_tree_math",

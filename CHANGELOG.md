@@ -12,6 +12,10 @@ defined by the status tables in `docs/`; they win over this file.
 
 ## [Unreleased]
 
+---
+
+## [0.0.9] — 2026-10-25 (helicoid 0.0.8)
+
 ### Changed
 
 - **`tf_tree_math` uses `helicoid` 0.0.8** (was 0.0.5). It brings helicoid's portable
@@ -21,22 +25,12 @@ defined by the status tables in `docs/`; they win over this file.
 
 ---
 
-## [0.0.8] — 2026-10-16 (helicoid 0.0.5)
-
-### Changed
-
-- **`tf_tree_math` uses `helicoid` 0.0.5** (was 0.0.4). It has no API break; helicoid's SO(3)
-  coefficients and `Log` change in their last bits, so the delegated bodies may too. The bench
-  baseline is re-cut: its one measured row, differential agreement, still reads `2.5e-16`
-  over 47,922 queries.
-
----
-
 ## Released versions
 
 Frozen history, newest first, in [`docs/changelog/`](./docs/changelog/); leave it
 out of searches and sweeps.
 
+- [`0.0.8`](./docs/changelog/0.0.8.md) — 2026-10-16 (helicoid 0.0.5)
 - [`0.0.7`](./docs/changelog/0.0.7.md) — 2026-10-14 (helicoid by default)
 - [`0.0.6`](./docs/changelog/0.0.6.md) — 2026-09-20 (the prose cut)
 - [`0.0.5`](./docs/changelog/0.0.5.md) — 2026-08-29 (the entry paths that need no toolchain)
@@ -53,3 +47,4 @@ out of searches and sweeps.
 [0.0.6]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.6
 [0.0.7]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.7
 [0.0.8]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.8
+[0.0.9]: https://github.com/NoeFontana/tf_tree/releases/tag/v0.0.9
